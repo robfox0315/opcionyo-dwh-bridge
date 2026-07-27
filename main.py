@@ -115,3 +115,26 @@ def query(body: dict, x_api_key: str | None = Header(default=None)):
         raise
     except Exception as e:
         raise HTTPException(400, f"Error al ejecutar la consulta: {e}")
+
+
+@app.get("/q")
+def query_get(sql: str, key: str):
+    """
+    Versión GET del mismo endpoint — para pegar directo en el navegador:
+    https://tu-app.onrender.com/q?key=TU_CLAVE&sql=SELECT+1
+
+    Roberto abre esta URL en el navegador, copia el JSON que aparece, y se lo
+    pega a Claude en el chat — mismas reglas de seguridad que /query.
+    """
+    _chequear_clave(key)
+    sql_seguro = _validar_sql(sql)
+    client = _cliente()
+    try:
+        result = client.query(sql_seguro)
+        columnas = result.column_names
+        filas = [dict(zip(columnas, row)) for row in result.result_rows]
+        return {"columnas": list(columnas), "filas": filas, "total_filas": len(filas)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, f"Error al ejecutar la consulta: {e}")
