@@ -5,16 +5,24 @@
 ║  consultar el Data Warehouse de Treble sin exponer las        ║
 ║  credenciales directamente ni permitir escritura alguna.      ║
 ║  Deploy sugerido: Render.com (free tier) o similar.           ║
+║                                                                 ║
+║  Incluye además: monitor de SLA de respuesta ATC (2 min),     ║
+║  corriendo en segundo plano dentro de este mismo proceso,     ║
+║  sin costo ni servicio adicional.                              ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
 import os
 import re
+import json
+import time
+import threading
+import urllib.request
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 import clickhouse_connect
 
-app = FastAPI(title="Opción Yo · DWH Bridge", version="1.0")
+app = FastAPI(title="Opción Yo · DWH Bridge", version="1.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -138,3 +146,85 @@ def query_get(sql: str, key: str):
         raise
     except Exception as e:
         raise HTTPException(400, f"Error al ejecutar la consulta: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  MONITOR DE SLA DE RESPUESTA ATC (Treble/WhatsApp) — 2 minutos
+#  Corre en segundo plano dentro de este mismo proceso, cada 60 segundos.
+#  No crea ningún servicio ni endpoint nuevo, no consume recursos extra
+#  significativos, y no interactúa con el enrutamiento de Treble — solo
+#  lee datos de fact_conversations.
+# ══════════════════════════════════════════════════════════════════════
+
+SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")  # agregar en Render → Environment
+SLA_THRESHOLD_SECONDS = 60  # 1 minuto: como el ciclo es de 60s, la alerta sale máx. a los 2 min
+SLA_POLL_INTERVAL_SECONDS = 60
+
+_sla_already_alerted: set[int] = set()
+
+SLA_SQL = f"""
+SELECT
+    conversation_id, agent_name, contact_wa_id, assigned_at,
+    dateDiff('second', assigned_at, now()) as seg_esperando
+FROM client_analytics.fact_conversations
+WHERE status = 'assigned'
+  AND first_agent_message_at IS NULL
+  AND assigned_at IS NOT NULL
+  AND assigned_at <= now() - INTERVAL {SLA_THRESHOLD_SECONDS} SECOND
+  AND assigned_at > now() - INTERVAL {SLA_THRESHOLD_SECONDS + 70} SECOND
+  AND created_at > now() - INTERVAL 1 DAY
+ORDER BY assigned_at ASC
+"""
+
+
+def _sla_enviar_slack(fila: dict):
+    minutos = round(fila["seg_esperando"] / 60, 1)
+    mensaje = {
+        "text": (
+            f":stopwatch: *SLA de respuesta vencido (Treble/WhatsApp)*\n"
+            f"Conversación #{fila['conversation_id']} asignada a *{fila.get('agent_name') or 'Sin agente'}* "
+            f"hace *{minutos} min* sin primera respuesta.\n"
+            f"Contacto (WhatsApp): `{fila.get('contact_wa_id') or 'N/D'}`"
+        )
+    }
+    req = urllib.request.Request(
+        SLACK_WEBHOOK_URL,
+        data=json.dumps(mensaje).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    urllib.request.urlopen(req, timeout=10)
+
+
+def _sla_revisar_una_vez():
+    global _sla_already_alerted
+    sql_seguro = _validar_sql(SLA_SQL)
+    client = _cliente()
+    result = client.query(sql_seguro)
+    columnas = result.column_names
+    filas = [dict(zip(columnas, row)) for row in result.result_rows]
+
+    for fila in filas:
+        cid = fila["conversation_id"]
+        if cid not in _sla_already_alerted and SLACK_WEBHOOK_URL:
+            try:
+                _sla_enviar_slack(fila)
+                _sla_already_alerted.add(cid)
+            except Exception as e:
+                print(f"[SLA monitor] error enviando a Slack conversation_id={cid}: {e}")
+
+    if len(_sla_already_alerted) > 5000:
+        _sla_already_alerted = set(list(_sla_already_alerted)[-2500:])
+
+
+def _sla_monitor_loop():
+    while True:
+        try:
+            _sla_revisar_una_vez()
+        except Exception as e:
+            print(f"[SLA monitor] error en la revisión: {e}")
+        time.sleep(SLA_POLL_INTERVAL_SECONDS)
+
+
+# Arranca el monitor en segundo plano cuando el bridge levanta (una sola vez).
+threading.Thread(target=_sla_monitor_loop, daemon=True).start()
