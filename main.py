@@ -168,6 +168,12 @@ _sla_already_alerted: set[int] = set()
 #    (ventana de 90s) — esto evita que se nos escapen casos donde el agente
 #    respondió ENTRE una revisión y la siguiente, que es lo que pasó el
 #    fin de semana: 267 conversaciones respondidas tarde y ninguna alertada.
+ATC_AGENTS = [
+    "Camila Rodriguez", "Estefany Suárez", "Mary Cárdenas", "Sofia Castro",
+    "Yesith Solano", "Eduardo Liendo", "Samira Pirique", "Lizbeth Calcina",
+]
+_atc_agents_sql = ", ".join(f"'{a}'" for a in ATC_AGENTS)
+
 SLA_SQL = f"""
 SELECT
     conversation_id, agent_name, contact_wa_id, assigned_at, first_agent_message_at,
@@ -175,6 +181,7 @@ SELECT
 FROM client_analytics.fact_conversations
 WHERE assigned_at IS NOT NULL
   AND assigned_at > now() - INTERVAL 1 DAY
+  AND agent_name IN ({_atc_agents_sql})
   AND (
         (first_agent_message_at IS NULL AND dateDiff('second', assigned_at, now()) >= {SLA_THRESHOLD_SECONDS})
         OR
