@@ -171,6 +171,7 @@ _sla_already_alerted: set[int] = set()
 ATC_AGENTS = [
     "Camila Rodriguez", "Estefany Suárez", "Mary Cárdenas", "Sofia Castro",
     "Yesith Solano", "Eduardo Liendo", "Samira Pirique", "Lizbeth Calcina",
+    "Ivanna Ortiz",  # agregada temporalmente para prueba — quitar después
 ]
 _atc_agents_sql = ", ".join(f"'{a}'" for a in ATC_AGENTS)
 
