@@ -162,17 +162,26 @@ SLA_POLL_INTERVAL_SECONDS = 60
 
 _sla_already_alerted: set[int] = set()
 
+# Detecta DOS casos (el bug original solo cubría el primero):
+# 1. Sigue sin responder ahora mismo, pasado el umbral (en vivo).
+# 2. Ya respondió, pero tardó más del umbral, Y la respuesta llegó hace poco
+#    (ventana de 90s) — esto evita que se nos escapen casos donde el agente
+#    respondió ENTRE una revisión y la siguiente, que es lo que pasó el
+#    fin de semana: 267 conversaciones respondidas tarde y ninguna alertada.
 SLA_SQL = f"""
 SELECT
-    conversation_id, agent_name, contact_wa_id, assigned_at,
-    dateDiff('second', assigned_at, now()) as seg_esperando
+    conversation_id, agent_name, contact_wa_id, assigned_at, first_agent_message_at,
+    dateDiff('second', assigned_at, coalesce(first_agent_message_at, now())) as seg_esperando
 FROM client_analytics.fact_conversations
-WHERE status = 'assigned'
-  AND first_agent_message_at IS NULL
-  AND assigned_at IS NOT NULL
-  AND assigned_at <= now() - INTERVAL {SLA_THRESHOLD_SECONDS} SECOND
-  AND assigned_at > now() - INTERVAL {SLA_THRESHOLD_SECONDS + 70} SECOND
-  AND created_at > now() - INTERVAL 1 DAY
+WHERE assigned_at IS NOT NULL
+  AND assigned_at > now() - INTERVAL 1 DAY
+  AND (
+        (first_agent_message_at IS NULL AND dateDiff('second', assigned_at, now()) >= {SLA_THRESHOLD_SECONDS})
+        OR
+        (first_agent_message_at IS NOT NULL
+         AND dateDiff('second', assigned_at, first_agent_message_at) >= {SLA_THRESHOLD_SECONDS}
+         AND first_agent_message_at > now() - INTERVAL 90 SECOND)
+      )
 ORDER BY assigned_at ASC
 """
 
