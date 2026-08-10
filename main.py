@@ -179,8 +179,7 @@ WHERE assigned_at IS NOT NULL
         (first_agent_message_at IS NULL AND dateDiff('second', assigned_at, now()) >= {SLA_THRESHOLD_SECONDS})
         OR
         (first_agent_message_at IS NOT NULL
-         AND dateDiff('second', assigned_at, first_agent_message_at) >= {SLA_THRESHOLD_SECONDS}
-         AND first_agent_message_at > now() - INTERVAL 90 SECOND)
+         AND dateDiff('second', assigned_at, first_agent_message_at) >= {SLA_THRESHOLD_SECONDS})
       )
 ORDER BY assigned_at ASC
 """
@@ -213,25 +212,50 @@ def _sla_revisar_una_vez():
     columnas = result.column_names
     filas = [dict(zip(columnas, row)) for row in result.result_rows]
 
+    print(f"[SLA monitor] revisión OK — {len(filas)} en incumplimiento detectados en esta corrida")
+
+    enviadas = 0
     for fila in filas:
         cid = fila["conversation_id"]
         if cid not in _sla_already_alerted and SLACK_WEBHOOK_URL:
             try:
                 _sla_enviar_slack(fila)
                 _sla_already_alerted.add(cid)
+                enviadas += 1
+                print(f"[SLA monitor] alerta enviada a Slack: conversation_id={cid}")
             except Exception as e:
-                print(f"[SLA monitor] error enviando a Slack conversation_id={cid}: {e}")
+                print(f"[SLA monitor] ERROR enviando a Slack conversation_id={cid}: {e}")
+
+    if filas and enviadas == 0:
+        print(f"[SLA monitor] {len(filas)} detectados pero 0 enviadas (ya estaban alertadas antes, o falta SLACK_WEBHOOK_URL)")
 
     if len(_sla_already_alerted) > 5000:
         _sla_already_alerted = set(list(_sla_already_alerted)[-2500:])
 
 
 def _sla_monitor_loop():
+    global _sla_already_alerted
+    print("[SLA monitor] hilo de monitoreo iniciado")
+
+    # Foto inicial: marca como "ya vistos" los casos que existen AL ARRANCAR,
+    # para no mandar de golpe todo el backlog histórico como alertas nuevas.
+    # Solo se alertan casos que aparezcan DESPUÉS de este arranque.
+    try:
+        sql_seguro = _validar_sql(SLA_SQL)
+        client = _cliente()
+        result = client.query(sql_seguro)
+        columnas = result.column_names
+        filas_iniciales = [dict(zip(columnas, row)) for row in result.result_rows]
+        _sla_already_alerted = {f["conversation_id"] for f in filas_iniciales}
+        print(f"[SLA monitor] foto inicial: {len(_sla_already_alerted)} casos existentes marcados como vistos (no se alertan)")
+    except Exception as e:
+        print(f"[SLA monitor] ERROR en foto inicial: {e}")
+
     while True:
         try:
             _sla_revisar_una_vez()
         except Exception as e:
-            print(f"[SLA monitor] error en la revisión: {e}")
+            print(f"[SLA monitor] ERROR en la revisión: {e}")
         time.sleep(SLA_POLL_INTERVAL_SECONDS)
 
 
