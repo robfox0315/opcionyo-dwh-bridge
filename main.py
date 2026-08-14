@@ -402,17 +402,32 @@ def _pedidos_revisar_una_vez():
 
 def _pedidos_monitor_loop():
     print("[Pedidos especialista] hilo de triage diario iniciado")
-    ya_corrio_hoy = None
+    marca_archivo = "/tmp/pedidos_ultimo_envio.txt"
+
+    def _leer_ultima_fecha():
+        try:
+            with open(marca_archivo) as f:
+                return f.read().strip()
+        except FileNotFoundError:
+            return None
+
+    def _guardar_fecha(fecha_str):
+        with open(marca_archivo, "w") as f:
+            f.write(fecha_str)
+
     while True:
         try:
             ahora = time.gmtime()
-            hoy = (ahora.tm_year, ahora.tm_yday)
-            if ahora.tm_hour == PEDIDOS_HORA_UTC and ya_corrio_hoy != hoy:
+            hoy_str = f"{ahora.tm_year}-{ahora.tm_yday}"
+            # Ventana angosta (primeros 5 min de la hora objetivo) para minimizar
+            # el riesgo de un doble envío si justo hay un redeploy en ese momento.
+            en_ventana = ahora.tm_hour == PEDIDOS_HORA_UTC and ahora.tm_min < 5
+            if en_ventana and _leer_ultima_fecha() != hoy_str:
                 _pedidos_revisar_una_vez()
-                ya_corrio_hoy = hoy
+                _guardar_fecha(hoy_str)
         except Exception as e:
             print(f"[Pedidos especialista] ERROR: {e}")
-        time.sleep(300)  # revisa cada 5 min si ya es la hora, sin gastar recursos
+        time.sleep(120)  # revisa cada 2 min si ya es la hora, dentro de la ventana angosta
 
 
 threading.Thread(target=_pedidos_monitor_loop, daemon=True).start()
