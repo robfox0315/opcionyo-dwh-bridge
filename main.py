@@ -269,3 +269,150 @@ def _sla_monitor_loop():
 
 # Arranca el monitor en segundo plano cuando el bridge levanta (una sola vez).
 threading.Thread(target=_sla_monitor_loop, daemon=True).start()
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  TRIAGE DIARIO — Bandeja "Pedido de especialista" (pipeline Administración)
+#  Corre UNA VEZ AL DÍA dentro de este mismo proceso, sin servicio ni costo
+#  adicional. No ejecuta ninguna acción real (no pausa, no reagenda) —
+#  solo clasifica y manda un resumen con borradores a Slack.
+# ══════════════════════════════════════════════════════════════════════
+
+import re as _re
+
+PEDIDOS_SLACK_WEBHOOK_URL = os.environ.get("PEDIDOS_SLACK_WEBHOOK_URL", "")
+PEDIDOS_HORA_UTC = int(os.environ.get("PEDIDOS_HORA_UTC", "12"))  # 12 UTC = 8 AM GMT-4
+PIPELINE_ADMINISTRACION = "74755616"
+STAGE_BANDEJA_ENTRADA = "143884924"
+
+PEDIDOS_DRAFTS = {
+    "Reagendar sesión": "Hola {nombre}, recibido — reviso la disponibilidad para reagendar la sesión de la clienta {id_cliente} y te confirmo un horario en breve.",
+    "Pausar plan": "Listo {nombre}, pauso el plan de la clienta {id_cliente} según lo que indicaste. Te aviso cuando esté hecho.",
+    "Postergar pago": "Confirmado {nombre}, gestiono la postergación del cobro de la clienta {id_cliente}. Te confirmo cuando quede aplicado.",
+    "Seguimiento / contactar cliente": "Gracias por avisar {nombre}, nos comunicamos con la clienta {id_cliente} para dar seguimiento y te contamos qué nos responde.",
+    "Corrección de estado de sesión": "Listo {nombre}, corrijo el estado de la sesión de la clienta {id_cliente} tal como indicaste.",
+}
+
+PEDIDOS_EMOJI = {
+    "🔴 SENSIBLE — requiere revisión humana, no automatizar": "🔴",
+    "Reagendar sesión": "📅", "Pausar plan": "⏸️", "Postergar pago": "💳",
+    "Seguimiento / contactar cliente": "📞", "Corrección de estado de sesión": "✏️",
+    "Soporte técnico / sistema": "🛠️", "Otro — revisar manualmente": "❓",
+}
+
+
+def _pedidos_obtener_tickets():
+    body = {
+        "filterGroups": [{"filters": [
+            {"propertyName": "hs_pipeline", "operator": "EQ", "value": PIPELINE_ADMINISTRACION},
+            {"propertyName": "hs_pipeline_stage", "operator": "EQ", "value": STAGE_BANDEJA_ENTRADA},
+        ]}],
+        "properties": ["subject", "content", "createdate"],
+        "limit": 100,
+    }
+    # Reutiliza las credenciales del bridge (BRIDGE_API_KEY es para el bridge, no HubSpot;
+    # esta llamada usa un token de HubSpot separado guardado en HUBSPOT_TOKEN)
+    hubspot_token = os.environ.get("HUBSPOT_TOKEN", "")
+    req = urllib.request.Request(
+        "https://api.hubspot.com/crm/v3/objects/tickets/search",
+        data=json.dumps(body).encode(),
+        headers={"Authorization": f"Bearer {hubspot_token}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return json.load(resp).get("results", [])
+
+
+def _pedidos_clasificar(subject, content):
+    t = (subject + " " + content).lower()
+    if any(k in t for k in ["hospitaliz", "salud", "grave", "riesgo", "hematocrito", "no volverá", "no insistir", "delicad", "suicid", "crisis"]):
+        return "🔴 SENSIBLE — requiere revisión humana, no automatizar"
+    if any(k in t for k in ["reagendar", "cambiar horario", "reprogramar", "próxima cita", "no logre reagendar"]):
+        return "Reagendar sesión"
+    if any(k in t for k in ["pausar", "pausa su plan", "pausa el plan"]):
+        return "Pausar plan"
+    if any(k in t for k in ["postergar pago", "cobrarse", "cobrársele", "postergar", "más adelante el cobro"]):
+        return "Postergar pago"
+    if any(k in t for k in ["no la veo", "no ha asistido", "se pudieran comunicar", "contactar", "no lee sus mensajes"]):
+        return "Seguimiento / contactar cliente"
+    if any(k in t for k in ["cambiar el estatus", "marcar completada", "corregir estado", "se fue la luz", "desconect", "no logre marcar"]):
+        return "Corrección de estado de sesión"
+    if any(k in t for k in ["app descargada", "no la tiene descargada", "no le permite", "agendar en un ar de"]):
+        return "Soporte técnico / sistema"
+    return "Otro — revisar manualmente"
+
+
+def _pedidos_extraer_nombre(subject):
+    m = _re.search(r'especialista:\s*(?:\(E\)\s*)?(.+?)\s*Por ID', subject)
+    if m:
+        return m.group(1).strip()
+    m2 = _re.match(r'^(.+?)\s*\(ID:', subject)
+    return m2.group(1).strip() if m2 else subject
+
+
+def _pedidos_extraer_id(subject, content):
+    m = _re.search(r'ID:\s*(\d+)', subject + " " + content)
+    return m.group(1) if m else "N/D"
+
+
+def _pedidos_enviar_slack(clasificados):
+    if not clasificados:
+        texto = "*📋 Bandeja Pedido de especialista* — vacía hoy, nada pendiente. ✅"
+    else:
+        lines = [f"*📋 Bandeja Pedido de especialista — {len(clasificados)} casos*\n"]
+        for t in sorted(clasificados, key=lambda x: x["categoria"]):
+            e = PEDIDOS_EMOJI.get(t["categoria"], "•")
+            link = f"https://app.hubspot.com/contacts/{ACCOUNT_ID}/record/0-5/{t['ticket_id']}"
+            lines.append(f"{e} *{t['categoria']}* — {t['especialista']} (cliente {t['id_cliente']})")
+            resumen = t["content"][:120] + ("..." if len(t["content"]) > 120 else "")
+            lines.append(f"   _{resumen}_")
+            if t.get("draft_respuesta"):
+                lines.append(f"   💬 Borrador: {t['draft_respuesta']}")
+            lines.append(f"   <{link}|Ver ticket>")
+            lines.append("")
+        texto = "\n".join(lines)
+
+    req = urllib.request.Request(
+        PEDIDOS_SLACK_WEBHOOK_URL, data=json.dumps({"text": texto}).encode(),
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    urllib.request.urlopen(req, timeout=10)
+
+
+def _pedidos_revisar_una_vez():
+    tickets = _pedidos_obtener_tickets()
+    clasificados = []
+    for r in tickets:
+        p = r["properties"]
+        subject = p.get("subject") or ""
+        content = p.get("content") or ""
+        cat = _pedidos_clasificar(subject, content)
+        nombre = _pedidos_extraer_nombre(subject)
+        id_cliente = _pedidos_extraer_id(subject, content)
+        draft = PEDIDOS_DRAFTS.get(cat, "").format(nombre=nombre, id_cliente=id_cliente) if cat in PEDIDOS_DRAFTS else None
+        clasificados.append({
+            "ticket_id": r["id"], "content": content, "categoria": cat,
+            "especialista": nombre, "id_cliente": id_cliente, "draft_respuesta": draft,
+        })
+    print(f"[Pedidos especialista] revisión OK — {len(clasificados)} tickets en bandeja")
+    if PEDIDOS_SLACK_WEBHOOK_URL:
+        _pedidos_enviar_slack(clasificados)
+        print("[Pedidos especialista] resumen enviado a Slack")
+
+
+def _pedidos_monitor_loop():
+    print("[Pedidos especialista] hilo de triage diario iniciado")
+    ya_corrio_hoy = None
+    while True:
+        try:
+            ahora = time.gmtime()
+            hoy = (ahora.tm_year, ahora.tm_yday)
+            if ahora.tm_hour == PEDIDOS_HORA_UTC and ya_corrio_hoy != hoy:
+                _pedidos_revisar_una_vez()
+                ya_corrio_hoy = hoy
+        except Exception as e:
+            print(f"[Pedidos especialista] ERROR: {e}")
+        time.sleep(300)  # revisa cada 5 min si ya es la hora, sin gastar recursos
+
+
+threading.Thread(target=_pedidos_monitor_loop, daemon=True).start()
