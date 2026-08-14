@@ -400,34 +400,84 @@ def _pedidos_revisar_una_vez():
         print("[Pedidos especialista] resumen enviado a Slack")
 
 
+def _pedidos_enviar_slack_ticket(t):
+    """Un mensaje completo y claro por cada ticket NUEVO — sin recortar contenido."""
+    e = PEDIDOS_EMOJI.get(t["categoria"], "•")
+    link = f"https://app.hubspot.com/contacts/{ACCOUNT_ID}/record/0-5/{t['ticket_id']}"
+
+    partes = [
+        f"{e} *Nuevo Pedido de especialista*",
+        f"*Categoría:* {t['categoria']}",
+        f"*Especialista:* {t['especialista']}",
+        f"*Cliente ID:* {t['id_cliente']}",
+        "",
+        f"*Mensaje completo:*",
+        f"> {t['content']}",
+    ]
+    if t.get("draft_respuesta"):
+        partes += ["", f"*💬 Borrador de respuesta sugerido:*", f"> {t['draft_respuesta']}"]
+    partes += ["", f"<{link}|Abrir ticket en HubSpot>"]
+
+    texto = "\n".join(partes)
+    req = urllib.request.Request(
+        PEDIDOS_SLACK_WEBHOOK_URL, data=json.dumps({"text": texto}).encode(),
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    urllib.request.urlopen(req, timeout=10)
+
+
+def _pedidos_clasificar_ticket(r):
+    p = r["properties"]
+    subject = p.get("subject") or ""
+    content = p.get("content") or ""
+    cat = _pedidos_clasificar(subject, content)
+    nombre = _pedidos_extraer_nombre(subject)
+    id_cliente = _pedidos_extraer_id(subject, content)
+    draft = PEDIDOS_DRAFTS.get(cat, "").format(nombre=nombre, id_cliente=id_cliente) if cat in PEDIDOS_DRAFTS else None
+    return {
+        "ticket_id": r["id"], "content": content, "categoria": cat,
+        "especialista": nombre, "id_cliente": id_cliente, "draft_respuesta": draft,
+    }
+
+
+_pedidos_ya_alertados: set = set()
+
+
 def _pedidos_monitor_loop():
-    print("[Pedidos especialista] hilo de triage diario iniciado")
-    marca_archivo = "/tmp/pedidos_ultimo_envio.txt"
+    global _pedidos_ya_alertados
+    print("[Pedidos especialista] hilo en vivo iniciado")
 
-    def _leer_ultima_fecha():
-        try:
-            with open(marca_archivo) as f:
-                return f.read().strip()
-        except FileNotFoundError:
-            return None
-
-    def _guardar_fecha(fecha_str):
-        with open(marca_archivo, "w") as f:
-            f.write(fecha_str)
+    # Foto inicial: marca como "ya vistos" los tickets que existen AL ARRANCAR,
+    # para no mandar de golpe todo el backlog actual. Solo se alertan tickets
+    # que aparezcan DESPUÉS de este arranque.
+    try:
+        tickets_iniciales = _pedidos_obtener_tickets()
+        _pedidos_ya_alertados = {r["id"] for r in tickets_iniciales}
+        print(f"[Pedidos especialista] foto inicial: {len(_pedidos_ya_alertados)} tickets existentes marcados como vistos")
+    except Exception as e:
+        print(f"[Pedidos especialista] ERROR en foto inicial: {e}")
 
     while True:
         try:
-            ahora = time.gmtime()
-            hoy_str = f"{ahora.tm_year}-{ahora.tm_yday}"
-            # Ventana angosta (primeros 5 min de la hora objetivo) para minimizar
-            # el riesgo de un doble envío si justo hay un redeploy en ese momento.
-            en_ventana = ahora.tm_hour == PEDIDOS_HORA_UTC and ahora.tm_min < 5
-            if en_ventana and _leer_ultima_fecha() != hoy_str:
-                _pedidos_revisar_una_vez()
-                _guardar_fecha(hoy_str)
+            tickets = _pedidos_obtener_tickets()
+            nuevos = [r for r in tickets if r["id"] not in _pedidos_ya_alertados]
+            print(f"[Pedidos especialista] revisión OK — {len(tickets)} en bandeja, {len(nuevos)} nuevos")
+
+            for r in nuevos:
+                clasificado = _pedidos_clasificar_ticket(r)
+                if PEDIDOS_SLACK_WEBHOOK_URL:
+                    try:
+                        _pedidos_enviar_slack_ticket(clasificado)
+                        print(f"[Pedidos especialista] alerta enviada: ticket_id={r['id']}")
+                    except Exception as e:
+                        print(f"[Pedidos especialista] ERROR enviando ticket_id={r['id']}: {e}")
+                _pedidos_ya_alertados.add(r["id"])
+
+            if len(_pedidos_ya_alertados) > 5000:
+                _pedidos_ya_alertados = set(list(_pedidos_ya_alertados)[-2500:])
         except Exception as e:
             print(f"[Pedidos especialista] ERROR: {e}")
-        time.sleep(120)  # revisa cada 2 min si ya es la hora, dentro de la ventana angosta
+        time.sleep(60)
 
 
 threading.Thread(target=_pedidos_monitor_loop, daemon=True).start()
