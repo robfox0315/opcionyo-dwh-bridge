@@ -7,8 +7,9 @@
 ║  Deploy sugerido: Render.com (free tier) o similar.           ║
 ║                                                                 ║
 ║  Incluye además: monitor de SLA de respuesta ATC (2 min),     ║
-║  corriendo en segundo plano dentro de este mismo proceso,     ║
-║  sin costo ni servicio adicional.                              ║
+║  triage diario de Pedido de especialista, y escalamiento de   ║
+║  pushes ignorados — todos corriendo en segundo plano dentro   ║
+║  de este mismo proceso, sin costo ni servicio adicional.       ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -22,7 +23,7 @@ from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 import clickhouse_connect
 
-app = FastAPI(title="Opción Yo · DWH Bridge", version="1.1")
+app = FastAPI(title="Opción Yo · DWH Bridge", version="1.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -30,6 +31,8 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+
+ACCOUNT_ID = 40159402
 
 # ── Configuración (todo por variables de entorno, nunca hardcodeado) ──
 DWH_HOST = os.environ.get("DWH_HOST", "")
@@ -61,7 +64,6 @@ def _validar_sql(sql: str) -> str:
     for palabra in PALABRAS_PROHIBIDAS:
         if re.search(rf"\b{palabra}\b", bajo):
             raise HTTPException(403, f"Palabra no permitida en la consulta: '{palabra}'.")
-    # Si no trae LIMIT y es un SELECT, le agregamos uno por seguridad (tope de resultado)
     if primera_palabra == "select" and "limit" not in bajo:
         sql_limpio += " LIMIT 5000"
     return sql_limpio
@@ -94,7 +96,6 @@ def home():
 
 @app.get("/health")
 def health():
-    """Prueba de conexión real al DWH (no requiere clave, no expone datos)."""
     try:
         client = _cliente()
         client.query("SELECT 1")
@@ -105,11 +106,6 @@ def health():
 
 @app.post("/query")
 def query(body: dict, x_api_key: str | None = Header(default=None)):
-    """
-    Body esperado: {"sql": "SELECT ..."}
-    Header requerido: X-API-Key: <tu clave>
-    Solo acepta SELECT/SHOW/DESCRIBE/EXPLAIN — cualquier otra cosa se rechaza.
-    """
     _chequear_clave(x_api_key)
     sql = body.get("sql", "")
     sql_seguro = _validar_sql(sql)
@@ -127,13 +123,6 @@ def query(body: dict, x_api_key: str | None = Header(default=None)):
 
 @app.get("/q")
 def query_get(sql: str, key: str):
-    """
-    Versión GET del mismo endpoint — para pegar directo en el navegador:
-    https://tu-app.onrender.com/q?key=TU_CLAVE&sql=SELECT+1
-
-    Roberto abre esta URL en el navegador, copia el JSON que aparece, y se lo
-    pega a Claude en el chat — mismas reglas de seguridad que /query.
-    """
     _chequear_clave(key)
     sql_seguro = _validar_sql(sql)
     client = _cliente()
@@ -150,24 +139,14 @@ def query_get(sql: str, key: str):
 
 # ══════════════════════════════════════════════════════════════════════
 #  MONITOR DE SLA DE RESPUESTA ATC (Treble/WhatsApp) — 2 minutos
-#  Corre en segundo plano dentro de este mismo proceso, cada 60 segundos.
-#  No crea ningún servicio ni endpoint nuevo, no consume recursos extra
-#  significativos, y no interactúa con el enrutamiento de Treble — solo
-#  lee datos de fact_conversations.
 # ══════════════════════════════════════════════════════════════════════
 
-SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")  # agregar en Render → Environment
-SLA_THRESHOLD_SECONDS = 60  # 1 minuto: como el ciclo es de 60s, la alerta sale máx. a los 2 min
+SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
+SLA_THRESHOLD_SECONDS = 60
 SLA_POLL_INTERVAL_SECONDS = 60
 
 _sla_already_alerted: set[int] = set()
 
-# Detecta DOS casos (el bug original solo cubría el primero):
-# 1. Sigue sin responder ahora mismo, pasado el umbral (en vivo).
-# 2. Ya respondió, pero tardó más del umbral, Y la respuesta llegó hace poco
-#    (ventana de 90s) — esto evita que se nos escapen casos donde el agente
-#    respondió ENTRE una revisión y la siguiente, que es lo que pasó el
-#    fin de semana: 267 conversaciones respondidas tarde y ninguna alertada.
 ATC_AGENTS = [
     "Camila Rodriguez", "Estefany Suárez", "Mary Cárdenas", "Sofia Castro",
     "Yesith Solano", "Eduardo Liendo", "Samira Pirique", "Lizbeth Calcina",
@@ -204,10 +183,8 @@ def _sla_enviar_slack(fila: dict):
         )
     }
     req = urllib.request.Request(
-        SLACK_WEBHOOK_URL,
-        data=json.dumps(mensaje).encode(),
-        headers={"Content-Type": "application/json"},
-        method="POST",
+        SLACK_WEBHOOK_URL, data=json.dumps(mensaje).encode(),
+        headers={"Content-Type": "application/json"}, method="POST",
     )
     urllib.request.urlopen(req, timeout=10)
 
@@ -244,10 +221,6 @@ def _sla_revisar_una_vez():
 def _sla_monitor_loop():
     global _sla_already_alerted
     print("[SLA monitor] hilo de monitoreo iniciado")
-
-    # Foto inicial: marca como "ya vistos" los casos que existen AL ARRANCAR,
-    # para no mandar de golpe todo el backlog histórico como alertas nuevas.
-    # Solo se alertan casos que aparezcan DESPUÉS de este arranque.
     try:
         sql_seguro = _validar_sql(SLA_SQL)
         client = _cliente()
@@ -267,21 +240,14 @@ def _sla_monitor_loop():
         time.sleep(SLA_POLL_INTERVAL_SECONDS)
 
 
-# Arranca el monitor en segundo plano cuando el bridge levanta (una sola vez).
 threading.Thread(target=_sla_monitor_loop, daemon=True).start()
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  TRIAGE DIARIO — Bandeja "Pedido de especialista" (pipeline Administración)
-#  Corre UNA VEZ AL DÍA dentro de este mismo proceso, sin servicio ni costo
-#  adicional. No ejecuta ninguna acción real (no pausa, no reagenda) —
-#  solo clasifica y manda un resumen con borradores a Slack.
+#  TRIAGE EN VIVO — Bandeja "Pedido de especialista" (pipeline Administración)
 # ══════════════════════════════════════════════════════════════════════
 
-import re as _re
-
 PEDIDOS_SLACK_WEBHOOK_URL = os.environ.get("PEDIDOS_SLACK_WEBHOOK_URL", "")
-PEDIDOS_HORA_UTC = int(os.environ.get("PEDIDOS_HORA_UTC", "12"))  # 12 UTC = 8 AM GMT-4
 PIPELINE_ADMINISTRACION = "74755616"
 STAGE_BANDEJA_ENTRADA = "143884924"
 
@@ -310,8 +276,6 @@ def _pedidos_obtener_tickets():
         "properties": ["subject", "content", "createdate"],
         "limit": 100,
     }
-    # Reutiliza las credenciales del bridge (BRIDGE_API_KEY es para el bridge, no HubSpot;
-    # esta llamada usa un token de HubSpot separado guardado en HUBSPOT_TOKEN)
     hubspot_token = os.environ.get("HUBSPOT_TOKEN", "")
     req = urllib.request.Request(
         "https://api.hubspot.com/crm/v3/objects/tickets/search",
@@ -343,84 +307,33 @@ def _pedidos_clasificar(subject, content):
 
 
 def _pedidos_extraer_nombre(subject):
-    m = _re.search(r'especialista:\s*(?:\(E\)\s*)?(.+?)\s*Por ID', subject)
+    m = re.search(r'especialista:\s*(?:\(E\)\s*)?(.+?)\s*Por ID', subject)
     if m:
         return m.group(1).strip()
-    m2 = _re.match(r'^(.+?)\s*\(ID:', subject)
+    m2 = re.match(r'^(.+?)\s*\(ID:', subject)
     return m2.group(1).strip() if m2 else subject
 
 
 def _pedidos_extraer_id(subject, content):
-    m = _re.search(r'ID:\s*(\d+)', subject + " " + content)
+    m = re.search(r'ID:\s*(\d+)', subject + " " + content)
     return m.group(1) if m else "N/D"
 
 
-def _pedidos_enviar_slack(clasificados):
-    if not clasificados:
-        texto = "*📋 Bandeja Pedido de especialista* — vacía hoy, nada pendiente. ✅"
-    else:
-        lines = [f"*📋 Bandeja Pedido de especialista — {len(clasificados)} casos*\n"]
-        for t in sorted(clasificados, key=lambda x: x["categoria"]):
-            e = PEDIDOS_EMOJI.get(t["categoria"], "•")
-            link = f"https://app.hubspot.com/contacts/{ACCOUNT_ID}/record/0-5/{t['ticket_id']}"
-            lines.append(f"{e} *{t['categoria']}* — {t['especialista']} (cliente {t['id_cliente']})")
-            resumen = t["content"][:120] + ("..." if len(t["content"]) > 120 else "")
-            lines.append(f"   _{resumen}_")
-            if t.get("draft_respuesta"):
-                lines.append(f"   💬 Borrador: {t['draft_respuesta']}")
-            lines.append(f"   <{link}|Ver ticket>")
-            lines.append("")
-        texto = "\n".join(lines)
-
-    req = urllib.request.Request(
-        PEDIDOS_SLACK_WEBHOOK_URL, data=json.dumps({"text": texto}).encode(),
-        headers={"Content-Type": "application/json"}, method="POST",
-    )
-    urllib.request.urlopen(req, timeout=10)
-
-
-def _pedidos_revisar_una_vez():
-    tickets = _pedidos_obtener_tickets()
-    clasificados = []
-    for r in tickets:
-        p = r["properties"]
-        subject = p.get("subject") or ""
-        content = p.get("content") or ""
-        cat = _pedidos_clasificar(subject, content)
-        nombre = _pedidos_extraer_nombre(subject)
-        id_cliente = _pedidos_extraer_id(subject, content)
-        draft = PEDIDOS_DRAFTS.get(cat, "").format(nombre=nombre, id_cliente=id_cliente) if cat in PEDIDOS_DRAFTS else None
-        clasificados.append({
-            "ticket_id": r["id"], "content": content, "categoria": cat,
-            "especialista": nombre, "id_cliente": id_cliente, "draft_respuesta": draft,
-        })
-    print(f"[Pedidos especialista] revisión OK — {len(clasificados)} tickets en bandeja")
-    if PEDIDOS_SLACK_WEBHOOK_URL:
-        _pedidos_enviar_slack(clasificados)
-        print("[Pedidos especialista] resumen enviado a Slack")
-
-
 def _pedidos_enviar_slack_ticket(t):
-    """Un mensaje completo y claro por cada ticket NUEVO — sin recortar contenido."""
     e = PEDIDOS_EMOJI.get(t["categoria"], "•")
     link = f"https://app.hubspot.com/contacts/{ACCOUNT_ID}/record/0-5/{t['ticket_id']}"
-
     partes = [
         f"{e} *Nuevo Pedido de especialista*",
         f"*Categoría:* {t['categoria']}",
         f"*Especialista:* {t['especialista']}",
         f"*Cliente ID:* {t['id_cliente']}",
-        "",
-        f"*Mensaje completo:*",
-        f"> {t['content']}",
+        "", f"*Mensaje completo:*", f"> {t['content']}",
     ]
     if t.get("draft_respuesta"):
         partes += ["", f"*💬 Borrador de respuesta sugerido:*", f"> {t['draft_respuesta']}"]
     partes += ["", f"<{link}|Abrir ticket en HubSpot>"]
-
-    texto = "\n".join(partes)
     req = urllib.request.Request(
-        PEDIDOS_SLACK_WEBHOOK_URL, data=json.dumps({"text": texto}).encode(),
+        PEDIDOS_SLACK_WEBHOOK_URL, data=json.dumps({"text": "\n".join(partes)}).encode(),
         headers={"Content-Type": "application/json"}, method="POST",
     )
     urllib.request.urlopen(req, timeout=10)
@@ -446,10 +359,6 @@ _pedidos_ya_alertados: set = set()
 def _pedidos_monitor_loop():
     global _pedidos_ya_alertados
     print("[Pedidos especialista] hilo en vivo iniciado")
-
-    # Foto inicial: marca como "ya vistos" los tickets que existen AL ARRANCAR,
-    # para no mandar de golpe todo el backlog actual. Solo se alertan tickets
-    # que aparezcan DESPUÉS de este arranque.
     try:
         tickets_iniciales = _pedidos_obtener_tickets()
         _pedidos_ya_alertados = {r["id"] for r in tickets_iniciales}
@@ -462,7 +371,6 @@ def _pedidos_monitor_loop():
             tickets = _pedidos_obtener_tickets()
             nuevos = [r for r in tickets if r["id"] not in _pedidos_ya_alertados]
             print(f"[Pedidos especialista] revisión OK — {len(tickets)} en bandeja, {len(nuevos)} nuevos")
-
             for r in nuevos:
                 clasificado = _pedidos_clasificar_ticket(r)
                 if PEDIDOS_SLACK_WEBHOOK_URL:
@@ -472,7 +380,6 @@ def _pedidos_monitor_loop():
                     except Exception as e:
                         print(f"[Pedidos especialista] ERROR enviando ticket_id={r['id']}: {e}")
                 _pedidos_ya_alertados.add(r["id"])
-
             if len(_pedidos_ya_alertados) > 5000:
                 _pedidos_ya_alertados = set(list(_pedidos_ya_alertados)[-2500:])
         except Exception as e:
@@ -481,3 +388,150 @@ def _pedidos_monitor_loop():
 
 
 threading.Thread(target=_pedidos_monitor_loop, daemon=True).start()
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  ESCALAMIENTO DE PUSHES IGNORADOS (pago + inasistencia)
+#  Corre 1 vez al día. Detecta pacientes con 3+ pushes fallidos/sin
+#  entrega consecutivos en las categorías de pago/inasistencia, marca
+#  requiere_gestion_humana=Sí en HubSpot, y avisa a Slack con prioridad
+#  para que un humano tome el caso en vez de que el automático le siga
+#  insistiendo solo con el mismo mensaje que ya demostró no funcionar.
+# ══════════════════════════════════════════════════════════════════════
+
+ESCALAMIENTO_SLACK_WEBHOOK_URL = os.environ.get("ESCALAMIENTO_SLACK_WEBHOOK_URL", "")
+ESCALAMIENTO_UMBRAL = int(os.environ.get("ESCALAMIENTO_UMBRAL", "3"))
+ESCALAMIENTO_HORA_UTC = int(os.environ.get("ESCALAMIENTO_HORA_UTC", "13"))  # 13 UTC = 9 AM GMT-4
+
+POLLS_PAGO_INASISTENCIA = [
+    "Informe pago fallido 48hs",
+    "Inasistencia 2, 3 o 4ta sesión con AR",
+    "Inasistencia 2, 3, o 4ta sesión",
+    "Inasistencia Primera sesión",
+    "Inasistencias Lau O",
+    "Saludo Carol INASISTENCIAS",
+    "Saludo Giselle INASISTENCIAS",
+    "Carlos inasistencias",
+]
+
+
+def _escalamiento_query_dwh():
+    polls_sql = ",".join(f"'{p}'" for p in POLLS_PAGO_INASISTENCIA)
+    sql = f"""
+    SELECT country_code, cellphone, poll_name, count(*) as veces
+    FROM client_analytics.fact_deployment_status
+    WHERE poll_name IN ({polls_sql})
+      AND status != 'DELIVERED'
+      AND timestamps_eta > now() - INTERVAL 30 DAY
+    GROUP BY country_code, cellphone, poll_name
+    HAVING veces >= {ESCALAMIENTO_UMBRAL}
+    ORDER BY veces DESC
+    LIMIT 200
+    """
+    sql_seguro = _validar_sql(sql)
+    client = _cliente()
+    result = client.query(sql_seguro)
+    columnas = result.column_names
+    return [dict(zip(columnas, row)) for row in result.result_rows]
+
+
+def _escalamiento_buscar_contacto_hubspot(country_code, cellphone):
+    hubspot_token = os.environ.get("HUBSPOT_TOKEN", "")
+    body = {
+        "filterGroups": [{"filters": [{"propertyName": "hs_whatsapp_phone_number", "operator": "CONTAINS_TOKEN", "value": f"*{cellphone}*"}]}],
+        "properties": ["firstname", "lastname", "hs_object_id"],
+        "limit": 1,
+    }
+    req = urllib.request.Request(
+        "https://api.hubspot.com/crm/v3/objects/contacts/search",
+        data=json.dumps(body).encode(),
+        headers={"Authorization": f"Bearer {hubspot_token}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        data = json.load(resp)
+    resultados = data.get("results", [])
+    return resultados[0] if resultados else None
+
+
+def _escalamiento_marcar_hubspot(contact_id, veces):
+    hubspot_token = os.environ.get("HUBSPOT_TOKEN", "")
+    body = {"properties": {"pushes_ignorados_consecutivos": veces, "requiere_gestion_humana": "true"}}
+    req = urllib.request.Request(
+        f"https://api.hubspot.com/crm/v3/objects/contacts/{contact_id}",
+        data=json.dumps(body).encode(),
+        headers={"Authorization": f"Bearer {hubspot_token}", "Content-Type": "application/json"},
+        method="PATCH",
+    )
+    urllib.request.urlopen(req, timeout=15)
+
+
+def _escalamiento_enviar_slack(casos):
+    if not casos:
+        texto = "*🚨 Escalamiento de pushes ignorados* — ningún caso nuevo hoy. ✅"
+    else:
+        lines = [f"*🚨 Escalamiento de pushes ignorados — {len(casos)} casos*\n_Estos pacientes ya no deberían seguir recibiendo el push automático — necesitan contacto humano._\n"]
+        for c in casos[:30]:
+            nombre = c.get("nombre") or "Sin nombre en HubSpot"
+            link = f"https://app.hubspot.com/contacts/{ACCOUNT_ID}/record/0-1/{c['contact_id']}" if c.get("contact_id") else None
+            lines.append(f"• *{nombre}* — {c['poll_name']} sin entregar {c['veces']}x — `{c['country_code']}{c['cellphone']}`")
+            if link:
+                lines.append(f"  <{link}|Ver contacto>")
+        texto = "\n".join(lines)
+
+    req = urllib.request.Request(
+        ESCALAMIENTO_SLACK_WEBHOOK_URL, data=json.dumps({"text": texto}).encode(),
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    urllib.request.urlopen(req, timeout=10)
+
+
+def _escalamiento_revisar_una_vez():
+    filas = _escalamiento_query_dwh()
+    print(f"[Escalamiento] {len(filas)} combinaciones número+push sobre el umbral")
+    casos = []
+    for fila in filas:
+        try:
+            contacto = _escalamiento_buscar_contacto_hubspot(fila["country_code"], fila["cellphone"])
+            if contacto:
+                nombre = f"{contacto['properties'].get('firstname') or ''} {contacto['properties'].get('lastname') or ''}".strip()
+                _escalamiento_marcar_hubspot(contacto["id"], fila["veces"])
+                casos.append({**fila, "contact_id": contacto["id"], "nombre": nombre})
+            else:
+                casos.append({**fila, "contact_id": None, "nombre": None})
+        except Exception as e:
+            print(f"[Escalamiento] error procesando {fila.get('cellphone')}: {e}")
+    if ESCALAMIENTO_SLACK_WEBHOOK_URL:
+        _escalamiento_enviar_slack(casos)
+    print(f"[Escalamiento] {len(casos)} casos procesados y enviados a Slack")
+
+
+def _escalamiento_monitor_loop():
+    print("[Escalamiento] hilo iniciado")
+    marca_archivo = "/tmp/escalamiento_ultimo_envio.txt"
+
+    def _leer():
+        try:
+            with open(marca_archivo) as f:
+                return f.read().strip()
+        except FileNotFoundError:
+            return None
+
+    def _guardar(v):
+        with open(marca_archivo, "w") as f:
+            f.write(v)
+
+    while True:
+        try:
+            ahora = time.gmtime()
+            hoy_str = f"{ahora.tm_year}-{ahora.tm_yday}"
+            en_ventana = ahora.tm_hour == ESCALAMIENTO_HORA_UTC and ahora.tm_min < 10
+            if en_ventana and _leer() != hoy_str:
+                _escalamiento_revisar_una_vez()
+                _guardar(hoy_str)
+        except Exception as e:
+            print(f"[Escalamiento] ERROR: {e}")
+        time.sleep(180)
+
+
+threading.Thread(target=_escalamiento_monitor_loop, daemon=True).start()
