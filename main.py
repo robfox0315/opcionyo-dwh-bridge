@@ -417,13 +417,19 @@ POLLS_PAGO_INASISTENCIA = [
 
 def _escalamiento_query_dwh():
     polls_sql = ",".join(f"'{p}'" for p in POLLS_PAGO_INASISTENCIA)
+    # Contador UNIFICADO: cuenta todos los pushes de pago+inasistencia juntos
+    # por número, no por categoría separada — un paciente que recibió 2
+    # pushes de pago Y 2 de inasistencia también debe escalar (4 en total).
     sql = f"""
-    SELECT country_code, cellphone, poll_name, count(*) as veces
+    SELECT
+        country_code, cellphone,
+        count(*) as veces,
+        groupArray(DISTINCT poll_name) as polls,
+        max(timestamps_eta) as ultimo_push
     FROM client_analytics.fact_deployment_status
     WHERE poll_name IN ({polls_sql})
-      AND status != 'DELIVERED'
       AND timestamps_eta > now() - INTERVAL 30 DAY
-    GROUP BY country_code, cellphone, poll_name
+    GROUP BY country_code, cellphone
     HAVING veces >= {ESCALAMIENTO_UMBRAL}
     ORDER BY veces DESC
     LIMIT 200
@@ -439,7 +445,7 @@ def _escalamiento_buscar_contacto_hubspot(country_code, cellphone):
     hubspot_token = os.environ.get("HUBSPOT_TOKEN", "")
     body = {
         "filterGroups": [{"filters": [{"propertyName": "hs_whatsapp_phone_number", "operator": "CONTAINS_TOKEN", "value": f"*{cellphone}*"}]}],
-        "properties": ["firstname", "lastname", "hs_object_id"],
+        "properties": ["firstname", "lastname", "hs_object_id", "fecha_sesion", "proxima_sesion"],
         "limit": 1,
     }
     req = urllib.request.Request(
@@ -452,6 +458,29 @@ def _escalamiento_buscar_contacto_hubspot(country_code, cellphone):
         data = json.load(resp)
     resultados = data.get("results", [])
     return resultados[0] if resultados else None
+
+
+def _escalamiento_ya_se_recupero(contacto, ultimo_push_str):
+    """True si el contacto ya tiene una sesión programada DESPUÉS del último
+    push — en ese caso no hace falta escalar, ya se recuperó solo."""
+    from datetime import datetime
+    try:
+        ultimo_push = datetime.fromisoformat(ultimo_push_str.replace("Z", "+00:00")) if ultimo_push_str else None
+    except Exception:
+        ultimo_push = None
+    if not ultimo_push:
+        return False
+    for campo in ("proxima_sesion", "fecha_sesion"):
+        val = contacto["properties"].get(campo)
+        if not val:
+            continue
+        try:
+            fecha = datetime.fromisoformat(val.replace("Z", "+00:00"))
+            if fecha > ultimo_push:
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def _escalamiento_marcar_hubspot(contact_id, veces):
@@ -470,11 +499,12 @@ def _escalamiento_enviar_slack(casos):
     if not casos:
         texto = "*🚨 Escalamiento de pushes ignorados* — ningún caso nuevo hoy. ✅"
     else:
-        lines = [f"*🚨 Escalamiento de pushes ignorados — {len(casos)} casos*\n_Estos pacientes ya no deberían seguir recibiendo el push automático — necesitan contacto humano._\n"]
+        lines = [f"*🚨 Escalamiento de pushes ignorados — {len(casos)} casos*\n_Ya se filtraron los que se recuperaron solos (tienen sesión después del último push). Estos siguen sin responder._\n"]
         for c in casos[:30]:
             nombre = c.get("nombre") or "Sin nombre en HubSpot"
             link = f"https://app.hubspot.com/contacts/{ACCOUNT_ID}/record/0-1/{c['contact_id']}" if c.get("contact_id") else None
-            lines.append(f"• *{nombre}* — {c['poll_name']} sin entregar {c['veces']}x — `{c['country_code']}{c['cellphone']}`")
+            polls_txt = ", ".join(c.get("polls", []))
+            lines.append(f"• *{nombre}* — {c['veces']}x sin responder ({polls_txt}) — `{c['country_code']}{c['cellphone']}`")
             if link:
                 lines.append(f"  <{link}|Ver contacto>")
         texto = "\n".join(lines)
@@ -488,19 +518,24 @@ def _escalamiento_enviar_slack(casos):
 
 def _escalamiento_revisar_una_vez():
     filas = _escalamiento_query_dwh()
-    print(f"[Escalamiento] {len(filas)} combinaciones número+push sobre el umbral")
+    print(f"[Escalamiento] {len(filas)} números sobre el umbral")
     casos = []
+    recuperados_solos = 0
     for fila in filas:
         try:
             contacto = _escalamiento_buscar_contacto_hubspot(fila["country_code"], fila["cellphone"])
-            if contacto:
-                nombre = f"{contacto['properties'].get('firstname') or ''} {contacto['properties'].get('lastname') or ''}".strip()
-                _escalamiento_marcar_hubspot(contacto["id"], fila["veces"])
-                casos.append({**fila, "contact_id": contacto["id"], "nombre": nombre})
-            else:
+            if not contacto:
                 casos.append({**fila, "contact_id": None, "nombre": None})
+                continue
+            if _escalamiento_ya_se_recupero(contacto, fila.get("ultimo_push")):
+                recuperados_solos += 1
+                continue  # ya tiene sesión después del último push, no escalar
+            nombre = f"{contacto['properties'].get('firstname') or ''} {contacto['properties'].get('lastname') or ''}".strip()
+            _escalamiento_marcar_hubspot(contacto["id"], fila["veces"])
+            casos.append({**fila, "contact_id": contacto["id"], "nombre": nombre})
         except Exception as e:
             print(f"[Escalamiento] error procesando {fila.get('cellphone')}: {e}")
+    print(f"[Escalamiento] {recuperados_solos} ya se habían recuperado solos (no escalados)")
     if ESCALAMIENTO_SLACK_WEBHOOK_URL:
         _escalamiento_enviar_slack(casos)
     print(f"[Escalamiento] {len(casos)} casos procesados y enviados a Slack")
