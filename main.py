@@ -9,6 +9,15 @@
 REQUIERE: fastapi, uvicorn, clickhouse-connect (igual que v1.2)
 NUEVO EN v1.3: no requiere dependencias nuevas — persistencia usa
 sqlite3 (stdlib), reintentos son caseros (sin librerías externas).
+
+FIX (v1.3.1): _cliente() usaba settings={"max_execution_time": ...}
+al crear el cliente de ClickHouse. Eso se manda como SETTING de
+sesión de ClickHouse, y el usuario opcionyo_readonly tiene el
+perfil en readonly=1, que bloquea CUALQUIER cambio de setting
+server-side -> error "Setting max_execution_time is readonly" en
+el 100% de las queries. Se reemplazó por send_receive_timeout,
+que es un timeout de socket/HTTP del cliente (no pasa por
+validación de readonly de ClickHouse) y logra el mismo objetivo.
 """
 
 import os
@@ -271,7 +280,7 @@ def _cliente():
         return clickhouse_connect.get_client(
             host=DWH_HOST, port=DWH_PORT, username=DWH_USER, password=DWH_PASSWORD,
             database=DWH_DATABASE, secure=True, connect_timeout=10,
-            settings={"max_execution_time": QUERY_TIMEOUT_SEGUNDOS},
+            send_receive_timeout=QUERY_TIMEOUT_SEGUNDOS,
         )
     except Exception as e:
         METRICAS["errores_dwh"] += 1
