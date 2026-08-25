@@ -1,23 +1,30 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║  DWH BRIDGE · Opción Yo · v1.3                                 ║
+║  DWH BRIDGE · Opción Yo · v1.3.2                                ║
 ║  API de solo lectura hacia ClickHouse + monitores de negocio  ║
 ║  (SLA ATC, Pedidos de especialista, Escalamiento de pushes).  ║
 ║  Un solo proceso, sin servicios adicionales, apto Render free. ║
 ╚══════════════════════════════════════════════════════════════╝
 
-REQUIERE: fastapi, uvicorn, clickhouse-connect (igual que v1.2)
-NUEVO EN v1.3: no requiere dependencias nuevas — persistencia usa
-sqlite3 (stdlib), reintentos son caseros (sin librerías externas).
+FIX v1.3.1: _cliente() usaba settings={"max_execution_time": ...},
+que ClickHouse rechaza para el usuario readonly. Se reemplazó por
+send_receive_timeout (timeout de socket del cliente).
 
-FIX (v1.3.1): _cliente() usaba settings={"max_execution_time": ...}
-al crear el cliente de ClickHouse. Eso se manda como SETTING de
-sesión de ClickHouse, y el usuario opcionyo_readonly tiene el
-perfil en readonly=1, que bloquea CUALQUIER cambio de setting
-server-side -> error "Setting max_execution_time is readonly" en
-el 100% de las queries. Se reemplazó por send_receive_timeout,
-que es un timeout de socket/HTTP del cliente (no pasa por
-validación de readonly de ClickHouse) y logra el mismo objetivo.
+FIX v1.3.2 (dos correcciones):
+1. Pedidos de especialista: se agregó filtro CONTAINS_TOKEN +
+   verificación de cliente para que solo pasen tickets cuyo asunto
+   empiece literalmente con "Pedido de especialista" — antes
+   llegaba cualquier ticket de la bandeja de Administración
+   (ej. postergaciones de pago que caen ahí por otro motivo).
+2. SLA: el punto 5 del brief pedía separar "SLA activo" (sigue
+   esperando) de "SLA histórico" (respondió tarde), priorizando
+   el activo para alertas EN VIVO — pero se implementó eliminando
+   por completo el histórico, y casi ninguna conversación queda
+   "esperando" durante los 60s exactos entre dos revisiones, así
+   que dejaron de llegar alertas casi por completo (13 casos
+   reales en 24h, 0 alertados). Se restaura la alerta histórica,
+   con mensaje correcto ("respondió tarde", nunca "sin respuesta"
+   si ya respondió) y como evento separado, tal como pedía el brief.
 """
 
 import os
@@ -36,10 +43,6 @@ from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException, Header
 import clickhouse_connect
 
-# ══════════════════════════════════════════════════════════════
-#  0. LOGGING ESTRUCTURADO
-# ══════════════════════════════════════════════════════════════
-
 logging.basicConfig(
     level=logging.INFO,
     format='{"ts":"%(asctime)s","level":"%(levelname)s","modulo":"%(name)s","msg":%(message)r}',
@@ -48,6 +51,7 @@ log = logging.getLogger("bridge")
 
 METRICAS = {
     "revisiones_sla": 0, "alertas_sla_enviadas": 0, "alertas_sla_fallidas": 0,
+    "alertas_sla_historico_enviadas": 0,
     "revisiones_pedidos": 0, "alertas_pedidos_enviadas": 0,
     "revisiones_escalamiento": 0, "contactos_encontrados": 0,
     "contactos_ambiguos": 0, "contactos_no_encontrados": 0,
@@ -56,16 +60,11 @@ METRICAS = {
 }
 
 
-def _mask_phone(numero: str) -> str:
-    """Enmascara un teléfono para logs/Slack: +525512345678 -> +5255****5678"""
+def _mask_phone(numero):
     if not numero or len(numero) < 8:
         return "***"
     return numero[:5] + "****" + numero[-4:]
 
-
-# ══════════════════════════════════════════════════════════════
-#  1. CONFIGURACIÓN Y VALIDACIÓN DE VARIABLES DE ENTORNO
-# ══════════════════════════════════════════════════════════════
 
 ACCOUNT_ID = int(os.environ.get("HUBSPOT_ACCOUNT_ID", "40159402"))
 
@@ -86,7 +85,7 @@ SLA_POLL_INTERVAL_SECONDS = int(os.environ.get("SLA_POLL_INTERVAL_SECONDS", "60"
 PEDIDOS_POLL_INTERVAL_SECONDS = int(os.environ.get("PEDIDOS_POLL_INTERVAL_SECONDS", "60"))
 ESCALAMIENTO_UMBRAL = int(os.environ.get("ESCALAMIENTO_UMBRAL", "3"))
 ESCALAMIENTO_HORA_UTC = int(os.environ.get("ESCALAMIENTO_HORA_UTC", "13"))
-ESCALAMIENTO_VENTANA_SIN_RESULTADO_HORAS = int(os.environ.get("ESCALAMIENTO_VENTANA_SIN_RESULTADO_HORAS", "720"))  # 30 días — 72h era muy angosto, verificado contra datos reales
+ESCALAMIENTO_VENTANA_SIN_RESULTADO_HORAS = int(os.environ.get("ESCALAMIENTO_VENTANA_SIN_RESULTADO_HORAS", "720"))
 
 ATC_AGENTS_RAW = os.environ.get(
     "ATC_AGENTS",
@@ -98,8 +97,6 @@ ATC_AGENTS = [a.strip() for a in ATC_AGENTS_RAW.split(",") if a.strip()]
 DB_PATH = os.environ.get("BRIDGE_DB_PATH", "/tmp/bridge_state.db")
 LOCK_PATH = os.environ.get("BRIDGE_LOCK_PATH", "/tmp/bridge_monitors.lock")
 
-# Variables requeridas por componente — se valida al arrancar, no se
-# tumba todo el proceso si falta algo de UN monitor opcional.
 REQUISITOS = {
     "api_dwh": {"DWH_HOST": DWH_HOST, "DWH_USER": DWH_USER, "DWH_PASSWORD": DWH_PASSWORD, "BRIDGE_API_KEY": API_KEY},
     "hubspot": {"HUBSPOT_TOKEN": HUBSPOT_TOKEN},
@@ -123,17 +120,6 @@ def _validar_entorno():
 
 ESTADO_CONFIG = _validar_entorno()
 
-# ══════════════════════════════════════════════════════════════
-#  2. PERSISTENCIA (SQLite) — reemplaza los sets en memoria
-#
-#  LIMITACIÓN HONESTA: el disco de Render free web service es
-#  efímero entre DEPLOYS (se borra al redesplegar), pero SÍ
-#  sobrevive a reinicios simples del proceso (crashes, sleep/wake).
-#  Para persistencia real entre deploys se necesitaría un Render
-#  Disk (plan pago) o una base externa (ej. Postgres free de otro
-#  proveedor). Documentado también en la sección G.
-# ══════════════════════════════════════════════════════════════
-
 _db_lock = threading.Lock()
 
 
@@ -153,7 +139,7 @@ def _init_db():
         con.commit()
 
 
-def _evento_ya_notificado(event_type: str, external_id: str) -> bool:
+def _evento_ya_notificado(event_type, external_id):
     with _db_lock, sqlite3.connect(DB_PATH) as con:
         row = con.execute(
             "SELECT status FROM eventos WHERE event_type=? AND external_id=?",
@@ -162,7 +148,7 @@ def _evento_ya_notificado(event_type: str, external_id: str) -> bool:
         return row is not None and row[0] == "notified"
 
 
-def _evento_marcar(event_type: str, external_id: str, status: str, notified: bool = False):
+def _evento_marcar(event_type, external_id, status, notified=False):
     ahora = datetime.now(timezone.utc).isoformat()
     with _db_lock, sqlite3.connect(DB_PATH) as con:
         con.execute(
@@ -175,8 +161,7 @@ def _evento_marcar(event_type: str, external_id: str, status: str, notified: boo
         con.commit()
 
 
-def _evento_seed_baseline(event_type: str, external_ids: list):
-    """Marca IDs existentes al arrancar como 'ya vistos' (no notificar retroactivo)."""
+def _evento_seed_baseline(event_type, external_ids):
     ahora = datetime.now(timezone.utc).isoformat()
     with _db_lock, sqlite3.connect(DB_PATH) as con:
         con.executemany(
@@ -187,17 +172,7 @@ def _evento_seed_baseline(event_type: str, external_ids: list):
         con.commit()
 
 
-# ══════════════════════════════════════════════════════════════
-#  3. LOCK DE UN SOLO PROCESO PARA LOS MONITORES
-#
-#  Render free tier corre WEB_CONCURRENCY=1 por defecto (confirmado
-#  en logs de deploy: "Setting WEB_CONCURRENCY=1 by default, based
-#  on available CPUs"). Aun así, este lock de archivo evita que dos
-#  procesos (ej. un redeploy solapado con el proceso viejo aún
-#  terminando) corran los monitores en paralelo.
-# ══════════════════════════════════════════════════════════════
-
-def _adquirir_lock_monitores() -> bool:
+def _adquirir_lock_monitores():
     try:
         fd = os.open(LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_RDWR)
         os.write(fd, str(os.getpid()).encode())
@@ -207,16 +182,12 @@ def _adquirir_lock_monitores() -> bool:
         try:
             with open(LOCK_PATH) as f:
                 pid_viejo = int(f.read().strip())
-            os.kill(pid_viejo, 0)  # existe el proceso?
-            return False  # sigue vivo, no tomar el lock
+            os.kill(pid_viejo, 0)
+            return False
         except (ProcessLookupError, ValueError, OSError):
-            os.remove(LOCK_PATH)  # lock huérfano, reintentar
+            os.remove(LOCK_PATH)
             return _adquirir_lock_monitores()
 
-
-# ══════════════════════════════════════════════════════════════
-#  4. RETRIES CON BACKOFF EXPONENCIAL
-# ══════════════════════════════════════════════════════════════
 
 def _con_reintentos(fn, *, intentos=3, base_espera=1.5, nombre="operacion"):
     ultimo_error = None
@@ -239,11 +210,7 @@ def _con_reintentos(fn, *, intentos=3, base_espera=1.5, nombre="operacion"):
     raise ultimo_error
 
 
-# ══════════════════════════════════════════════════════════════
-#  5. FASTAPI — endpoints
-# ══════════════════════════════════════════════════════════════
-
-app = FastAPI(title="Opción Yo · DWH Bridge", version="1.3")
+app = FastAPI(title="Opción Yo · DWH Bridge", version="1.3.2")
 
 PALABRAS_PROHIBIDAS = [
     "insert", "update", "delete", "drop", "alter", "create", "truncate",
@@ -255,7 +222,7 @@ MAX_FILAS = int(os.environ.get("BRIDGE_MAX_FILAS", "5000"))
 QUERY_TIMEOUT_SEGUNDOS = int(os.environ.get("BRIDGE_QUERY_TIMEOUT", "20"))
 
 
-def _validar_sql(sql: str) -> str:
+def _validar_sql(sql):
     sql_limpio = sql.strip().rstrip(";").strip()
     if not sql_limpio:
         raise HTTPException(400, "SQL vacío.")
@@ -296,18 +263,16 @@ def _chequear_clave(x_api_key):
 
 @app.get("/")
 def home():
-    return {"servicio": "Opción Yo DWH Bridge", "version": "1.3", "estado": "activo"}
+    return {"servicio": "Opción Yo DWH Bridge", "version": "1.3.2", "estado": "activo"}
 
 
 @app.get("/health")
 def health():
-    """Health básico — no revela detalles internos, para probes de Render."""
     return {"status": "ok"}
 
 
 @app.get("/health/deep")
 def health_deep(x_api_key: str | None = Header(default=None)):
-    """Health profundo — requiere autenticación, sí prueba el DWH."""
     _chequear_clave(x_api_key)
     try:
         _cliente().query("SELECT 1")
@@ -323,7 +288,6 @@ def health_deep(x_api_key: str | None = Header(default=None)):
 
 @app.post("/query")
 def query(body: dict, x_api_key: str | None = Header(default=None)):
-    """Único endpoint de consulta. GET /q fue retirado (exponía SQL+key en la URL/logs)."""
     _chequear_clave(x_api_key)
     sql_seguro = _validar_sql(body.get("sql", ""))
     client = _cliente()
@@ -339,8 +303,7 @@ def query(body: dict, x_api_key: str | None = Header(default=None)):
         raise HTTPException(400, f"Error al ejecutar la consulta: {e}")
 
 
-def _query_interna(sql: str):
-    """Para uso de los monitores internos (no pasa por HTTP)."""
+def _query_interna(sql):
     sql_seguro = _validar_sql(sql)
     client = _cliente()
     result = client.query(sql_seguro)
@@ -348,11 +311,7 @@ def _query_interna(sql: str):
     return [dict(zip(columnas, row)) for row in result.result_rows]
 
 
-# ══════════════════════════════════════════════════════════════
-#  6. HUBSPOT — helpers con reintentos y matching seguro de teléfono
-# ══════════════════════════════════════════════════════════════
-
-def _hubspot_request(method: str, path: str, body: dict = None):
+def _hubspot_request(method, path, body=None):
     def _do():
         url = f"https://api.hubspot.com{path}"
         data = json.dumps(body).encode() if body is not None else None
@@ -369,8 +328,7 @@ def _hubspot_request(method: str, path: str, body: dict = None):
         raise
 
 
-def _normalizar_e164(country_code: str, cellphone: str) -> str | None:
-    """Normaliza country_code + cellphone del DWH a E.164, sin adivinar."""
+def _normalizar_e164(country_code, cellphone):
     cc = re.sub(r"\D", "", country_code or "")
     num = re.sub(r"\D", "", cellphone or "")
     if not cc or not num:
@@ -378,12 +336,7 @@ def _normalizar_e164(country_code: str, cellphone: str) -> str | None:
     return f"+{cc}{num}"
 
 
-def _buscar_contacto_por_telefono(country_code: str, cellphone: str) -> dict:
-    """
-    Busca contacto por coincidencia EXACTA de E.164 en los 3 campos de teléfono.
-    Devuelve: {"resultado": "valido"|"ambiguo"|"no_encontrado", "contact": {...} | None, "candidatos": [...]}
-    NUNCA actualiza al primer resultado de una búsqueda parcial.
-    """
+def _buscar_contacto_por_telefono(country_code, cellphone):
     e164 = _normalizar_e164(country_code, cellphone)
     if not e164:
         return {"resultado": "no_encontrado", "contact": None, "candidatos": []}
@@ -399,9 +352,7 @@ def _buscar_contacto_por_telefono(country_code: str, cellphone: str) -> dict:
     }
     data = _hubspot_request("POST", "/crm/v3/objects/contacts/search", body)
     resultados = data.get("results", [])
-    # Deduplicar por id (puede matchear el mismo contacto en más de un filterGroup)
-    unicos = {r["id"]: r for r in resultados}.values()
-    unicos = list(unicos)
+    unicos = list({r["id"]: r for r in resultados}.values())
 
     if len(unicos) == 0:
         METRICAS["contactos_no_encontrados"] += 1
@@ -413,7 +364,7 @@ def _buscar_contacto_por_telefono(country_code: str, cellphone: str) -> dict:
     return {"resultado": "ambiguo", "contact": None, "candidatos": unicos}
 
 
-def _slack_enviar(webhook_url: str, texto: str, nombre="slack"):
+def _slack_enviar(webhook_url, texto, nombre="slack"):
     def _do():
         req = urllib.request.Request(
             webhook_url, data=json.dumps({"text": texto}).encode(),
@@ -430,7 +381,10 @@ def _slack_enviar(webhook_url: str, texto: str, nombre="slack"):
 
 
 # ══════════════════════════════════════════════════════════════
-#  7. MONITOR DE SLA ATC — 2 minutos, separa "activo" vs "histórico"
+#  MONITOR DE SLA ATC — dos tipos de alerta, ambas restauradas:
+#  - "activo": sigue esperando respuesta ahora mismo.
+#  - "histórico": ya respondió, pero tardó más del umbral. Mensaje
+#    distinto, nunca dice "sin respuesta" (porque ya la hubo).
 # ══════════════════════════════════════════════════════════════
 
 _atc_agents_sql = ", ".join(f"'{a}'" for a in ATC_AGENTS)
@@ -447,12 +401,22 @@ WHERE assigned_at IS NOT NULL
 ORDER BY assigned_at ASC
 """
 
+SQL_SLA_HISTORICO = f"""
+SELECT conversation_id, agent_name, contact_wa_id, assigned_at, first_agent_message_at,
+       dateDiff('second', assigned_at, first_agent_message_at) as seg_tardanza
+FROM client_analytics.fact_conversations
+WHERE assigned_at IS NOT NULL
+  AND assigned_at > now() - INTERVAL 1 DAY
+  AND agent_name IN ({_atc_agents_sql})
+  AND first_agent_message_at IS NOT NULL
+  AND dateDiff('second', assigned_at, first_agent_message_at) >= {SLA_THRESHOLD_SECONDS}
+ORDER BY assigned_at DESC
+"""
 
-def _sla_revisar_una_vez():
-    METRICAS["revisiones_sla"] += 1
+
+def _sla_revisar_activo():
     filas = _query_interna(SQL_SLA_ACTIVO)
-    log.info(f"[sla] {len(filas)} conversaciones activas sobre el umbral")
-
+    log.info(f"[sla-activo] {len(filas)} conversaciones activas sobre el umbral")
     for fila in filas:
         cid = str(fila["conversation_id"])
         if _evento_ya_notificado("sla_activo", cid):
@@ -465,7 +429,7 @@ def _sla_revisar_una_vez():
         )
         try:
             if SLACK_WEBHOOK_URL:
-                _slack_enviar(SLACK_WEBHOOK_URL, texto, nombre="sla")
+                _slack_enviar(SLACK_WEBHOOK_URL, texto, nombre="sla-activo")
             _evento_marcar("sla_activo", cid, "notified", notified=True)
             METRICAS["alertas_sla_enviadas"] += 1
         except Exception:
@@ -473,27 +437,51 @@ def _sla_revisar_una_vez():
             _evento_marcar("sla_activo", cid, "error_envio")
 
 
+def _sla_revisar_historico():
+    filas = _query_interna(SQL_SLA_HISTORICO)
+    log.info(f"[sla-historico] {len(filas)} conversaciones respondidas fuera de tiempo")
+    for fila in filas:
+        cid = str(fila["conversation_id"])
+        if _evento_ya_notificado("sla_historico", cid):
+            continue
+        minutos = round(fila["seg_tardanza"] / 60, 1)
+        texto = (
+            f":warning: *SLA incumplido — respondió tarde*\n"
+            f"Conversación #{fila['conversation_id']} de *{fila.get('agent_name') or 'Sin agente'}* "
+            f"tardó *{minutos} min* en la primera respuesta (umbral: {SLA_THRESHOLD_SECONDS // 60} min)."
+        )
+        try:
+            if SLACK_WEBHOOK_URL:
+                _slack_enviar(SLACK_WEBHOOK_URL, texto, nombre="sla-historico")
+            _evento_marcar("sla_historico", cid, "notified", notified=True)
+            METRICAS["alertas_sla_historico_enviadas"] += 1
+        except Exception:
+            _evento_marcar("sla_historico", cid, "error_envio")
+
+
 def _sla_monitor_loop():
     log.info("[sla] hilo iniciado")
     try:
-        baseline = _query_interna(SQL_SLA_ACTIVO)
-        _evento_seed_baseline("sla_activo", [str(f["conversation_id"]) for f in baseline])
-        log.info(f"[sla] foto inicial: {len(baseline)} casos marcados como vistos")
+        baseline_activo = _query_interna(SQL_SLA_ACTIVO)
+        _evento_seed_baseline("sla_activo", [str(f["conversation_id"]) for f in baseline_activo])
+        baseline_hist = _query_interna(SQL_SLA_HISTORICO)
+        _evento_seed_baseline("sla_historico", [str(f["conversation_id"]) for f in baseline_hist])
+        log.info(f"[sla] foto inicial: {len(baseline_activo)} activos + {len(baseline_hist)} históricos marcados como vistos")
     except Exception as e:
         log.error(f"[sla] error en foto inicial: {e}")
 
     while True:
         try:
-            _sla_revisar_una_vez()
+            METRICAS["revisiones_sla"] += 1
+            _sla_revisar_activo()
+            _sla_revisar_historico()
         except Exception as e:
             log.error(f"[sla] error en revisión: {e}")
         time.sleep(SLA_POLL_INTERVAL_SECONDS)
 
 
 # ══════════════════════════════════════════════════════════════
-#  8. TRIAGE "PEDIDO DE ESPECIALISTA" — sin cambios de fondo,
-#     sigue siendo clasificar + borrador + Slack, nunca ejecución
-#     automática. Solo se agrega persistencia SQLite.
+#  TRIAGE "PEDIDO DE ESPECIALISTA" — filtro de asunto corregido
 # ══════════════════════════════════════════════════════════════
 
 PIPELINE_ADMINISTRACION = os.environ.get("PIPELINE_ADMINISTRACION", "74755616")
@@ -519,12 +507,20 @@ def _pedidos_obtener_tickets():
         "filterGroups": [{"filters": [
             {"propertyName": "hs_pipeline", "operator": "EQ", "value": PIPELINE_ADMINISTRACION},
             {"propertyName": "hs_pipeline_stage", "operator": "EQ", "value": STAGE_BANDEJA_ENTRADA},
+            {"propertyName": "subject", "operator": "CONTAINS_TOKEN", "value": "*Pedido de especialista*"},
         ]}],
         "properties": ["subject", "content", "createdate"],
         "limit": 100,
     }
     data = _hubspot_request("POST", "/crm/v3/objects/tickets/search", body)
-    return data.get("results", [])
+    resultados = data.get("results", [])
+    # Doble chequeo del lado del cliente: exige que el asunto empiece
+    # literalmente con la frase (CONTAINS_TOKEN puede matchear tokens
+    # sueltos y devolver ruido que no es un pedido real, como se
+    # confirmó el 25/08: "Saira Jahzel Arias (ID: 54667)" - una
+    # postergación de pago que cayó en la misma bandeja sin ser un
+    # pedido de especialista real).
+    return [r for r in resultados if (r["properties"].get("subject") or "").strip().lower().startswith("pedido de especialista")]
 
 
 def _pedidos_clasificar(subject, content):
@@ -615,21 +611,7 @@ def _pedidos_monitor_loop():
 
 
 # ══════════════════════════════════════════════════════════════
-#  9. ESCALAMIENTO DE PUSHES — rediseñado
-#
-#  Definición técnica FINAL (verificada empíricamente, no asumida —
-#  ver nota en _escalamiento_query_sin_resultado):
-#    "push sin resultado" = status NOT IN ('DELIVERED','SUCCESS')
-#    dentro de ESCALAMIENTO_VENTANA_SIN_RESULTADO_HORAS.
-#    (timestamp_responded se descartó como señal: está poblado al
-#     100% incluso en fallos totales, no mide interacción real).
-#  Se separan payment_push_count y attendance_push_count.
-#  "Consecutivo" = N intentos fallidos seguidos de la misma
-#  categoría para el mismo número, sin entrega exitosa entre medio.
-#  Recuperación de pago: SOLO por fecha_ultimo_pago posterior al
-#  último push (nunca por "próxima sesión").
-#  Recuperación de inasistencia: por proxima_sesion/fecha_sesion
-#  posterior al último push (esto sí es válido para esta categoría).
+#  ESCALAMIENTO DE PUSHES
 # ══════════════════════════════════════════════════════════════
 
 POLLS_PAGO = [p.strip() for p in os.environ.get(
@@ -644,19 +626,7 @@ POLLS_INASISTENCIA = [p.strip() for p in os.environ.get(
 ).split(",") if p.strip()]
 
 
-def _escalamiento_query_sin_resultado(polls: list):
-    """
-    NOTA IMPORTANTE (verificado contra el DWH real, no asumido):
-    timestamp_responded está poblado en el 100% de las filas de
-    fact_deployment_status, incluso en fallos totales como
-    FAILURE_BY_UNABLE_TO_CONTACT o MISSING_PARAMETER. Esto prueba
-    que NO mide una respuesta/interacción real del destinatario —
-    es un timestamp interno de cierre del registro. Por lo tanto,
-    la señal confiable disponible sigue siendo `status`:
-    'DELIVERED' o 'SUCCESS' = entregado sin problema técnico.
-    Cualquier otro status = intento sin resultado exitoso.
-    Esto es una limitación real del DWH, no una elección de diseño.
-    """
+def _escalamiento_query_sin_resultado(polls):
     polls_sql = ",".join(f"'{p}'" for p in polls)
     sql = f"""
     SELECT deployment_id, country_code, cellphone, poll_name, status, timestamps_eta
@@ -669,13 +639,7 @@ def _escalamiento_query_sin_resultado(polls: list):
     return _query_interna(sql)
 
 
-def _agrupar_consecutivos(filas: list) -> dict:
-    """
-    Agrupa por (country_code, cellphone). 'Consecutivo' aquí significa:
-    N intentos de la misma categoría, todos sin timestamp_responded,
-    ya filtrados en la query — es decir, ninguno tuvo resultado entre
-    medio. Devuelve {telefono: {"veces": N, "deployment_ids": [...], "ultimo": ts}}
-    """
+def _agrupar_consecutivos(filas):
     agrupado = {}
     for f in filas:
         key = (f["country_code"], f["cellphone"])
@@ -690,8 +654,7 @@ def _agrupar_consecutivos(filas: list) -> dict:
     return agrupado
 
 
-def _escalamiento_recuperacion_pago(contacto: dict, ultimo_push) -> bool:
-    """Recuperado SOLO si hay pago real posterior al último push. Nunca por sesión futura."""
+def _escalamiento_recuperacion_pago(contacto, ultimo_push):
     fecha_pago = contacto["properties"].get("fecha_ultimo_pago")
     if not fecha_pago or not ultimo_push:
         return False
@@ -703,8 +666,7 @@ def _escalamiento_recuperacion_pago(contacto: dict, ultimo_push) -> bool:
         return False
 
 
-def _escalamiento_recuperacion_inasistencia(contacto: dict, ultimo_push) -> bool:
-    """Recuperado si hay sesión (próxima o registrada) posterior al último push."""
+def _escalamiento_recuperacion_inasistencia(contacto, ultimo_push):
     if not ultimo_push:
         return False
     up = ultimo_push if ultimo_push.tzinfo else ultimo_push.replace(tzinfo=timezone.utc)
@@ -721,7 +683,7 @@ def _escalamiento_recuperacion_inasistencia(contacto: dict, ultimo_push) -> bool
     return False
 
 
-def _escalamiento_procesar_categoria(polls: list, categoria: str, campo_contador: str):
+def _escalamiento_procesar_categoria(polls, categoria, campo_contador):
     filas = _escalamiento_query_sin_resultado(polls)
     agrupado = _agrupar_consecutivos(filas)
     log.info(f"[escalamiento:{categoria}] {len(agrupado)} números con pushes sin resultado")
@@ -782,7 +744,7 @@ def _escalamiento_procesar_categoria(polls: list, categoria: str, campo_contador
     return casos_a_notificar
 
 
-def _escalamiento_enviar_slack(casos: list):
+def _escalamiento_enviar_slack(casos):
     if not casos:
         texto = "*🚨 Escalamiento de pushes — ningún caso nuevo hoy.* ✅"
     else:
@@ -827,10 +789,6 @@ def _escalamiento_monitor_loop():
             log.error(f"[escalamiento] error: {e}")
         time.sleep(180)
 
-
-# ══════════════════════════════════════════════════════════════
-#  10. ARRANQUE — un solo lanzador de monitores, protegido por lock
-# ══════════════════════════════════════════════════════════════
 
 @app.on_event("startup")
 def arrancar_monitores():
