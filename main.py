@@ -425,7 +425,8 @@ def _sla_revisar_activo():
         texto = (
             f":stopwatch: *SLA de respuesta activo (sigue esperando)*\n"
             f"Conversación #{fila['conversation_id']} asignada a *{fila.get('agent_name') or 'Sin agente'}* "
-            f"hace *{minutos} min* sin primera respuesta."
+            f"hace *{minutos} min* sin primera respuesta.\n"
+            f"Cliente (WhatsApp): `{fila.get('contact_wa_id') or 'N/D'}`"
         )
         try:
             if SLACK_WEBHOOK_URL:
@@ -448,7 +449,8 @@ def _sla_revisar_historico():
         texto = (
             f":warning: *SLA incumplido — respondió tarde*\n"
             f"Conversación #{fila['conversation_id']} de *{fila.get('agent_name') or 'Sin agente'}* "
-            f"tardó *{minutos} min* en la primera respuesta (umbral: {SLA_THRESHOLD_SECONDS // 60} min)."
+            f"tardó *{minutos} min* en la primera respuesta (umbral: {SLA_THRESHOLD_SECONDS // 60} min).\n"
+            f"Cliente (WhatsApp): `{fila.get('contact_wa_id') or 'N/D'}`"
         )
         try:
             if SLACK_WEBHOOK_URL:
