@@ -1,30 +1,29 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║  DWH BRIDGE · Opción Yo · v1.3.2                                ║
+║  DWH BRIDGE · Opción Yo · v1.3.3                                ║
 ║  API de solo lectura hacia ClickHouse + monitores de negocio  ║
-║  (SLA ATC, Pedidos de especialista, Escalamiento de pushes).  ║
-║  Un solo proceso, sin servicios adicionales, apto Render free. ║
+║  (SLA ATC, Pedidos de especialista, Escalamiento de pushes,   ║
+║  Fallos de pushes de onboarding). Un solo proceso, apto Render ║
+║  free.                                                          ║
 ╚══════════════════════════════════════════════════════════════╝
 
 FIX v1.3.1: _cliente() usaba settings={"max_execution_time": ...},
 que ClickHouse rechaza para el usuario readonly. Se reemplazó por
 send_receive_timeout (timeout de socket del cliente).
 
-FIX v1.3.2 (dos correcciones):
-1. Pedidos de especialista: se agregó filtro CONTAINS_TOKEN +
-   verificación de cliente para que solo pasen tickets cuyo asunto
-   empiece literalmente con "Pedido de especialista" — antes
-   llegaba cualquier ticket de la bandeja de Administración
-   (ej. postergaciones de pago que caen ahí por otro motivo).
-2. SLA: el punto 5 del brief pedía separar "SLA activo" (sigue
-   esperando) de "SLA histórico" (respondió tarde), priorizando
-   el activo para alertas EN VIVO — pero se implementó eliminando
-   por completo el histórico, y casi ninguna conversación queda
-   "esperando" durante los 60s exactos entre dos revisiones, así
-   que dejaron de llegar alertas casi por completo (13 casos
-   reales en 24h, 0 alertados). Se restaura la alerta histórica,
-   con mensaje correcto ("respondió tarde", nunca "sin respuesta"
-   si ya respondió) y como evento separado, tal como pedía el brief.
+FIX v1.3.2: filtro de Pedidos de especialista corregido (exige que
+el asunto empiece literalmente con la frase) + alerta SLA histórica
+restaurada.
+
+NUEVO v1.3.3: Monitor de fallos en pushes de onboarding. Hallazgo
+01/09/2026: el push de WhatsApp de confirmación de sesiones a veces
+falla con FAILURE_BY_HUMAN_HANDOVER o FAILURE_BY_UNABLE_TO_CONTACT
+incluso cuando el agente SÍ lo disparó bien — es una falla de
+entrega real de Treble, no un problema de que se olviden de
+mandarlo. No se puede arreglar desde HubSpot (vive en la config del
+bot en Treble, sin acceso). Este monitor no soluciona la causa raíz,
+pero asegura que ningún cliente se quede sin el mensaje en silencio:
+avisa en minutos para que alguien lo reintente a mano.
 """
 
 import os
@@ -56,6 +55,7 @@ METRICAS = {
     "revisiones_escalamiento": 0, "contactos_encontrados": 0,
     "contactos_ambiguos": 0, "contactos_no_encontrados": 0,
     "pacientes_recuperados": 0, "pacientes_escalados": 0,
+    "revisiones_onboarding": 0, "alertas_onboarding_enviadas": 0,
     "errores_slack": 0, "errores_hubspot": 0, "errores_dwh": 0,
 }
 
@@ -79,6 +79,7 @@ HUBSPOT_TOKEN = os.environ.get("HUBSPOT_TOKEN", "")
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
 PEDIDOS_SLACK_WEBHOOK_URL = os.environ.get("PEDIDOS_SLACK_WEBHOOK_URL", "")
 ESCALAMIENTO_SLACK_WEBHOOK_URL = os.environ.get("ESCALAMIENTO_SLACK_WEBHOOK_URL", "")
+ONBOARDING_SLACK_WEBHOOK_URL = os.environ.get("ONBOARDING_SLACK_WEBHOOK_URL", "")
 
 SLA_THRESHOLD_SECONDS = int(os.environ.get("SLA_THRESHOLD_SECONDS", "120"))
 SLA_POLL_INTERVAL_SECONDS = int(os.environ.get("SLA_POLL_INTERVAL_SECONDS", "60"))
@@ -86,6 +87,7 @@ PEDIDOS_POLL_INTERVAL_SECONDS = int(os.environ.get("PEDIDOS_POLL_INTERVAL_SECOND
 ESCALAMIENTO_UMBRAL = int(os.environ.get("ESCALAMIENTO_UMBRAL", "3"))
 ESCALAMIENTO_HORA_UTC = int(os.environ.get("ESCALAMIENTO_HORA_UTC", "13"))
 ESCALAMIENTO_VENTANA_SIN_RESULTADO_HORAS = int(os.environ.get("ESCALAMIENTO_VENTANA_SIN_RESULTADO_HORAS", "720"))
+ONBOARDING_POLL_INTERVAL_SECONDS = int(os.environ.get("ONBOARDING_POLL_INTERVAL_SECONDS", "300"))  # cada 5 min
 
 ATC_AGENTS_RAW = os.environ.get(
     "ATC_AGENTS",
@@ -93,6 +95,23 @@ ATC_AGENTS_RAW = os.environ.get(
     "Yesith Solano,Eduardo Liendo,Samira Pirique,Lizbeth Calcina",
 )
 ATC_AGENTS = [a.strip() for a in ATC_AGENTS_RAW.split(",") if a.strip()]
+
+# Los 6 pushes de onboarding/confirmación de sesión que armamos —
+# los que están sujetos a este monitor de fallos.
+ONBOARDING_POLL_IDS_RAW = os.environ.get(
+    "ONBOARDING_POLL_IDS",
+    "1466598,1466668,1468229,1468224,1466613,1466629"
+)
+ONBOARDING_POLL_IDS = [p.strip() for p in ONBOARDING_POLL_IDS_RAW.split(",") if p.strip()]
+
+ONBOARDING_NOMBRES_POLL = {
+    "1466598": "Confirmación de sesiones premium",
+    "1466668": "Confirmacion de sesiones basico",
+    "1468229": "Recordatorio autoenrollment premium",
+    "1468224": "Recordatorio autoenrollment básico",
+    "1466613": "Especialista confirmación 6 horas antes",
+    "1466629": "Especialista confirmación 3 dias antes",
+}
 
 DB_PATH = os.environ.get("BRIDGE_DB_PATH", "/tmp/bridge_state.db")
 LOCK_PATH = os.environ.get("BRIDGE_LOCK_PATH", "/tmp/bridge_monitors.lock")
@@ -103,6 +122,7 @@ REQUISITOS = {
     "monitor_sla": {"SLACK_WEBHOOK_URL": SLACK_WEBHOOK_URL},
     "monitor_pedidos": {"PEDIDOS_SLACK_WEBHOOK_URL": PEDIDOS_SLACK_WEBHOOK_URL},
     "monitor_escalamiento": {"ESCALAMIENTO_SLACK_WEBHOOK_URL": ESCALAMIENTO_SLACK_WEBHOOK_URL},
+    "monitor_onboarding": {"ONBOARDING_SLACK_WEBHOOK_URL": ONBOARDING_SLACK_WEBHOOK_URL},
 }
 
 
@@ -210,7 +230,7 @@ def _con_reintentos(fn, *, intentos=3, base_espera=1.5, nombre="operacion"):
     raise ultimo_error
 
 
-app = FastAPI(title="Opción Yo · DWH Bridge", version="1.3.2")
+app = FastAPI(title="Opción Yo · DWH Bridge", version="1.3.3")
 
 PALABRAS_PROHIBIDAS = [
     "insert", "update", "delete", "drop", "alter", "create", "truncate",
@@ -263,7 +283,7 @@ def _chequear_clave(x_api_key):
 
 @app.get("/")
 def home():
-    return {"servicio": "Opción Yo DWH Bridge", "version": "1.3.2", "estado": "activo"}
+    return {"servicio": "Opción Yo DWH Bridge", "version": "1.3.3", "estado": "activo"}
 
 
 @app.get("/health")
@@ -516,12 +536,6 @@ def _pedidos_obtener_tickets():
     }
     data = _hubspot_request("POST", "/crm/v3/objects/tickets/search", body)
     resultados = data.get("results", [])
-    # Doble chequeo del lado del cliente: exige que el asunto empiece
-    # literalmente con la frase (CONTAINS_TOKEN puede matchear tokens
-    # sueltos y devolver ruido que no es un pedido real, como se
-    # confirmó el 25/08: "Saira Jahzel Arias (ID: 54667)" - una
-    # postergación de pago que cayó en la misma bandeja sin ser un
-    # pedido de especialista real).
     return [r for r in resultados if (r["properties"].get("subject") or "").strip().lower().startswith("pedido de especialista")]
 
 
@@ -792,6 +806,96 @@ def _escalamiento_monitor_loop():
         time.sleep(180)
 
 
+# ══════════════════════════════════════════════════════════════
+#  MONITOR DE FALLOS EN PUSHES DE ONBOARDING (nuevo v1.3.3)
+#
+#  No arregla la causa raíz (vive en Treble, sin acceso). Solo
+#  asegura que ningún fallo real quede en silencio: revisa cada
+#  5 minutos los 6 poll_id de onboarding, y en cuanto detecta un
+#  registro con status distinto de DELIVERED/SUCCESS, avisa con
+#  el contacto y el link, para que alguien lo reintente a mano
+#  desde HubSpot (Acciones → Inscribir en workflow) en minutos,
+#  no días después por un reclamo del cliente.
+# ══════════════════════════════════════════════════════════════
+
+def _onboarding_query_fallos():
+    polls_sql = ",".join(f"'{p}'" for p in ONBOARDING_POLL_IDS)
+    sql = f"""
+    SELECT deployment_id, poll_id, country_code, cellphone, status, timestamps_eta
+    FROM client_analytics.fact_deployment_status
+    WHERE poll_id IN ({polls_sql})
+      AND status NOT IN ('DELIVERED', 'SUCCESS')
+      AND timestamps_eta > now() - INTERVAL 24 HOUR
+    ORDER BY timestamps_eta DESC
+    """
+    return _query_interna(sql)
+
+
+def _onboarding_enviar_alerta(fila, contacto):
+    poll_id = str(fila["poll_id"])
+    nombre_push = ONBOARDING_NOMBRES_POLL.get(poll_id, f"poll_id {poll_id}")
+    nombre_cliente = "Sin nombre"
+    link = None
+    if contacto:
+        p = contacto["properties"]
+        nombre_cliente = f"{p.get('firstname') or ''} {p.get('lastname') or ''}".strip() or "Sin nombre"
+        link = f"https://app.hubspot.com/contacts/{ACCOUNT_ID}/record/0-1/{contacto['id']}"
+
+    texto = (
+        f":rotating_light: *Push de onboarding sin entregar*\n"
+        f"*Push:* {nombre_push}\n"
+        f"*Cliente:* {nombre_cliente}\n"
+        f"*Motivo:* `{fila['status']}`\n"
+        f"*Teléfono:* `{_mask_phone(fila['country_code'] + fila['cellphone'])}`\n"
+    )
+    if link:
+        texto += f"<{link}|Ver contacto> — reintentar manual: Acciones → Inscribir en workflow → \"{nombre_push}\""
+    else:
+        texto += "⚠️ No se encontró el contacto en HubSpot por este número — revisar manual."
+
+    if ONBOARDING_SLACK_WEBHOOK_URL:
+        _slack_enviar(ONBOARDING_SLACK_WEBHOOK_URL, texto, nombre="onboarding")
+
+
+def _onboarding_revisar_una_vez():
+    METRICAS["revisiones_onboarding"] += 1
+    filas = _onboarding_query_fallos()
+    log.info(f"[onboarding] {len(filas)} fallos detectados en ventana de 24h")
+
+    for fila in filas:
+        event_id = str(fila["deployment_id"])
+        if _evento_ya_notificado("onboarding_fallo", event_id):
+            continue
+
+        resultado = _buscar_contacto_por_telefono(fila["country_code"], fila["cellphone"])
+        contacto = resultado["contact"] if resultado["resultado"] == "valido" else None
+
+        try:
+            _onboarding_enviar_alerta(fila, contacto)
+            _evento_marcar("onboarding_fallo", event_id, "notified", notified=True)
+            METRICAS["alertas_onboarding_enviadas"] += 1
+        except Exception as e:
+            log.error(f"[onboarding] error enviando alerta deployment_id={event_id}: {e}")
+            _evento_marcar("onboarding_fallo", event_id, "error_envio")
+
+
+def _onboarding_monitor_loop():
+    log.info("[onboarding] hilo iniciado")
+    try:
+        baseline = _onboarding_query_fallos()
+        _evento_seed_baseline("onboarding_fallo", [str(f["deployment_id"]) for f in baseline])
+        log.info(f"[onboarding] foto inicial: {len(baseline)} fallos existentes marcados como vistos")
+    except Exception as e:
+        log.error(f"[onboarding] error en foto inicial: {e}")
+
+    while True:
+        try:
+            _onboarding_revisar_una_vez()
+        except Exception as e:
+            log.error(f"[onboarding] error en revisión: {e}")
+        time.sleep(ONBOARDING_POLL_INTERVAL_SECONDS)
+
+
 @app.on_event("startup")
 def arrancar_monitores():
     _init_db()
@@ -813,3 +917,8 @@ def arrancar_monitores():
         threading.Thread(target=_escalamiento_monitor_loop, daemon=True).start()
     else:
         log.warning("[startup] monitor_escalamiento no arranca — configuración incompleta")
+
+    if ESTADO_CONFIG["monitor_onboarding"]["ok"] and ESTADO_CONFIG["hubspot"]["ok"]:
+        threading.Thread(target=_onboarding_monitor_loop, daemon=True).start()
+    else:
+        log.warning("[startup] monitor_onboarding no arranca — falta ONBOARDING_SLACK_WEBHOOK_URL")
