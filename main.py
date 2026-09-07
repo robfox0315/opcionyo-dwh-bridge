@@ -2022,13 +2022,279 @@ def version_bloques(x_api_key: str | None = Header(default=None)):
     _chequear_clave(x_api_key)
     return {
         "base": "1.3.3",
-        "bloques": ["workflows_push (1.3.4)", "cohorte_renovaciones (1.3.5)", "reintento_pushes (1.3.5)"],
+        "bloques": ["workflows_push (1.3.4)", "cohorte_renovaciones (1.3.5)", "reintento_pushes (1.3.5)", "contador_sesiones (1.3.6)"],
         "endpoints_nuevos": [
             "POST /cohorte/setup", "POST /cohorte/procesar",
             "GET /cohorte/renovaciones", "GET /cohorte/kpis",
             "GET /pushes/bloqueados", "POST /pushes/reintentar",
+            "POST /sesiones/setup", "POST /sesiones/sincronizar", "GET /sesiones/embudo",
         ],
     }
+
+
+# ══════════════════════════════════════════════════════════════════
+#  CONTADOR DE SESIONES REALIZADAS
+#  Agregado 07/09/2026 (v1.3.6). BLOQUE PURAMENTE ADITIVO.
+#
+#  ── El problema ───────────────────────────────────────────────────
+#  Angela quiere que los clientes cumplan sus 2 o 4 sesiones del mes
+#  para frenar bajas y reembolsos, y pidió bifurcar el push de 72 h
+#  según si el cliente va en sus primeras 4 sesiones o en la 5ta en
+#  adelante. Las dos cosas chocaban con lo mismo: en HubSpot NO existe
+#  ningún campo con las sesiones realizadas. `sesiones_plan` dice
+#  cuántas contrató (2 o 4), no cuántas hizo; `numero_de_sesiones_hsm`
+#  está vacío; `hsm_sesion_1..4` guarda las fechas AGENDADAS, no la
+#  asistencia; y MEETING_EVENT en HubSpot son reuniones internas.
+#
+#  ── De dónde sale el dato entonces ────────────────────────────────
+#  La plataforma ya dispara un push distinto después de cada sesión
+#  según si el cliente asistió o no, y eso queda registrado en el DWH.
+#  Contar esos envíos por cliente ES el contador que falta:
+#
+#    1282086  Pos primera sesión Sí Asistió
+#    1255377  Pos Segunda sesión Sí Asistió
+#    1255383  Pos Tercera sesión Sí Asistió
+#    1255390  Pos Cuarta sesión Sí Asistió
+#    1255396  Pos Primera sesión No Asistió
+#    1282059  Pos 2,3,4 sesión No Asistió sin AR
+#    1282062  Pos 2,3,4 sesión No Asistió con AR
+#
+#  Verificado antes de construir: 2.362 clientes con sesiones
+#  registradas, 96,2% mapeables a su contacto de HubSpot, historial
+#  desde el 16/06/2026. El ciclo se repite (104 clientes recibieron
+#  el push de primera sesión dos veces), así que se cuentan ENVÍOS
+#  acumulados, no un máximo.
+#
+#  ── Límite honesto ────────────────────────────────────────────────
+#  Esto mide "sesiones con push de cierre DISPARADO". El push se dispara
+#  porque la sesión ocurrió; si Meta lo entrega o no es un hecho
+#  posterior e independiente, así que NO se filtra por estado de entrega.
+#  Esa distinción no es cosmética: filtrando por entrega, el embudo daba
+#  "40% llega a la cuarta sesión" cuando la cifra real es ~84%, porque el
+#  push de la cuarta es rechazado por Meta más de la mitad de las veces.
+#  Un mismo push reenviado el mismo día se cuenta una sola vez.
+#  El campo `sesiones_origen` deja explícito que el dato es derivado: el
+#  día que la plataforma escriba el número real, se cambia la fuente y
+#  nada más se toca.
+# ══════════════════════════════════════════════════════════════════
+
+PROP_SES_ASISTIDAS = "sesiones_asistidas"
+PROP_SES_INASISTENCIAS = "sesiones_inasistencias"
+PROP_SES_ULTIMA = "sesiones_ultima_fecha"
+PROP_SES_ETAPA = "sesiones_etapa"
+PROP_SES_ORIGEN = "sesiones_origen"
+
+# La bifurcación que pidió Angela: hasta completar 4 sesiones el cliente
+# está en acompañamiento (gestoras de consultoría); de la 5ta en adelante
+# pasa a soporte (ATC).
+SESIONES_CORTE_ETAPA = int(os.environ.get("SESIONES_CORTE_ETAPA", "4"))
+SESIONES_ETAPAS = [
+    ("acompanamiento", "Sesiones 1 a 4 · Gestoras de consultoría"),
+    ("soporte", "Sesión 5 en adelante · ATC"),
+]
+
+PUSHES_ASISTIO = {"1282086": 1, "1255377": 2, "1255383": 3, "1255390": 4}
+PUSHES_NO_ASISTIO = {"1255396": 1, "1282059": 0, "1282062": 0}
+SESIONES_MAX_CONTACTOS = int(os.environ.get("SESIONES_MAX_CONTACTOS", "6000"))
+
+for _m in ("sesiones_sincronizadas",):
+    METRICAS.setdefault(_m, 0)
+
+
+def _sesiones_props_existentes():
+    faltan, existen = [], {}
+    for nombre in (PROP_SES_ASISTIDAS, PROP_SES_INASISTENCIAS, PROP_SES_ULTIMA,
+                   PROP_SES_ETAPA, PROP_SES_ORIGEN):
+        try:
+            existen[nombre] = _hubspot_api("GET", f"/crm/v3/properties/contacts/{nombre}")
+        except Exception:
+            faltan.append(nombre)
+    return existen, faltan
+
+
+@app.post("/sesiones/setup")
+def sesiones_setup(x_api_key: str | None = Header(default=None)):
+    """Crea las propiedades del contador si no existen. Idempotente."""
+    _chequear_clave(x_api_key)
+    existen, faltan = _sesiones_props_existentes()
+    if not faltan:
+        return {"creadas": [], "ya_existian": list(existen), "mensaje": "Ya estaban todas."}
+
+    defs = {
+        PROP_SES_ASISTIDAS: {
+            "name": PROP_SES_ASISTIDAS, "label": "Sesiones asistidas", "type": "number",
+            "fieldType": "number", "groupName": GRUPO_COHORTE,
+            "description": "Cuántas sesiones asistió el cliente. Derivado de los pushes de cierre de sesión. Lo mantiene el bridge.",
+        },
+        PROP_SES_INASISTENCIAS: {
+            "name": PROP_SES_INASISTENCIAS, "label": "Sesiones no asistidas", "type": "number",
+            "fieldType": "number", "groupName": GRUPO_COHORTE,
+            "description": "Cuántas veces no asistió a una sesión agendada. Derivado de los pushes de inasistencia.",
+        },
+        PROP_SES_ULTIMA: {
+            "name": PROP_SES_ULTIMA, "label": "Última sesión registrada", "type": "date",
+            "fieldType": "date", "groupName": GRUPO_COHORTE,
+            "description": "Fecha del último cierre de sesión registrado para este cliente.",
+        },
+        PROP_SES_ETAPA: {
+            "name": PROP_SES_ETAPA, "label": "Etapa de acompañamiento", "type": "enumeration",
+            "fieldType": "select", "groupName": GRUPO_COHORTE,
+            "description": "Define a qué equipo va la respuesta del cliente: gestoras de consultoría en sus primeras 4 sesiones, ATC de la 5ta en adelante.",
+            "options": [{"label": et, "value": v, "displayOrder": i, "hidden": False}
+                        for i, (v, et) in enumerate(SESIONES_ETAPAS)],
+        },
+        PROP_SES_ORIGEN: {
+            "name": PROP_SES_ORIGEN, "label": "Origen del conteo de sesiones", "type": "string",
+            "fieldType": "text", "groupName": GRUPO_COHORTE,
+            "description": "De dónde salió el número. Hoy: derivado de pushes de cierre. Cambia el día que la plataforma escriba el dato real.",
+        },
+    }
+    creadas, errores = [], []
+    for nombre in faltan:
+        try:
+            _hubspot_api("POST", "/crm/v3/properties/contacts", defs[nombre])
+            creadas.append(nombre)
+        except Exception as e:
+            errores.append({"propiedad": nombre, "error": str(e)[:300]})
+    log.warning(f"[sesiones] setup creadas={creadas} errores={errores}")
+    return {"creadas": creadas, "ya_existian": list(existen), "errores": errores}
+
+
+def _sesiones_desde_dwh(dias=None):
+    """
+    Un renglón por cliente con su conteo de sesiones, ya mapeado al
+    contacto de HubSpot. Cuenta pushes DISPARADOS, no entregados: el push
+    sale porque la sesión ocurrió. Un mismo push repetido el mismo día es
+    un reintento, no otra sesión, y se cuenta una vez.
+    """
+    asistio = ",".join(f"'{k}'" for k in PUSHES_ASISTIO)
+    no_asistio = ",".join(f"'{k}'" for k in PUSHES_NO_ASISTIO)
+    corte = f"AND timestamps_eta >= now() - INTERVAL {int(dias)} DAY" if dias else ""
+    sql = f"""
+    WITH d AS (
+      SELECT treble_id tid, toString(poll_id) pid, timestamps_eta ts
+      FROM fact_deployment_status
+      WHERE toString(poll_id) IN ({asistio},{no_asistio}) {corte}
+    ),
+    c AS (
+      SELECT contact_wa_id wa, any(helpdesk_contact_id) hs
+      FROM fact_conversations WHERE helpdesk_contact_id != '' GROUP BY wa
+    )
+    SELECT d.tid tid, any(c.hs) hubspot_id,
+           uniqExactIf(concat(d.pid, '|', toString(toDate(d.ts))), d.pid IN ({asistio})) asistidas,
+           uniqExactIf(concat(d.pid, '|', toString(toDate(d.ts))), d.pid IN ({no_asistio})) inasistencias,
+           toDate(max(d.ts)) ultima
+    FROM d LEFT JOIN c ON d.tid = c.wa
+    GROUP BY tid
+    HAVING hubspot_id != ''
+    ORDER BY ultima DESC
+    LIMIT {SESIONES_MAX_CONTACTOS}
+    """
+    return _query_interna(sql)
+
+
+@app.get("/sesiones/embudo")
+def sesiones_embudo(x_api_key: str | None = Header(default=None), dias: int | None = None):
+    """
+    El embudo de asistencia: cuántos clientes llegan a cada sesión.
+    Es el KPI que hoy no existe y que Angela necesita para saber si la
+    meta de "2 a 4 sesiones al mes" se está cumpliendo.
+    """
+    _chequear_clave(x_api_key)
+    corte = f"AND timestamps_eta >= now() - INTERVAL {int(dias)} DAY" if dias else ""
+    sql = f"""
+    SELECT
+      uniqExactIf(treble_id, toString(poll_id)='1282086') sesion_1,
+      uniqExactIf(treble_id, toString(poll_id)='1255377') sesion_2,
+      uniqExactIf(treble_id, toString(poll_id)='1255383') sesion_3,
+      uniqExactIf(treble_id, toString(poll_id)='1255390') sesion_4,
+      uniqExactIf(treble_id, toString(poll_id)='1255396') falto_a_la_1,
+      uniqExactIf(treble_id, toString(poll_id) IN ('1282059','1282062')) falto_a_otra
+    FROM fact_deployment_status
+    WHERE toString(poll_id) IN ('1282086','1255377','1255383','1255390','1255396','1282059','1282062') {corte}
+    LIMIT 1
+    """
+    f = (_query_interna(sql) or [{}])[0]
+    s1 = f.get("sesion_1") or 0
+    return {
+        "generado": datetime.now(timezone.utc).isoformat(),
+        "ventana_dias": dias,
+        "clientes_por_sesion": {
+            "1": s1, "2": f.get("sesion_2"), "3": f.get("sesion_3"), "4": f.get("sesion_4"),
+        },
+        "inasistencias": {
+            "faltaron_a_la_primera": f.get("falto_a_la_1"),
+            "faltaron_a_alguna_de_2_a_4": f.get("falto_a_otra"),
+        },
+        "llegan_a_la_cuarta": round((f.get("sesion_4") or 0) / s1, 4) if s1 else None,
+        "nota": ("Derivado de los pushes de cierre de sesión ENVIADOS, no entregados: el push "
+                 "sale porque la sesión ocurrió, y que Meta lo entregue es posterior e "
+                 "independiente. Filtrar por entrega distorsiona el embudo — el push de la "
+                 "cuarta sesión hoy es rechazado por Meta el 55,6% de las veces."),
+        "salud_de_los_pushes": ("Revisar aparte: Pos 4a sesión 55,6% FAILURE_BY_META_CHOSE_NOT_DELIVER, "
+                 "Pos 1a 15,7% MISSING_PARAMETER, Pos 3a 9,0% MISSING_PARAMETER. No afecta el "
+                 "conteo de sesiones, sí afecta que el cliente reciba el mensaje."),
+    }
+
+
+@app.post("/sesiones/sincronizar")
+def sesiones_sincronizar(
+    x_api_key: str | None = Header(default=None),
+    aplicar: str | None = None,
+    dias: int | None = None,
+):
+    """
+    Calcula el conteo desde el DWH y lo escribe en la ficha de cada
+    contacto, junto con la etapa que decide el enrutamiento del push
+    de 72 h. DRY-RUN por defecto.
+    """
+    _chequear_clave(x_api_key)
+    _, faltan = _sesiones_props_existentes()
+    if faltan:
+        raise HTTPException(409, f"Faltan propiedades: {faltan}. Llamá primero a POST /sesiones/setup.")
+
+    escribir = _a_bool(aplicar, por_defecto=False)
+    filas = _sesiones_desde_dwh(dias)
+
+    entradas, etapas = [], {"acompanamiento": 0, "soporte": 0}
+    for f in filas:
+        hs = str(f.get("hubspot_id") or "").strip()
+        if not hs.isdigit():
+            continue
+        asistidas = int(f.get("asistidas") or 0)
+        etapa = "soporte" if asistidas >= SESIONES_CORTE_ETAPA else "acompanamiento"
+        etapas[etapa] += 1
+        props = {
+            PROP_SES_ASISTIDAS: asistidas,
+            PROP_SES_INASISTENCIAS: int(f.get("inasistencias") or 0),
+            PROP_SES_ETAPA: etapa,
+            PROP_SES_ORIGEN: "Derivado de pushes de cierre de sesión (bridge)",
+        }
+        ultima = _a_fecha(f.get("ultima"))
+        if ultima:
+            props[PROP_SES_ULTIMA] = _dia_ms(ultima)
+        entradas.append({"id": hs, "properties": props})
+
+    resultado = {
+        "modo": "aplicado" if escribir else "simulacion",
+        "clientes_con_sesiones": len(filas),
+        "a_escribir": len(entradas),
+        "sin_contacto_en_hubspot": len(filas) - len(entradas),
+        "por_etapa": etapas,
+        "corte_de_etapa": SESIONES_CORTE_ETAPA,
+        "muestra": [{"hubspot_id": e["id"],
+                     "asistidas": e["properties"][PROP_SES_ASISTIDAS],
+                     "etapa": e["properties"][PROP_SES_ETAPA]} for e in entradas[:10]],
+    }
+    if not escribir:
+        resultado["aviso"] = "Simulación. Para escribir en HubSpot: POST /sesiones/sincronizar?aplicar=true"
+        return resultado
+
+    escritos, errores = _hs_batch_update("contacts", entradas)
+    METRICAS["sesiones_sincronizadas"] += escritos
+    resultado.update({"escritos": escritos, "errores": errores})
+    log.warning(f"[sesiones] sincronizadas={escritos} errores={len(errores)}")
+    return resultado
 
 
 @app.on_event("startup")
