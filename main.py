@@ -1089,7 +1089,13 @@ def _wf_push(usar_cache=True, resolver_dudosos=True):
     resultado, dudosos = [], []
     for f in flows:
         nombre = f.get("name") or ""
-        if not nombre.startswith(PREFIJO_WORKFLOW_PUSH):
+        # SOLO los que siguen EXACTAMENTE nuestro patrón "PUSH - X (auto)".
+        # El portal tiene ~103 workflows preexistentes llamados "PUSH - X"
+        # (sin el sufijo) que son de la operación normal y NO se disparan por
+        # la propiedad `enviar_push`. Antes se colaban en el cruce: al quitar
+        # el sufijo quedaban con el mismo label que los nuestros y salían
+        # marcados como 102 "duplicados" falsos.
+        if not (nombre.startswith(PREFIJO_WORKFLOW_PUSH) and nombre.endswith(SUFIJO_WORKFLOW_PUSH)):
             continue
         entrada = {
             "flow_id": f.get("id"),
@@ -1257,6 +1263,25 @@ def crear_workflow_push(body: dict, x_api_key: str | None = Header(default=None)
         nombre_previsto = f"{PREFIJO_WORKFLOW_PUSH}{label}{SUFIJO_WORKFLOW_PUSH}"
         ya = [w for w in existentes
               if conversation_id in w["conversation_ids"] or w["nombre"] == nombre_previsto]
+        # Además: cualquier workflow "PUSH - <label>" (aunque le falte el
+        # sufijo "(auto)" por haber sido renombrado a mano, o sea preexistente
+        # de la operación) cuenta como coincidencia. Para CREAR se es
+        # deliberadamente conservador: ante la duda, no se crea, porque un
+        # duplicado significa que el cliente recibe el WhatsApp dos veces.
+        if not ya:
+            try:
+                todos, _ = _wf_listar_flows()
+                parecidos = [{"flow_id": f.get("id"), "nombre": f.get("name")}
+                             for f in todos
+                             if (f.get("name") or "").startswith(PREFIJO_WORKFLOW_PUSH)
+                             and _label_desde_nombre(f.get("name") or "").casefold() == label.casefold()]
+            except Exception:
+                parecidos = []
+            if parecidos:
+                raise HTTPException(409, f"Ya existe un workflow con ese mismo nombre de push: "
+                                         f"{[p['nombre'] for p in parecidos]} (flow_id {[p['flow_id'] for p in parecidos]}). "
+                                         f"Puede ser uno renombrado o preexistente. Revisalo antes de crear otro; "
+                                         f"si igual querés crearlo, usá \"forzar\": true.")
         if ya:
             raise HTTPException(409, f"Ya existe workflow para conversation_id {conversation_id}: "
                                      f"{[w['nombre'] for w in ya]} (flow_id {[w['flow_id'] for w in ya]}). "
@@ -1333,6 +1358,15 @@ def auditar_workflows_push(x_api_key: str | None = Header(default=None)):
     huerfanos = [w for w in workflows
                  if w["conversation_ids"] and not any(c in pushes for c in w["conversation_ids"])]
 
+    try:
+        todos_flows, _ = _wf_listar_flows()
+        otros = [{"flow_id": f.get("id"), "nombre": f.get("name"), "activo": f.get("isEnabled")}
+                 for f in todos_flows
+                 if (f.get("name") or "").startswith(PREFIJO_WORKFLOW_PUSH)
+                 and not (f.get("name") or "").endswith(SUFIJO_WORKFLOW_PUSH)]
+    except Exception:
+        otros = []
+
     METRICAS["auditorias_workflows"] += 1
     resultado = {
         "cruce_confiable": confiable,
@@ -1346,6 +1380,10 @@ def auditar_workflows_push(x_api_key: str | None = Header(default=None)):
         "huerfanos": huerfanos,
         "sin_referencia_detectable": [w for w in workflows if not w["conversation_ids"]],
         "desactivados": [w for w in workflows if w["activo"] is False],
+        # Informativo: workflows "PUSH - ..." preexistentes de la operación que
+        # NO siguen nuestro patrón "(auto)". No entran en el cruce ni cuentan
+        # como duplicados; se listan para que nadie los confunda con los nuestros.
+        "otros_workflows_push_no_gestionados": otros,
     }
     if not confiable:
         resultado["advertencia"] = ("El cruce no es confiable (listado cortado por tiempo o workflows que no "
@@ -1353,6 +1391,40 @@ def auditar_workflows_push(x_api_key: str | None = Header(default=None)):
                                     "workflows a partir de esta auditoría; reintentá en un minuto.")
         resultado["no_resueltos"] = [w for w in workflows if w.get("origen") in (None, "no_resuelto", "error")]
     return resultado
+
+
+@app.get("/workflows/{flow_id}/detalle")
+def detalle_workflow(flow_id: str, x_api_key: str | None = Header(default=None)):
+    """
+    Detalle completo de un workflow (solo lectura): trigger, acciones y estado.
+    Sirve para verificar qué dispara realmente un workflow sin depender de la
+    UI de HubSpot, y para diagnosticar sin adivinar.
+    """
+    _chequear_clave(x_api_key)
+    flow_id = _validar_id_numerico(flow_id, "flow_id")
+    try:
+        flow = _hubspot_api("GET", f"/automation/v4/flows/{flow_id}")
+    except urllib.error.HTTPError as e:
+        detalle = e.read().decode() if hasattr(e, "read") else str(e)
+        raise HTTPException(e.code, f"No se pudo leer el workflow {flow_id}: {detalle}")
+    except Exception as e:
+        raise HTTPException(502, f"No se pudo leer el workflow {flow_id}: {e}")
+
+    criterios = json.dumps(flow.get("enrollmentCriteria") or {}, ensure_ascii=False)
+    return {
+        "flow_id": flow.get("id"),
+        "nombre": flow.get("name"),
+        "activo": flow.get("isEnabled"),
+        "tipo_inscripcion": (flow.get("enrollmentCriteria") or {}).get("type"),
+        # Lo que de verdad importa: ¿este workflow escucha la propiedad de pushes?
+        "escucha_enviar_push": PROP_ENVIAR_PUSH in criterios,
+        "pushes_en_el_trigger": sorted(set(re.findall(r"PUSH_(\d+)", criterios))),
+        "conversation_ids_en_acciones": sorted(_wf_conversation_ids(flow)),
+        "acciones": [{"actionId": a.get("actionId"), "actionTypeId": a.get("actionTypeId"),
+                      "fields": a.get("fields")} for a in (flow.get("actions") or [])],
+        "creado": flow.get("createdAt"),
+        "actualizado": flow.get("updatedAt"),
+    }
 
 
 @app.delete("/workflows/{flow_id}")
