@@ -896,6 +896,514 @@ def _onboarding_monitor_loop():
         time.sleep(ONBOARDING_POLL_INTERVAL_SECONDS)
 
 
+
+# ══════════════════════════════════════════════════════════════
+#  WORKFLOWS "PUSH - ... (auto)" — crear / listar / auditar / borrar
+#  Agregado 05/09/2026 (v1.3.4). BLOQUE PURAMENTE ADITIVO:
+#  no modifica ni una línea del código anterior, para no arriesgar
+#  nada de lo que ya está corriendo (monitores de SLA, pedidos,
+#  escalamiento, onboarding y el endpoint /query).
+#
+#  Motivo: cierra el gap detectado en la auditoría del 04/09 — cuando
+#  aparece un push nuevo en la propiedad `enviar_push` sin su workflow,
+#  se crea con una llamada en vez de ~10 min de clics en la UI.
+#
+#  Esquema descubierto por prueba y error controlado contra la API real
+#  (POST /automation/v4/flows es BETA y su schema NO está documentado
+#  para acciones de apps custom). Lo que costó encontrar:
+#   - "actions" es un ARRAY (no un objeto con claves "1","2": esa forma
+#     es solo la representación interna de lectura de la UI).
+#   - La acción de Treble usa actionTypeId "1-49295660" con fields
+#     planos {"conversation_id","channel_id"}; channel_id es constante
+#     (42571) en los 102 pushes, verificado contra workflows reales.
+#   - La acción "Editar registro" usa actionTypeId "0-5" y su value
+#     EXIGE {"staticValue": "", "type": "STATIC_VALUE"} — sin el "type"
+#     HubSpot responde 500 genérico, no un error de validación.
+#   - El trigger va en enrollmentCriteria.type = "LIST_BASED" con
+#     "listFilterBranch" (no "EVENT_BASED"/"filterBranch").
+# ══════════════════════════════════════════════════════════════
+
+CHANNEL_ID_WHATSAPP = os.environ.get("TREBLE_CHANNEL_ID", "42571")
+TREBLE_ACTION_TYPE_ID = os.environ.get("TREBLE_ACTION_TYPE_ID", "1-49295660")
+TREBLE_ACTION_VERSION = int(os.environ.get("TREBLE_ACTION_VERSION", "4"))
+
+PREFIJO_WORKFLOW_PUSH = "PUSH - "
+SUFIJO_WORKFLOW_PUSH = " (auto)"
+PROP_ENVIAR_PUSH = "enviar_push"
+# Tope de detalles individuales a pedir cuando un workflow no cruza por nombre.
+MAX_DETALLES_FLOW = int(os.environ.get("MAX_DETALLES_FLOW", "25"))
+LIMITE_SEGUNDOS_DETALLE = int(os.environ.get("LIMITE_SEGUNDOS_DETALLE", "20"))
+# Salvaguarda: el portal tiene 1.100+ workflows, muchos críticos de
+# Marketing y Ventas. Este bridge solo puede borrar los que encajan con
+# estos prefijos, salvo override explícito en la query string.
+PREFIJOS_BORRABLES = (PREFIJO_WORKFLOW_PUSH, "TEST - ")
+
+CACHE_FLOWS_SEGUNDOS = int(os.environ.get("CACHE_FLOWS_SEGUNDOS", "60"))
+# Presupuesto de tiempo para paginar los ~1.100 flows. Sin tope, el peor caso
+# eran 60 páginas × 20s = 20 min y Render cortaba el request a medias.
+LIMITE_SEGUNDOS_LISTADO = int(os.environ.get("LIMITE_SEGUNDOS_LISTADO", "45"))
+_CACHE_FLOWS = {"ts": 0.0, "datos": None, "completo": False}
+
+
+def _a_bool(valor, por_defecto=True):
+    """
+    bool("false") es True en Python: si el body traía {"activar": "false"} el
+    workflow se creaba ACTIVO igual. Esto interpreta el string de verdad.
+    """
+    if valor is None:
+        return por_defecto
+    if isinstance(valor, bool):
+        return valor
+    if isinstance(valor, (int, float)):
+        return bool(valor)
+    return str(valor).strip().lower() in ("1", "true", "t", "yes", "y", "si", "sí")
+
+# Contadores propios: se agregan al dict existente sin tocar su declaración.
+for _m in ("workflows_creados", "workflows_eliminados", "auditorias_workflows"):
+    METRICAS.setdefault(_m, 0)
+
+
+def _hubspot_api(method, path, body=None):
+    """
+    Igual que _hubspot_request pero tolera respuestas sin cuerpo (un DELETE
+    devuelve 204 vacío y json.loads("") reventaría). Se define aparte en vez
+    de modificar _hubspot_request para no tocar el camino que ya usan los
+    monitores en producción.
+    """
+    def _do():
+        url = f"https://api.hubspot.com{path}"
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(
+            url, data=data, method=method,
+            headers={"Authorization": f"Bearer {HUBSPOT_TOKEN}", "Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            crudo = resp.read().decode()
+            return json.loads(crudo) if crudo.strip() else {}
+
+    try:
+        return _con_reintentos(_do, nombre=f"hubspot {method} {path}")
+    except Exception:
+        METRICAS["errores_hubspot"] += 1
+        raise
+
+
+def _validar_id_numerico(valor, campo):
+    """
+    Los IDs se concatenan a la URL de HubSpot: sin validar, un valor como
+    "../../crm/v3/objects/contacts" saldría de la ruta prevista.
+    """
+    valor = str(valor or "").strip()
+    if not re.fullmatch(r"\d{1,20}", valor):
+        raise HTTPException(400, f"{campo} inválido: debe ser numérico.")
+    return valor
+
+
+def _wf_listar_flows(usar_cache=True):
+    """
+    Todos los flows del portal (~1.100 → ~12 llamadas), con caché corto.
+    Devuelve (flows, completo). `completo` es False si la paginación se cortó
+    por tiempo o por el tope de páginas: un listado a medias haría que la
+    auditoría reporte como "faltantes" pushes que SÍ tienen workflow, y crear
+    sobre esa base generaría DUPLICADOS (el cliente recibiría el push dos
+    veces). Por eso la completitud se propaga en vez de ocultarse.
+    """
+    ahora = time.time()
+    if usar_cache and _CACHE_FLOWS["datos"] is not None and (ahora - _CACHE_FLOWS["ts"]) < CACHE_FLOWS_SEGUNDOS:
+        return _CACHE_FLOWS["datos"], _CACHE_FLOWS["completo"]
+
+    flows, after, vistos, completo = [], None, set(), False
+    inicio = time.time()
+    for _ in range(60):
+        if time.time() - inicio > LIMITE_SEGUNDOS_LISTADO:
+            log.warning(f"[workflows] listado cortado por tiempo tras {len(flows)} flows")
+            break
+        path = "/automation/v4/flows?limit=100"
+        if after:
+            path += f"&after={after}"
+        data = _hubspot_api("GET", path)
+        flows.extend(data.get("results", []))
+        after = ((data.get("paging") or {}).get("next") or {}).get("after")
+        if not after or after in vistos:   # sin cursor = terminó; repetido = bucle
+            completo = not after
+            break
+        vistos.add(after)
+
+    _CACHE_FLOWS.update({"datos": flows, "ts": ahora, "completo": completo})
+    log.info(f"[workflows] listados {len(flows)} flows del portal (completo={completo})")
+    return flows, completo
+
+
+def _wf_conversation_ids(flow):
+    """
+    conversation_id que dispara un flow, leído del detalle del flow.
+    OJO: el LISTADO (GET /automation/v4/flows) NO devuelve `actions` ni
+    `enrollmentCriteria` — solo id, name, isEnabled y fechas. Verificado
+    contra la API real. Por eso esta función solo sirve sobre el DETALLE
+    (GET /automation/v4/flows/{id}); para el listado se usa el cruce por
+    nombre de _wf_push().
+    """
+    ids = set()
+    for accion in flow.get("actions") or []:
+        if accion.get("actionTypeId") == TREBLE_ACTION_TYPE_ID:
+            cid = (accion.get("fields") or {}).get("conversation_id")
+            if cid:
+                ids.add(str(cid))
+    if ids:
+        return ids
+    ids.update(re.findall(r"PUSH_(\d+)", json.dumps(flow.get("enrollmentCriteria") or {})))
+    return ids
+
+
+def _label_desde_nombre(nombre):
+    """'PUSH - Saludo Gestoras Consultoria (auto)' → 'Saludo Gestoras Consultoria'."""
+    interno = nombre[len(PREFIJO_WORKFLOW_PUSH):]
+    if interno.endswith(SUFIJO_WORKFLOW_PUSH):
+        interno = interno[: -len(SUFIJO_WORKFLOW_PUSH)]
+    return interno.strip()
+
+
+def _wf_push(usar_cache=True, resolver_dudosos=True):
+    """
+    Devuelve (workflows_push, confiable).
+
+    Cómo se resuelve el conversation_id de cada workflow, dado que el listado
+    NO trae las acciones:
+      1) Cruce por nombre: los workflows se llaman "PUSH - <label> (auto)" y
+         las opciones de `enviar_push` traen ese mismo <label>. Es exacto,
+         determinista y no cuesta ni una llamada extra.
+      2) Los que no cruzan por nombre (renombrados a mano, por ejemplo) se
+         resuelven pidiendo el detalle del flow uno por uno, con tope para no
+         agotar el tiempo del request.
+    `confiable` es False si el listado quedó incompleto o si quedaron
+    workflows sin resolver: en ese caso no se puede afirmar cobertura ni
+    crear nada sin arriesgar duplicados.
+    """
+    flows, completo = _wf_listar_flows(usar_cache)
+    try:
+        pushes = _wf_opciones_push()
+    except Exception:
+        pushes = {}
+    por_label = {label.strip(): cid for cid, label in pushes.items()}
+
+    resultado, dudosos = [], []
+    for f in flows:
+        nombre = f.get("name") or ""
+        if not nombre.startswith(PREFIJO_WORKFLOW_PUSH):
+            continue
+        entrada = {
+            "flow_id": f.get("id"),
+            "nombre": nombre,
+            "activo": f.get("isEnabled"),
+            "conversation_ids": [],
+            "origen": None,
+        }
+        cid = por_label.get(_label_desde_nombre(nombre))
+        if cid:
+            entrada["conversation_ids"] = [cid]
+            entrada["origen"] = "nombre"
+        else:
+            dudosos.append(entrada)
+        resultado.append(entrada)
+
+    sin_resolver = 0
+    if resolver_dudosos and dudosos:
+        inicio = time.time()
+        for entrada in dudosos:
+            if len(dudosos) > MAX_DETALLES_FLOW or (time.time() - inicio) > LIMITE_SEGUNDOS_DETALLE:
+                sin_resolver += 1
+                continue
+            try:
+                detalle = _hubspot_api("GET", f"/automation/v4/flows/{entrada['flow_id']}")
+                entrada["conversation_ids"] = sorted(_wf_conversation_ids(detalle))
+                entrada["origen"] = "detalle" if entrada["conversation_ids"] else "no_resuelto"
+                if not entrada["conversation_ids"]:
+                    sin_resolver += 1
+            except Exception as e:
+                log.warning(f"[workflows] no se pudo leer el detalle de {entrada['flow_id']}: {e}")
+                entrada["origen"] = "error"
+                sin_resolver += 1
+    elif dudosos:
+        sin_resolver = len(dudosos)
+
+    confiable = completo and sin_resolver == 0
+    if not confiable:
+        log.warning(f"[workflows] cruce NO confiable (listado_completo={completo}, sin_resolver={sin_resolver})")
+    return resultado, confiable
+
+
+def _wf_opciones_push():
+    """{conversation_id: label} desde las opciones de la propiedad enviar_push."""
+    prop = _hubspot_api("GET", f"/crm/v3/properties/contacts/{PROP_ENVIAR_PUSH}")
+    pushes = {}
+    for opcion in prop.get("options") or []:
+        m = re.fullmatch(r"PUSH_(\d+)", (opcion.get("value") or "").strip())
+        if m:
+            pushes[m.group(1)] = opcion.get("label") or ""
+    return pushes
+
+
+def _wf_payload(label, conversation_id, activar=True, descripcion=None):
+    push_value = f"PUSH_{conversation_id}"
+    nombre = f"{PREFIJO_WORKFLOW_PUSH}{label} (auto)"
+    payload = {
+        "isEnabled": bool(activar),
+        "flowType": "WORKFLOW",
+        "type": "CONTACT_FLOW",
+        "name": nombre,
+        "objectTypeId": "0-1",
+        "startActionId": "1",
+        "nextAvailableActionId": "3",
+        "actions": [
+            {
+                "type": "SINGLE_CONNECTION",
+                "actionId": "1",
+                "actionTypeVersion": TREBLE_ACTION_VERSION,
+                "actionTypeId": TREBLE_ACTION_TYPE_ID,
+                "connection": {"edgeType": "STANDARD", "nextActionId": "2"},
+                "fields": {"conversation_id": str(conversation_id), "channel_id": CHANNEL_ID_WHATSAPP},
+            },
+            {
+                "type": "SINGLE_CONNECTION",
+                "actionId": "2",
+                "actionTypeVersion": 0,
+                "actionTypeId": "0-5",
+                "fields": {
+                    "property_name": PROP_ENVIAR_PUSH,
+                    "value": {"staticValue": "", "type": "STATIC_VALUE"},
+                },
+            },
+        ],
+        "enrollmentCriteria": {
+            "shouldReEnroll": True,
+            "type": "LIST_BASED",
+            "listFilterBranch": {
+                "filterBranches": [{
+                    "filterBranches": [],
+                    "filters": [{
+                        "property": PROP_ENVIAR_PUSH,
+                        "operation": {
+                            "operator": "IS_ANY_OF",
+                            "includeObjectsWithNoValueSet": False,
+                            "values": [push_value],
+                            "operationType": "ENUMERATION",
+                        },
+                        "filterType": "PROPERTY",
+                    }],
+                    "filterBranchType": "AND",
+                    "filterBranchOperator": "AND",
+                }],
+                "filters": [],
+                "filterBranchType": "OR",
+                "filterBranchOperator": "OR",
+            },
+            "unEnrollObjectsNotMeetingCriteria": False,
+            "reEnrollmentTriggersFilterBranches": [],
+        },
+        "timeWindows": [],
+        "blockedDates": [],
+        "customProperties": {},
+        "crmObjectCreationStatus": "COMPLETE",
+        "suppressionListIds": [],
+        "canEnrollFromSalesforce": False,
+    }
+    if descripcion:
+        payload["description"] = descripcion
+    return nombre, push_value, payload
+
+
+@app.post("/workflows/push")
+def crear_workflow_push(body: dict, x_api_key: str | None = Header(default=None)):
+    """
+    Body: {"label": "...", "conversation_id": "1391721", "activar": true, "forzar": false}
+
+    Salvaguardas:
+      - conversation_id debe ser numérico.
+      - El push debe existir como opción de `enviar_push`; si no, el workflow
+        nunca se dispararía (se devuelve 409).
+      - No puede existir ya un workflow para ese conversation_id: un duplicado
+        haría que el cliente reciba el mismo WhatsApp dos veces (409).
+      - "forzar": true salta esas dos verificaciones.
+    """
+    _chequear_clave(x_api_key)
+    label = (body.get("label") or "").strip()
+    conversation_id = _validar_id_numerico(body.get("conversation_id"), "conversation_id")
+    activar = _a_bool(body.get("activar"), True)
+    forzar = _a_bool(body.get("forzar"), False)
+
+    if not label:
+        raise HTTPException(400, "Se requiere 'label'.")
+    if len(label) > 180:
+        raise HTTPException(400, "'label' demasiado largo (máx. 180 caracteres).")
+
+    if not forzar:
+        try:
+            pushes = _wf_opciones_push()
+        except Exception as e:
+            raise HTTPException(502, f"No se pudieron leer las opciones de {PROP_ENVIAR_PUSH}: {e}")
+        if conversation_id not in pushes:
+            raise HTTPException(409, f"No existe la opción PUSH_{conversation_id} en {PROP_ENVIAR_PUSH}. "
+                                     f"El workflow nunca se dispararía. Usá \"forzar\": true para crearlo igual.")
+        try:
+            existentes, confiable = _wf_push(usar_cache=False)
+        except Exception as e:
+            raise HTTPException(502, f"No se pudo verificar si ya existe el workflow: {e}")
+        # Si el cruce no es confiable (listado cortado o workflows sin resolver)
+        # NO se crea: podría existir ya uno y terminaríamos duplicando el envío.
+        if not confiable:
+            raise HTTPException(503, "No se pudo verificar de forma confiable si el workflow ya existe "
+                                     "(listado incompleto o workflows sin resolver). No se crea nada para "
+                                     "no arriesgar un duplicado. Reintentá en un minuto.")
+        nombre_previsto = f"{PREFIJO_WORKFLOW_PUSH}{label}{SUFIJO_WORKFLOW_PUSH}"
+        ya = [w for w in existentes
+              if conversation_id in w["conversation_ids"] or w["nombre"] == nombre_previsto]
+        if ya:
+            raise HTTPException(409, f"Ya existe workflow para conversation_id {conversation_id}: "
+                                     f"{[w['nombre'] for w in ya]} (flow_id {[w['flow_id'] for w in ya]}). "
+                                     f"Duplicarlo haría que el cliente reciba el push dos veces.")
+
+    descripcion = (f"Se dispara solo cuando el campo 'Enviar push (WhatsApp)' = {label}. "
+                   f"Envia el HSM (conversation_id {conversation_id}) y limpia el campo "
+                   f"para reutilizarlo. Creado automaticamente via bridge.")
+    nombre, push_value, payload = _wf_payload(label, conversation_id, activar, descripcion)
+
+    try:
+        resultado = _hubspot_api("POST", "/automation/v4/flows", payload)
+    except urllib.error.HTTPError as e:
+        detalle = e.read().decode() if hasattr(e, "read") else str(e)
+        # "description" no está en el schema público de la v4 (beta): si lo
+        # rechaza, se reintenta sin él en vez de fallar por algo cosmético.
+        if "description" in detalle.lower():
+            log.warning("[workflows] HubSpot rechazó 'description', reintento sin ese campo")
+            payload.pop("description", None)
+            try:
+                resultado = _hubspot_api("POST", "/automation/v4/flows", payload)
+            except urllib.error.HTTPError as e2:
+                d2 = e2.read().decode() if hasattr(e2, "read") else str(e2)
+                raise HTTPException(e2.code, f"HubSpot rechazó el workflow: {d2}")
+        else:
+            raise HTTPException(e.code, f"HubSpot rechazó el workflow: {detalle}")
+    except Exception as e:
+        raise HTTPException(502, f"Error creando el workflow en HubSpot: {e}")
+
+    _CACHE_FLOWS["datos"] = None
+    flow_id = resultado.get("id")
+    METRICAS["workflows_creados"] += 1
+    log.info(f"[workflows] creado flow_id={flow_id} nombre={nombre!r} activo={bool(activar)}")
+    return {
+        "creado": True, "flow_id": flow_id, "nombre": nombre, "push_value": push_value,
+        "activo": bool(activar),
+        "link": f"https://app.hubspot.com/workflows/{ACCOUNT_ID}/platform/flow/{flow_id}/edit",
+    }
+
+
+@app.get("/workflows/push")
+def listar_workflows_push(x_api_key: str | None = Header(default=None)):
+    """Lista los workflows 'PUSH - ... (auto)' con su conversation_id."""
+    _chequear_clave(x_api_key)
+    try:
+        workflows, confiable = _wf_push()
+    except Exception as e:
+        raise HTTPException(502, f"Error listando workflows en HubSpot: {e}")
+    return {"total": len(workflows), "cruce_confiable": confiable, "workflows": workflows}
+
+
+@app.get("/workflows/push/auditoria")
+def auditar_workflows_push(x_api_key: str | None = Header(default=None)):
+    """
+    Cruza las opciones de `enviar_push` contra los workflows existentes.
+    Automatiza la auditoría que el 04/09/2026 se hizo a mano: devuelve los
+    pushes sin workflow (el gap), los duplicados (mismo push con 2+ workflows
+    → el cliente recibiría el mensaje repetido), los huérfanos y los apagados.
+    """
+    _chequear_clave(x_api_key)
+    try:
+        pushes = _wf_opciones_push()
+        workflows, confiable = _wf_push()
+    except Exception as e:
+        raise HTTPException(502, f"Error auditando workflows en HubSpot: {e}")
+
+    cubiertos = {}
+    for w in workflows:
+        for cid in w["conversation_ids"]:
+            cubiertos.setdefault(cid, []).append(w["flow_id"])
+
+    faltantes = [{"conversation_id": c, "label": l} for c, l in sorted(pushes.items()) if c not in cubiertos]
+    duplicados = {c: ids for c, ids in cubiertos.items() if len(ids) > 1}
+    huerfanos = [w for w in workflows
+                 if w["conversation_ids"] and not any(c in pushes for c in w["conversation_ids"])]
+
+    METRICAS["auditorias_workflows"] += 1
+    resultado = {
+        "cruce_confiable": confiable,
+        "total_pushes": len(pushes),
+        "total_workflows_push": len(workflows),
+        # Sin un cruce confiable no se puede afirmar cobertura: los
+        # "faltantes" podrían tener workflow y no haberse podido resolver.
+        "cobertura_ok": confiable and not faltantes and not duplicados,
+        "faltantes": faltantes,
+        "duplicados": duplicados,
+        "huerfanos": huerfanos,
+        "sin_referencia_detectable": [w for w in workflows if not w["conversation_ids"]],
+        "desactivados": [w for w in workflows if w["activo"] is False],
+    }
+    if not confiable:
+        resultado["advertencia"] = ("El cruce no es confiable (listado cortado por tiempo o workflows que no "
+                                    "se pudieron resolver): los 'faltantes' pueden ser falsos. NO crear "
+                                    "workflows a partir de esta auditoría; reintentá en un minuto.")
+        resultado["no_resueltos"] = [w for w in workflows if w.get("origen") in (None, "no_resuelto", "error")]
+    return resultado
+
+
+@app.delete("/workflows/{flow_id}")
+def eliminar_workflow(flow_id: str, confirmar: bool = False, permitir_cualquiera: bool = False,
+                      x_api_key: str | None = Header(default=None)):
+    """
+    Elimina un workflow. En HubSpot queda en la vista 'Eliminado' del portal
+    (recuperable), no es destrucción permanente.
+
+    Salvaguardas:
+      - ?confirmar=true obligatorio, para que un curl mal escrito no borre nada.
+      - Solo nombres que empiecen por "PUSH - " o "TEST - "; para cualquier otro
+        hace falta además ?permitir_cualquiera=true. Sin esto, la API key sola
+        permitiría borrar cualquiera de los 1.100+ workflows del portal.
+      - Deja en el log qué se borró y si estaba activo.
+    """
+    _chequear_clave(x_api_key)
+    flow_id = _validar_id_numerico(flow_id, "flow_id")
+
+    if not confirmar:
+        raise HTTPException(400, "Falta ?confirmar=true. El borrado no se ejecuta sin confirmación explícita.")
+
+    try:
+        antes = _hubspot_api("GET", f"/automation/v4/flows/{flow_id}")
+    except urllib.error.HTTPError as e:
+        detalle = e.read().decode() if hasattr(e, "read") else str(e)
+        raise HTTPException(e.code, f"No se pudo leer el workflow {flow_id}: {detalle}")
+    except Exception as e:
+        raise HTTPException(502, f"No se pudo leer el workflow {flow_id}: {e}")
+
+    nombre = antes.get("name") or ""
+    estaba_activo = antes.get("isEnabled")
+    if not nombre.startswith(PREFIJOS_BORRABLES) and not permitir_cualquiera:
+        raise HTTPException(403, f"'{nombre}' no es un workflow de push (no empieza por {PREFIJOS_BORRABLES}). "
+                                 f"Este bridge no borra workflows de otras áreas por seguridad. "
+                                 f"Si de verdad hay que borrarlo, agregá &permitir_cualquiera=true.")
+
+    try:
+        _hubspot_api("DELETE", f"/automation/v4/flows/{flow_id}")
+    except urllib.error.HTTPError as e:
+        detalle = e.read().decode() if hasattr(e, "read") else str(e)
+        raise HTTPException(e.code, f"HubSpot rechazó el borrado: {detalle}")
+    except Exception as e:
+        raise HTTPException(502, f"Error borrando el workflow en HubSpot: {e}")
+
+    _CACHE_FLOWS["datos"] = None
+    METRICAS["workflows_eliminados"] += 1
+    log.warning(f"[workflows] ELIMINADO flow_id={flow_id} nombre={nombre!r} estaba_activo={estaba_activo}")
+    return {"eliminado": True, "flow_id": flow_id, "nombre": nombre, "estaba_activo": estaba_activo}
+
+
 @app.on_event("startup")
 def arrancar_monitores():
     _init_db()
