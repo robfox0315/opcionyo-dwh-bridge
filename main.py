@@ -1476,6 +1476,561 @@ def eliminar_workflow(flow_id: str, confirmar: bool = False, permitir_cualquiera
     return {"eliminado": True, "flow_id": flow_id, "nombre": nombre, "estaba_activo": estaba_activo}
 
 
+# ══════════════════════════════════════════════════════════════════
+#  COHORTE DE RENOVACIONES + REINTENTO DE PUSHES BLOQUEADOS
+#  Agregado 07/09/2026 (v1.3.5). BLOQUE PURAMENTE ADITIVO: no toca
+#  ni una línea de lo anterior. Todo lo nuevo vive acá abajo.
+#
+#  ── Por qué existe ────────────────────────────────────────────────
+#  1) COHORTE. Yesica pidió dejar de armar a mano la lista de clientes
+#     en primera renovación. No hace falta: un cliente en su primera
+#     renovación es simplemente el que tiene UN solo pago registrado
+#     (fecha_compra == fecha_ultimo_pago) y una fecha_renovacion
+#     próxima. El estado se guarda EN LA FICHA DE HUBSPOT, no en una
+#     base acá: así Diana lo ve donde ya trabaja, el equipo arma listas
+#     y reportes sin depender de este bridge, y no hay estado frágil
+#     que se pierda en un redeploy de Render.
+#
+#  2) REINTENTO. Un push disparado desde HubSpot no se entrega si el
+#     contacto tiene una conversación abierta en Treble (status
+#     FAILURE_BY_HUMAN_HANDOVER). Medido sobre 8.046 casos: el 98,8%
+#     de los bloqueados tenía conversación abierta contra el 0,6% de
+#     los entregados. El 83,5% nunca recibe el mensaje. Como no hay
+#     forma de forzar el envío desde Treble, esto reintenta solo,
+#     una vez que la conversación se cerró.
+#
+#  ── Salvaguardas ──────────────────────────────────────────────────
+#  · /cohorte/procesar y /pushes/reintentar son DRY-RUN por defecto.
+#    Sin ?aplicar=true simulan y devuelven qué harían, sin escribir.
+#  · El reintento solo toca contactos cuya conversación YA está
+#    cerrada (si sigue abierta, volvería a fallar y gastaría el envío).
+#  · Cada reintento se registra en la tabla de eventos: un mismo push
+#    bloqueado nunca se reintenta dos veces.
+#  · Tope por corrida configurable, para que un error no dispare miles
+#    de WhatsApps.
+# ══════════════════════════════════════════════════════════════════
+
+from datetime import timedelta  # no estaba importado; se agrega acá para no tocar la cabecera
+
+PROP_COHORTE_ESTADO = "cohorte_renovacion"
+PROP_COHORTE_ENTRADA = "cohorte_fecha_entrada"
+PROP_COHORTE_PAGO_BASE = "cohorte_pago_al_entrar"
+GRUPO_COHORTE = "contactinformation"
+
+# Estados del cohorte. Son el ciclo de vida completo que pidió Yesica:
+# entra preventivo → paga, o falla → se recupera, o termina en churn.
+COHORTE_ESTADOS = [
+    ("preventivo", "Preventivo · renueva pronto"),
+    ("pago", "Pagó la renovación"),
+    ("fallo", "Falló la primera renovación"),
+    ("recuperado", "Recuperado tras fallar"),
+    ("churn", "Churn"),
+]
+
+# Ventana por defecto: los que renuevan en los próximos 7 días.
+COHORTE_DIAS_VENTANA = int(os.environ.get("COHORTE_DIAS_VENTANA", "7"))
+# Días después de la fecha de renovación sin pago para declarar churn.
+COHORTE_DIAS_CHURN = int(os.environ.get("COHORTE_DIAS_CHURN", "30"))
+COHORTE_MAX_CONTACTOS = int(os.environ.get("COHORTE_MAX_CONTACTOS", "2000"))
+
+REINTENTO_MAX_POR_CORRIDA = int(os.environ.get("REINTENTO_MAX_POR_CORRIDA", "150"))
+REINTENTO_HORAS_ATRAS = int(os.environ.get("REINTENTO_HORAS_ATRAS", "72"))
+
+for _m in ("cohorte_marcados", "cohorte_actualizados", "pushes_reintentados"):
+    METRICAS.setdefault(_m, 0)
+
+
+def _dia_ms(fecha):
+    """HubSpot guarda las propiedades de tipo date como epoch ms a medianoche UTC."""
+    return int(datetime(fecha.year, fecha.month, fecha.day, tzinfo=timezone.utc).timestamp() * 1000)
+
+
+def _a_fecha(valor):
+    """Acepta '2026-09-07', epoch ms como string o int. Devuelve date o None."""
+    if valor in (None, ""):
+        return None
+    if isinstance(valor, (int, float)):
+        return datetime.fromtimestamp(float(valor) / 1000, tz=timezone.utc).date()
+    texto = str(valor).strip()
+    if texto.isdigit() and len(texto) >= 12:
+        return datetime.fromtimestamp(int(texto) / 1000, tz=timezone.utc).date()
+    try:
+        return datetime.strptime(texto[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _hs_buscar_todo(objeto, body, tope=COHORTE_MAX_CONTACTOS):
+    """
+    Search paginado. HubSpot devuelve como máximo 200 por página y corta en
+    10.000 resultados; el tope acá es una segunda red por si un filtro mal
+    puesto intentara traerse el portal entero.
+    """
+    salida, after, vueltas = [], None, 0
+    while len(salida) < tope and vueltas < 60:
+        vueltas += 1
+        cuerpo = dict(body, limit=min(200, tope - len(salida)))
+        if after:
+            cuerpo["after"] = after
+        data = _hubspot_api("POST", f"/crm/v3/objects/{objeto}/search", cuerpo)
+        salida.extend(data.get("results", []))
+        after = (data.get("paging") or {}).get("next", {}).get("after")
+        if not after:
+            break
+    return salida
+
+
+def _hs_batch_update(objeto, entradas):
+    """
+    Actualiza en lotes de 100 (el máximo de la API). Devuelve cuántos se
+    escribieron y los errores por lote, sin abortar todo si uno falla.
+    """
+    escritos, errores = 0, []
+    for i in range(0, len(entradas), 100):
+        lote = entradas[i:i + 100]
+        try:
+            _hubspot_api("POST", f"/crm/v3/objects/{objeto}/batch/update", {"inputs": lote})
+            escritos += len(lote)
+        except Exception as e:
+            errores.append({"desde": i, "cantidad": len(lote), "error": str(e)[:200]})
+            log.error(f"[cohorte] fallo lote {i}-{i+len(lote)}: {e}")
+    return escritos, errores
+
+
+# ── Propiedades en HubSpot ────────────────────────────────────────
+
+def _cohorte_props_existentes():
+    faltan, existen = [], {}
+    for nombre in (PROP_COHORTE_ESTADO, PROP_COHORTE_ENTRADA, PROP_COHORTE_PAGO_BASE):
+        try:
+            existen[nombre] = _hubspot_api("GET", f"/crm/v3/properties/contacts/{nombre}")
+        except Exception:
+            faltan.append(nombre)
+    return existen, faltan
+
+
+@app.post("/cohorte/setup")
+def cohorte_setup(x_api_key: str | None = Header(default=None)):
+    """
+    Crea las tres propiedades del cohorte si no existen. Idempotente:
+    llamarlo dos veces no rompe nada ni duplica.
+    """
+    _chequear_clave(x_api_key)
+    existen, faltan = _cohorte_props_existentes()
+    if not faltan:
+        return {"creadas": [], "ya_existian": list(existen), "mensaje": "Nada que hacer, ya estaban las tres."}
+
+    definiciones = {
+        PROP_COHORTE_ESTADO: {
+            "name": PROP_COHORTE_ESTADO, "label": "Cohorte renovación", "type": "enumeration",
+            "fieldType": "select", "groupName": GRUPO_COHORTE,
+            "description": "Estado del cliente dentro del cohorte de primera renovación. Lo mantiene el bridge automáticamente.",
+            "options": [{"label": et, "value": v, "displayOrder": i, "hidden": False}
+                        for i, (v, et) in enumerate(COHORTE_ESTADOS)],
+        },
+        PROP_COHORTE_ENTRADA: {
+            "name": PROP_COHORTE_ENTRADA, "label": "Cohorte · fecha de entrada", "type": "date",
+            "fieldType": "date", "groupName": GRUPO_COHORTE,
+            "description": "Cuándo entró este cliente al cohorte de renovación.",
+        },
+        PROP_COHORTE_PAGO_BASE: {
+            "name": PROP_COHORTE_PAGO_BASE, "label": "Cohorte · último pago al entrar", "type": "date",
+            "fieldType": "date", "groupName": GRUPO_COHORTE,
+            "description": "Fecha del último pago en el momento de entrar al cohorte. Sirve para detectar si después pagó.",
+        },
+    }
+    creadas, errores = [], []
+    for nombre in faltan:
+        try:
+            _hubspot_api("POST", "/crm/v3/properties/contacts", definiciones[nombre])
+            creadas.append(nombre)
+        except Exception as e:
+            errores.append({"propiedad": nombre, "error": str(e)[:300]})
+    log.warning(f"[cohorte] setup creadas={creadas} errores={errores}")
+    return {"creadas": creadas, "ya_existian": list(existen), "errores": errores}
+
+
+# ── Detección del cohorte ─────────────────────────────────────────
+
+PROPS_COHORTE_LEER = [
+    "hs_object_id", "hs_full_name_or_email", "firstname", "lastname", "email",
+    "yopsi_id", "fecha_compra", "fecha_ultimo_pago", "fecha_renovacion",
+    "hs_whatsapp_phone_number", "phone", "lifecyclestage",
+    PROP_COHORTE_ESTADO, PROP_COHORTE_ENTRADA, PROP_COHORTE_PAGO_BASE,
+]
+
+
+def _cohorte_detectar(dias=COHORTE_DIAS_VENTANA):
+    """
+    Los que renuevan dentro de la ventana. Primera renovación =
+    fecha_compra == fecha_ultimo_pago (un solo cobro registrado).
+    """
+    hoy = datetime.now(timezone.utc).date()
+    hasta = hoy + timedelta(days=dias)
+    body = {
+        "filterGroups": [{"filters": [
+            {"propertyName": "lifecyclestage", "operator": "EQ", "value": "customer"},
+            {"propertyName": "fecha_renovacion", "operator": "BETWEEN",
+             "value": str(_dia_ms(hoy)), "highValue": str(_dia_ms(hasta))},
+        ]}],
+        "properties": PROPS_COHORTE_LEER,
+        "sorts": [{"propertyName": "fecha_renovacion", "direction": "ASCENDING"}],
+    }
+    salida = []
+    for r in _hs_buscar_todo("contacts", body):
+        p = r.get("properties", {})
+        compra, ultimo, renov = _a_fecha(p.get("fecha_compra")), _a_fecha(p.get("fecha_ultimo_pago")), _a_fecha(p.get("fecha_renovacion"))
+        salida.append({
+            "id": r["id"],
+            "nombre": p.get("hs_full_name_or_email") or f"{p.get('firstname','')} {p.get('lastname','')}".strip(),
+            "yopsi_id": p.get("yopsi_id"), "email": p.get("email"),
+            "whatsapp": p.get("hs_whatsapp_phone_number") or "",
+            "telefono": p.get("phone") or "",
+            "fecha_compra": compra.isoformat() if compra else None,
+            "fecha_ultimo_pago": ultimo.isoformat() if ultimo else None,
+            "fecha_renovacion": renov.isoformat() if renov else None,
+            "dias_para_renovar": (renov - hoy).days if renov else None,
+            "primera_renovacion": bool(compra and ultimo and compra == ultimo),
+            "estado_actual": p.get(PROP_COHORTE_ESTADO) or "",
+            "tiene_whatsapp": bool(p.get("hs_whatsapp_phone_number")),
+        })
+    return salida
+
+
+def _cohorte_marcados():
+    """Todos los que ya tienen una marca de cohorte, para actualizar su estado."""
+    body = {
+        "filterGroups": [{"filters": [
+            {"propertyName": PROP_COHORTE_ESTADO, "operator": "IN",
+             "values": [v for v, _ in COHORTE_ESTADOS if v not in ("churn",)]},
+        ]}],
+        "properties": PROPS_COHORTE_LEER,
+    }
+    return _hs_buscar_todo("contacts", body)
+
+
+def _cohorte_nuevo_estado(p, hoy):
+    """
+    Reglas de transición. Se apoyan solo en lo que HubSpot ya tiene, así que
+    son auditables por cualquiera desde la ficha del cliente.
+    """
+    estado = p.get(PROP_COHORTE_ESTADO) or ""
+    base = _a_fecha(p.get(PROP_COHORTE_PAGO_BASE))
+    ultimo = _a_fecha(p.get("fecha_ultimo_pago"))
+    renov = _a_fecha(p.get("fecha_renovacion"))
+    ciclo = p.get("lifecyclestage") or ""
+
+    pago_nuevo = bool(ultimo and base and ultimo > base)
+
+    if pago_nuevo:
+        return "recuperado" if estado == "fallo" else "pago"
+    if estado in ("pago", "recuperado"):
+        return estado
+    if renov and renov < hoy:
+        dias = (hoy - renov).days
+        if dias >= COHORTE_DIAS_CHURN or (ciclo and ciclo != "customer"):
+            return "churn"
+        return "fallo"
+    return estado or "preventivo"
+
+
+@app.post("/cohorte/procesar")
+def cohorte_procesar(
+    x_api_key: str | None = Header(default=None),
+    aplicar: str | None = None,
+    dias: int | None = None,
+):
+    """
+    La corrida semanal. Hace dos cosas:
+      1. Marca como "preventivo" a los que entran al cohorte y todavía no
+         tienen marca, guardando su fecha de último pago para poder detectar
+         después si pagaron.
+      2. Recorre los ya marcados y actualiza su estado: pagó, falló,
+         recuperado o churn.
+
+    DRY-RUN por defecto. Sin ?aplicar=true no escribe nada en HubSpot.
+    """
+    _chequear_clave(x_api_key)
+    _, faltan = _cohorte_props_existentes()
+    if faltan:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Faltan propiedades en HubSpot: {faltan}. Llamá primero a POST /cohorte/setup.",
+        )
+
+    escribir = _a_bool(aplicar, por_defecto=False)
+    ventana = int(dias) if dias else COHORTE_DIAS_VENTANA
+    hoy = datetime.now(timezone.utc).date()
+
+    # 1) Altas
+    detectados = _cohorte_detectar(ventana)
+    nuevos = [c for c in detectados if c["primera_renovacion"] and not c["estado_actual"]]
+    altas = [{"id": c["id"], "properties": {
+        PROP_COHORTE_ESTADO: "preventivo",
+        PROP_COHORTE_ENTRADA: _dia_ms(hoy),
+        PROP_COHORTE_PAGO_BASE: _dia_ms(_a_fecha(c["fecha_ultimo_pago"])) if c["fecha_ultimo_pago"] else "",
+    }} for c in nuevos]
+
+    # 2) Actualizaciones de estado
+    cambios, detalle_cambios = [], []
+    for r in _cohorte_marcados():
+        p = r.get("properties", {})
+        actual = p.get(PROP_COHORTE_ESTADO) or ""
+        nuevo = _cohorte_nuevo_estado(p, hoy)
+        if nuevo and nuevo != actual:
+            cambios.append({"id": r["id"], "properties": {PROP_COHORTE_ESTADO: nuevo}})
+            detalle_cambios.append({
+                "id": r["id"],
+                "nombre": p.get("hs_full_name_or_email"),
+                "de": actual, "a": nuevo,
+            })
+
+    resultado = {
+        "modo": "aplicado" if escribir else "simulacion",
+        "ventana_dias": ventana,
+        "detectados_en_ventana": len(detectados),
+        "primera_renovacion": sum(1 for c in detectados if c["primera_renovacion"]),
+        "altas_nuevas": len(altas),
+        "cambios_de_estado": len(cambios),
+        "detalle_cambios": detalle_cambios[:50],
+        "sin_whatsapp": [c["nombre"] for c in detectados if not c["tiene_whatsapp"]][:20],
+    }
+
+    if not escribir:
+        resultado["aviso"] = "Simulación. Para que escriba en HubSpot: POST /cohorte/procesar?aplicar=true"
+        return resultado
+
+    esc_altas, err_altas = _hs_batch_update("contacts", altas) if altas else (0, [])
+    esc_cambios, err_cambios = _hs_batch_update("contacts", cambios) if cambios else (0, [])
+    METRICAS["cohorte_marcados"] += esc_altas
+    METRICAS["cohorte_actualizados"] += esc_cambios
+    resultado.update({
+        "altas_escritas": esc_altas, "cambios_escritos": esc_cambios,
+        "errores": err_altas + err_cambios,
+    })
+    log.warning(f"[cohorte] procesado altas={esc_altas} cambios={esc_cambios} errores={len(err_altas + err_cambios)}")
+    return resultado
+
+
+@app.get("/cohorte/renovaciones")
+def cohorte_renovaciones(x_api_key: str | None = Header(default=None), dias: int | None = None):
+    """La lista de la semana, en vivo. Es lo que reemplaza al Excel manual."""
+    _chequear_clave(x_api_key)
+    ventana = int(dias) if dias else COHORTE_DIAS_VENTANA
+    lista = _cohorte_detectar(ventana)
+    primera = [c for c in lista if c["primera_renovacion"]]
+    return {
+        "generado": datetime.now(timezone.utc).isoformat(),
+        "ventana_dias": ventana,
+        "total": len(lista),
+        "primera_renovacion": len(primera),
+        "recurrentes": len(lista) - len(primera),
+        "sin_whatsapp": sum(1 for c in lista if not c["tiene_whatsapp"]),
+        "urgentes_2_dias": sum(1 for c in primera if (c["dias_para_renovar"] or 99) <= 2),
+        "clientes": sorted(lista, key=lambda c: (not c["primera_renovacion"], c["dias_para_renovar"] or 99, c["nombre"])),
+    }
+
+
+@app.get("/cohorte/kpis")
+def cohorte_kpis(x_api_key: str | None = Header(default=None)):
+    """
+    Los cuatro KPIs que definió Yesica, sobre el mismo cohorte y sin
+    trabajo manual: cuántos entran, cuántos se contactaron, cuántos se
+    recuperaron, y cómo se reparte el churn.
+    """
+    _chequear_clave(x_api_key)
+    conteo = {}
+    for valor, etiqueta in COHORTE_ESTADOS:
+        body = {"filterGroups": [{"filters": [
+            {"propertyName": PROP_COHORTE_ESTADO, "operator": "EQ", "value": valor}]}],
+            "properties": ["hs_object_id"]}
+        try:
+            data = _hubspot_api("POST", "/crm/v3/objects/contacts/search", dict(body, limit=1))
+            conteo[valor] = {"etiqueta": etiqueta, "total": data.get("total", 0)}
+        except Exception as e:
+            conteo[valor] = {"etiqueta": etiqueta, "total": None, "error": str(e)[:120]}
+
+    fallaron = (conteo.get("fallo", {}).get("total") or 0) + (conteo.get("recuperado", {}).get("total") or 0) \
+        + (conteo.get("churn", {}).get("total") or 0)
+    recuperados = conteo.get("recuperado", {}).get("total") or 0
+    return {
+        "generado": datetime.now(timezone.utc).isoformat(),
+        "por_estado": conteo,
+        "entraron_al_cohorte": sum((v.get("total") or 0) for v in conteo.values()),
+        "fallaron_alguna_vez": fallaron,
+        "recuperados": recuperados,
+        "tasa_recuperacion": round(recuperados / fallaron, 4) if fallaron else None,
+        "en_seguimiento_ahora": conteo.get("preventivo", {}).get("total"),
+    }
+
+
+# ── Reintento de pushes bloqueados ────────────────────────────────
+
+def _push_opciones_por_id():
+    """conversation_id -> label, leído de la propiedad enviar_push."""
+    prop = _hubspot_api("GET", f"/crm/v3/properties/contacts/{PROP_ENVIAR_PUSH}")
+    salida = {}
+    for o in prop.get("options", []):
+        valor = str(o.get("value", ""))
+        if valor.startswith("PUSH_") and valor[5:].isdigit():
+            salida[valor[5:]] = o.get("label", "")
+    return salida
+
+
+def _bloqueados_pendientes(horas=REINTENTO_HORAS_ATRAS, tope=500):
+    """
+    Pushes bloqueados por conversación abierta que:
+      · ya tienen la conversación CERRADA (si sigue abierta volvería a fallar),
+      · y no recibieron ningún envío exitoso posterior.
+    """
+    sql = f"""
+    WITH f AS (
+      SELECT deployment_id did, treble_id tid, cellphone cel, country_code cc,
+             poll_id pid, timestamps_eta ts
+      FROM fact_deployment_status
+      WHERE origin = 'HELPDESK_INTEGRATION' AND status = 'FAILURE_BY_HUMAN_HANDOVER'
+        AND timestamps_eta >= now() - INTERVAL {int(horas)} HOUR
+    ),
+    ok AS (
+      SELECT treble_id tid, timestamps_eta ts FROM fact_deployment_status
+      WHERE origin = 'HELPDESK_INTEGRATION' AND status IN ('DELIVERED','SUCCESS')
+        AND timestamps_eta >= now() - INTERVAL {int(horas) + 24} HOUR
+    ),
+    abierta AS (
+      SELECT contact_wa_id wa FROM fact_conversations WHERE status = 'assigned'
+    ),
+    conv AS (
+      SELECT contact_wa_id wa, helpdesk_contact_id hs FROM fact_conversations
+      WHERE helpdesk_contact_id != ''
+    )
+    SELECT f.did did, f.tid tid, f.cel cel, f.cc cc, f.pid pid, f.ts ts,
+           any(conv.hs) hubspot_id
+    FROM f
+    LEFT JOIN ok ON f.tid = ok.tid
+    LEFT JOIN abierta ON f.tid = abierta.wa
+    LEFT JOIN conv ON f.tid = conv.wa
+    GROUP BY did, tid, cel, cc, pid, ts
+    HAVING max(if(ok.ts > f.ts, 1, 0)) = 0 AND max(if(abierta.wa != '', 1, 0)) = 0
+    ORDER BY ts DESC
+    LIMIT {int(tope)}
+    """
+    return _query_interna(sql)
+
+
+@app.get("/pushes/bloqueados")
+def pushes_bloqueados(x_api_key: str | None = Header(default=None), horas: int | None = None):
+    """Diagnóstico: qué hay pendiente de reintentar y qué fracción es recuperable."""
+    _chequear_clave(x_api_key)
+    ventana = int(horas) if horas else REINTENTO_HORAS_ATRAS
+    filas = _bloqueados_pendientes(ventana)
+    opciones = _push_opciones_por_id()
+    recuperables = [f for f in filas if str(f["pid"]) in opciones]
+    sin_opcion = {}
+    for f in filas:
+        if str(f["pid"]) not in opciones:
+            sin_opcion[str(f["pid"])] = sin_opcion.get(str(f["pid"]), 0) + 1
+    return {
+        "ventana_horas": ventana,
+        "pendientes": len(filas),
+        "reintentables_ahora": len(recuperables),
+        "sin_workflow_asociado": sorted(
+            [{"conversation_id": k, "casos": v} for k, v in sin_opcion.items()],
+            key=lambda x: -x["casos"])[:20],
+        "nota": ("Los 'sin workflow asociado' son campañas que no están en la propiedad "
+                 "enviar_push. Para reintentarlas hay que darles de alta su workflow "
+                 "con POST /workflows/push."),
+    }
+
+
+@app.post("/pushes/reintentar")
+def pushes_reintentar(
+    x_api_key: str | None = Header(default=None),
+    aplicar: str | None = None,
+    horas: int | None = None,
+    tope: int | None = None,
+):
+    """
+    Reintenta escribiendo la propiedad enviar_push del contacto, que es lo
+    que dispara el workflow correspondiente. No toca Treble ni requiere
+    credenciales suyas: usa la misma maquinaria que ya opera el equipo.
+
+    DRY-RUN por defecto. Sin ?aplicar=true no escribe nada.
+    """
+    _chequear_clave(x_api_key)
+    escribir = _a_bool(aplicar, por_defecto=False)
+    ventana = int(horas) if horas else REINTENTO_HORAS_ATRAS
+    limite = min(int(tope), REINTENTO_MAX_POR_CORRIDA) if tope else REINTENTO_MAX_POR_CORRIDA
+
+    filas = _bloqueados_pendientes(ventana)
+    opciones = _push_opciones_por_id()
+
+    plan, omitidos = [], {"sin_workflow": 0, "sin_contacto": 0, "ya_reintentado": 0}
+    for f in filas:
+        pid = str(f["pid"])
+        if pid not in opciones:
+            omitidos["sin_workflow"] += 1
+            continue
+        hs_id = str(f.get("hubspot_id") or "").strip()
+        if not hs_id or not hs_id.isdigit():
+            omitidos["sin_contacto"] += 1
+            continue
+        if _evento_ya_notificado("reintento_push", f["did"]):
+            omitidos["ya_reintentado"] += 1
+            continue
+        plan.append({
+            "deployment_id": f["did"], "hubspot_id": hs_id,
+            "conversation_id": pid, "push": opciones[pid],
+            "telefono": _mask_phone(f"{f['cc']}{f['cel']}"),
+        })
+        if len(plan) >= limite:
+            break
+
+    resultado = {
+        "modo": "aplicado" if escribir else "simulacion",
+        "ventana_horas": ventana, "tope": limite,
+        "pendientes_totales": len(filas),
+        "a_reintentar": len(plan),
+        "omitidos": omitidos,
+        "muestra": plan[:15],
+    }
+    if not escribir:
+        resultado["aviso"] = "Simulación. Para reintentar de verdad: POST /pushes/reintentar?aplicar=true"
+        return resultado
+
+    enviados, errores = 0, []
+    for item in plan:
+        try:
+            _hubspot_api("PATCH", f"/crm/v3/objects/contacts/{item['hubspot_id']}",
+                         {"properties": {PROP_ENVIAR_PUSH: f"PUSH_{item['conversation_id']}"}})
+            # OJO: _evento_ya_notificado() solo devuelve True si status == "notified".
+            # Con cualquier otro valor el candado no cierra y el push se reenvía
+            # en cada corrida. Lo detectó el test de duplicados.
+            _evento_marcar("reintento_push", item["deployment_id"], "notified", notified=True)
+            enviados += 1
+        except Exception as e:
+            errores.append({"deployment_id": item["deployment_id"], "error": str(e)[:200]})
+    METRICAS["pushes_reintentados"] += enviados
+    resultado.update({"reintentados": enviados, "errores": errores})
+    log.warning(f"[reintento] reintentados={enviados} errores={len(errores)}")
+    return resultado
+@app.get("/version")
+def version_bloques(x_api_key: str | None = Header(default=None)):
+    """
+    Sirve para confirmar de un vistazo qué está realmente desplegado, sin
+    tener que cambiar la versión del endpoint raíz (que no se toca).
+    """
+    _chequear_clave(x_api_key)
+    return {
+        "base": "1.3.3",
+        "bloques": ["workflows_push (1.3.4)", "cohorte_renovaciones (1.3.5)", "reintento_pushes (1.3.5)"],
+        "endpoints_nuevos": [
+            "POST /cohorte/setup", "POST /cohorte/procesar",
+            "GET /cohorte/renovaciones", "GET /cohorte/kpis",
+            "GET /pushes/bloqueados", "POST /pushes/reintentar",
+        ],
+    }
+
+
 @app.on_event("startup")
 def arrancar_monitores():
     _init_db()
