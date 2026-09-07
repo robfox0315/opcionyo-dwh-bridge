@@ -2022,12 +2022,13 @@ def version_bloques(x_api_key: str | None = Header(default=None)):
     _chequear_clave(x_api_key)
     return {
         "base": "1.3.3",
-        "bloques": ["workflows_push (1.3.4)", "cohorte_renovaciones (1.3.5)", "reintento_pushes (1.3.5)", "contador_sesiones (1.3.6)"],
+        "bloques": ["workflows_push (1.3.4)", "cohorte_renovaciones (1.3.5)", "reintento_pushes (1.3.5)", "contador_sesiones (1.3.6)", "workflows_crudo (1.3.7)"],
         "endpoints_nuevos": [
             "POST /cohorte/setup", "POST /cohorte/procesar",
             "GET /cohorte/renovaciones", "GET /cohorte/kpis",
             "GET /pushes/bloqueados", "POST /pushes/reintentar",
             "POST /sesiones/setup", "POST /sesiones/sincronizar", "GET /sesiones/embudo",
+            "GET /workflows/{id}/crudo", "GET /workflows/buscar", "POST /workflows/crear-crudo",
         ],
     }
 
@@ -2295,6 +2296,144 @@ def sesiones_sincronizar(
     resultado.update({"escritos": escritos, "errores": errores})
     log.warning(f"[sesiones] sincronizadas={escritos} errores={len(errores)}")
     return resultado
+
+
+# ══════════════════════════════════════════════════════════════════
+#  WORKFLOWS: LECTURA CRUDA Y CREACIÓN DESDE PAYLOAD
+#  Agregado 07/09/2026 (v1.3.7). BLOQUE PURAMENTE ADITIVO.
+#
+#  ── Por qué ───────────────────────────────────────────────────────
+#  Angela pidió que el push de 72 h se bifurque: respuestas de clientes
+#  en sus primeras 4 sesiones a gestoras de consultoría, de la 5ta en
+#  adelante a ATC. En Treble ya están los dos flujos publicados
+#  (1018613 · ATC y 1480814 · Consultoría). Falta el workflow de
+#  HubSpot que elija uno u otro según `sesiones_etapa`, y eso exige una
+#  RAMA — algo que `/workflows/push` no sabe construir porque solo
+#  genera el patrón lineal.
+#
+#  El esquema de ramas de la API v4 no está documentado (igual que pasó
+#  con el de creación). Así que en vez de adivinarlo, estos dos
+#  endpoints permiten leer un workflow real que ya tenga ramas, copiar
+#  su forma exacta, y crear el nuevo a partir de eso.
+#
+#  ── Regla de oro ──────────────────────────────────────────────────
+#  NADA de esto modifica un workflow existente. Solo lee y crea nuevos.
+#  El workflow en producción no se toca: el plan es clonar, dejar el
+#  clon DESACTIVADO, y recién con el visto bueno de Angela apagar el
+#  viejo y encender el nuevo. Ese cambio es atómico y reversible.
+# ══════════════════════════════════════════════════════════════════
+
+# Un workflow nuevo solo puede llamarse así. Evita que un error de acá
+# genere algo con pinta de workflow oficial de Marketing o Ventas.
+PREFIJOS_CREABLES = (PREFIJO_WORKFLOW_PUSH, "TEST - ")
+
+
+@app.get("/workflows/{flow_id}/crudo")
+def workflow_crudo(flow_id: str, x_api_key: str | None = Header(default=None)):
+    """
+    El JSON tal cual lo devuelve HubSpot. Solo lectura. Sirve para copiar
+    la forma exacta de un workflow que ya funciona — sobre todo los que
+    tienen ramas, cuyo esquema no está documentado.
+    """
+    _chequear_clave(x_api_key)
+    if not flow_id.isdigit():
+        raise HTTPException(400, "flow_id debe ser numérico.")
+    try:
+        return _hubspot_api("GET", f"/automation/v4/flows/{flow_id}")
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise HTTPException(404, f"No existe el workflow {flow_id}.")
+        raise HTTPException(502, f"HubSpot respondió {e.code}.")
+
+
+@app.get("/workflows/buscar")
+def workflows_buscar(x_api_key: str | None = Header(default=None), texto: str = ""):
+    """Busca workflows por nombre, para ubicar uno con ramas sin adivinar IDs."""
+    _chequear_clave(x_api_key)
+    if not texto or len(texto) < 3:
+        raise HTTPException(400, "Pasá al menos 3 caracteres en ?texto=")
+    flows, completo = _wf_listar_flows()
+    if not completo:
+        raise HTTPException(503, "No se pudo listar el portal completo; reintentá.")
+    t = texto.lower()
+    hallados = [{"flow_id": f.get("id"), "nombre": f.get("name"), "activo": f.get("isEnabled")}
+                for f in flows if t in str(f.get("name") or "").lower()]
+    return {"texto": texto, "encontrados": len(hallados), "workflows": hallados[:60]}
+
+
+@app.post("/workflows/crear-crudo")
+def workflow_crear_crudo(
+    body: dict,
+    x_api_key: str | None = Header(default=None),
+    aplicar: str | None = None,
+    activar: str | None = None,
+):
+    """
+    Crea un workflow NUEVO a partir de un payload completo. No modifica
+    nada existente. Pensado para armar workflows con ramas, que
+    `/workflows/push` no puede generar.
+
+    Salvaguardas:
+      · DRY-RUN por defecto: sin ?aplicar=true devuelve lo que enviaría.
+      · El nombre debe empezar por un prefijo permitido.
+      · Nace DESACTIVADO salvo ?activar=true explícito.
+      · Rechaza el payload si trae un id (sería un intento de sobrescribir).
+    """
+    _chequear_clave(x_api_key)
+    if not isinstance(body, dict) or not body:
+        raise HTTPException(400, "Falta el cuerpo del workflow.")
+    if body.get("id"):
+        raise HTTPException(400, "El payload no puede traer 'id': este endpoint solo crea, nunca sobrescribe.")
+
+    nombre = str(body.get("name") or "").strip()
+    if not nombre.startswith(PREFIJOS_CREABLES):
+        raise HTTPException(
+            403,
+            f"El nombre debe empezar con alguno de {list(PREFIJOS_CREABLES)}. "
+            "Es la salvaguarda para no crear workflows que parezcan oficiales de otro equipo.",
+        )
+    if body.get("objectTypeId") not in (None, "0-1"):
+        raise HTTPException(400, "Solo se permiten workflows de contactos (objectTypeId 0-1).")
+
+    escribir = _a_bool(aplicar, por_defecto=False)
+    encendido = _a_bool(activar, por_defecto=False)
+
+    payload = dict(body)
+    payload["isEnabled"] = bool(encendido)
+    payload.setdefault("type", "CONTACT_FLOW")
+    payload.setdefault("flowType", "WORKFLOW")
+    payload.setdefault("objectTypeId", "0-1")
+
+    acciones = payload.get("actions") or []
+    resumen = {
+        "modo": "aplicado" if escribir else "simulacion",
+        "nombre": nombre,
+        "nacera_activo": bool(encendido),
+        "acciones": len(acciones),
+        "tipos_de_accion": sorted({str(a.get("actionTypeId")) for a in acciones if isinstance(a, dict)}),
+        "tiene_ramas": any(str(a.get("type")) == "LIST_BRANCH" or "listBranches" in a
+                           for a in acciones if isinstance(a, dict)),
+    }
+    if not escribir:
+        resumen["aviso"] = "Simulación. Para crearlo de verdad: ?aplicar=true (y ?activar=true si además debe nacer encendido)."
+        resumen["payload_que_se_enviaria"] = payload
+        return resumen
+
+    try:
+        creado = _hubspot_api("POST", "/automation/v4/flows", payload)
+    except urllib.error.HTTPError as e:
+        detalle = ""
+        try:
+            detalle = e.read().decode()[:600]
+        except Exception:
+            pass
+        raise HTTPException(502, f"HubSpot rechazó la creación ({e.code}): {detalle}")
+
+    METRICAS["workflows_creados"] += 1
+    _CACHE_FLOWS.update({"datos": None, "ts": 0, "completo": False})
+    log.warning(f"[workflows] CREADO desde payload id={creado.get('id')} nombre={nombre!r} activo={encendido}")
+    resumen.update({"flow_id": creado.get("id"), "creado": True})
+    return resumen
 
 
 @app.on_event("startup")
