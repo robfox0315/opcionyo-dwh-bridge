@@ -2022,7 +2022,7 @@ def version_bloques(x_api_key: str | None = Header(default=None)):
     _chequear_clave(x_api_key)
     return {
         "base": "1.3.3",
-        "bloques": ["workflows_push (1.3.4)", "cohorte_renovaciones (1.3.5)", "reintento_pushes (1.3.5)", "contador_sesiones (1.3.6)", "workflows_crudo (1.3.7)", "riesgo_cancelacion (1.3.8)"],
+        "bloques": ["workflows_push (1.3.4)", "cohorte_renovaciones (1.3.5)", "reintento_pushes (1.3.5)", "contador_sesiones (1.3.6)", "workflows_crudo (1.3.7)", "riesgo_cancelacion (1.3.8)", "salud_mensajeria (1.3.9)"],
         "endpoints_nuevos": [
             "POST /cohorte/setup", "POST /cohorte/procesar",
             "GET /cohorte/renovaciones", "GET /cohorte/kpis",
@@ -2030,6 +2030,7 @@ def version_bloques(x_api_key: str | None = Header(default=None)):
             "POST /sesiones/setup", "POST /sesiones/sincronizar", "GET /sesiones/embudo",
             "GET /workflows/{id}/crudo", "GET /workflows/buscar", "POST /workflows/crear-crudo",
             "POST /riesgo/setup", "POST /riesgo/calcular", "GET /riesgo/lista",
+            "GET /salud/mensajeria", "POST /salud/enviar",
         ],
     }
 
@@ -2678,6 +2679,239 @@ def riesgo_lista(x_api_key: str | None = Header(default=None), nivel: str = "alt
         } for f in pendientes[:min(int(tope), 1000)]],
         "nota": "Excluye a quienes ya tienen una conversación de cancelación: esos ya están en gestión.",
     }
+
+
+# ══════════════════════════════════════════════════════════════════
+#  PARTE DIARIO DE SALUD DE MENSAJERÍA
+#  Agregado 08/09/2026 (v1.3.9). BLOQUE PURAMENTE ADITIVO.
+#
+#  ── Por qué reemplaza al monitor de escalamiento ──────────────────
+#  Iva preguntó si el "ningún caso nuevo hoy" de todos los días
+#  significaba que había mejorado la tasa de respuesta o que estábamos
+#  mandando algo mal. Al verificarlo aparecieron TRES problemas:
+#
+#  1. El monitor decía medir respuestas del cliente. En realidad mide
+#     ENTREGAS fallidas. Son cosas distintas y nadie lo sabía.
+#  2. El umbral es de 3 fallos del MISMO número en 30 días, y eso casi
+#     nunca ocurre: en el último mes lo alcanzó 1 número. De 122 con
+#     algún fallo, 114 fallaron una sola vez. El umbral los tapa a todos.
+#  3. Solo vigila 8 campañas de las más de 100 que existen.
+#
+#  Resultado: decía "cero" mientras ~120 clientes al mes se quedaban sin
+#  su mensaje. Un monitor que siempre dice cero entrena al equipo a
+#  ignorarlo, que es peor que no tenerlo.
+#
+#  ── Qué hace este ─────────────────────────────────────────────────
+#  Un parte diario que SIEMPRE da números, aunque no haya nada raro:
+#    · cuántos mensajes salieron ayer y cuántos no llegaron
+#    · si eso es normal o peor que la semana
+#    · por qué no llegaron, con la acción que corresponde a cada causa
+#    · qué push está fallando más
+#    · cuántos clientes acumulan mensajes sin recibir
+#
+#  Nunca dice "ningún caso". Si todo está bien, lo dice con el número.
+#
+#  ── Para apagar el monitor viejo ──────────────────────────────────
+#  Basta con borrar ESCALAMIENTO_SLACK_WEBHOOK_URL en Render. No hay
+#  que tocar una línea de código.
+# ══════════════════════════════════════════════════════════════════
+
+SALUD_SLACK_WEBHOOK_URL = os.environ.get("SALUD_SLACK_WEBHOOK_URL", "")
+SALUD_COMPANY_ID = os.environ.get("SALUD_COMPANY_ID", "25732")
+SALUD_HORA_UTC = int(os.environ.get("SALUD_HORA_UTC", "13"))
+# Cuántos puntos por encima del promedio semanal se considera anómalo.
+SALUD_UMBRAL_ALERTA = float(os.environ.get("SALUD_UMBRAL_ALERTA", "2.0"))
+
+# Cada causa con su lectura en castellano y qué hacer. Sin esto el parte
+# sería una lista de códigos que nadie sabe interpretar.
+CAUSAS = {
+    "FAILURE_BY_HUMAN_HANDOVER": ("el cliente tenía un chat abierto en Treble",
+                                  "el reintento automático los recupera"),
+    "FAILURE_BY_META_CHOSE_NOT_DELIVER": ("Meta rechazó el envío",
+                                          "hay que revisar la plantilla"),
+    "MISSING_PARAMETER": ("falta un parámetro en la plantilla",
+                          "es configuración nuestra, se arregla en HubSpot"),
+    "FAILURE_BY_UNABLE_TO_CONTACT": ("el número no existe o no recibe",
+                                     "dato de contacto muerto"),
+    "FAILURE_BY_OPTOUT_CONTACT": ("el cliente se dio de baja",
+                                  "correcto, no hay que hacer nada"),
+    "FAILURE_BY_DISABLED_HSM": ("la plantilla está desactivada en Meta",
+                                "hay que reactivarla o dejar de usarla"),
+    "FAILURE_BY_BLOCKED_CONTACT": ("el cliente bloqueó el número", "sin acción"),
+    "RECEIVED_BY_WORKER": ("quedó en cola y no se resolvió", "vigilar si crece"),
+    "FAILURE_BY_MEDIA_UPLOAD_ERROR": ("falló la carga de un archivo adjunto",
+                                      "revisar el contenido del push"),
+    "INVALID_PHONE": ("el número tiene formato inválido", "corregir en el CRM"),
+    "FAILURE": ("fallo genérico sin detalle", "vigilar si crece"),
+}
+
+for _m in ("partes_salud_enviados",):
+    METRICAS.setdefault(_m, 0)
+
+
+def _salud_datos():
+    """Todo lo que necesita el parte, en tres consultas."""
+    cia = int(SALUD_COMPANY_ID)
+    dias = _query_interna(f"""
+        SELECT toDate(timestamps_eta) dia, count() enviados,
+               countIf(status NOT IN ('DELIVERED','SUCCESS')) no_llegaron
+        FROM fact_deployment_status
+        WHERE company_id = {cia} AND timestamps_eta >= today() - 8
+        GROUP BY dia ORDER BY dia DESC LIMIT 9
+    """)
+    causas = _query_interna(f"""
+        SELECT status, count() c FROM fact_deployment_status
+        WHERE company_id = {cia} AND toDate(timestamps_eta) = today() - 1
+          AND status NOT IN ('DELIVERED','SUCCESS')
+        GROUP BY status ORDER BY c DESC LIMIT 8
+    """)
+    peor = _query_interna(f"""
+        SELECT poll_id, count() enviados,
+               countIf(status NOT IN ('DELIVERED','SUCCESS')) fallan
+        FROM fact_deployment_status
+        WHERE company_id = {cia} AND timestamps_eta >= today() - 7
+        GROUP BY poll_id HAVING enviados >= 20 AND fallan >= 5
+        ORDER BY fallan / enviados DESC LIMIT 3
+    """)
+    acumulan = _query_interna(f"""
+        SELECT countIf(veces >= 3) tres_o_mas, countIf(veces >= 2) dos_o_mas, count() con_algun_fallo
+        FROM (SELECT treble_id, count() veces FROM fact_deployment_status
+              WHERE company_id = {cia} AND timestamps_eta >= today() - 7
+                AND status NOT IN ('DELIVERED','SUCCESS')
+              GROUP BY treble_id)
+        LIMIT 1
+    """)
+    return dias, causas, peor, (acumulan or [{}])[0]
+
+
+def _salud_armar():
+    dias, causas, peor, acum = _salud_datos()
+    if not dias:
+        return None
+    # dias[0] es hoy (parcial); el parte habla de AYER, que es el último día completo.
+    ayer = dias[1] if len(dias) > 1 else dias[0]
+    previos = dias[2:9] if len(dias) > 2 else []
+    env_ayer = int(ayer.get("enviados") or 0)
+    mal_ayer = int(ayer.get("no_llegaron") or 0)
+    pct_ayer = round(100 * mal_ayer / env_ayer, 1) if env_ayer else 0.0
+
+    tot_e = sum(int(d.get("enviados") or 0) for d in previos)
+    tot_m = sum(int(d.get("no_llegaron") or 0) for d in previos)
+    pct_prev = round(100 * tot_m / tot_e, 1) if tot_e else 0.0
+    delta = round(pct_ayer - pct_prev, 1)
+
+    return {
+        "fecha": str(ayer.get("dia")),
+        "enviados": env_ayer, "no_llegaron": mal_ayer, "pct": pct_ayer,
+        "pct_promedio_7d": pct_prev, "diferencia_puntos": delta,
+        "anomalo": delta >= SALUD_UMBRAL_ALERTA,
+        "causas": [{"status": c["status"], "casos": int(c["c"]),
+                    "que_paso": CAUSAS.get(c["status"], ("sin clasificar", "revisar"))[0],
+                    "que_hacer": CAUSAS.get(c["status"], ("sin clasificar", "revisar"))[1]}
+                   for c in causas],
+        "pushes_mas_afectados": [
+            {"conversation_id": str(p["poll_id"]), "enviados": int(p["enviados"]),
+             "no_llegaron": int(p["fallan"]),
+             "pct": round(100 * int(p["fallan"]) / int(p["enviados"]), 1)} for p in peor],
+        "clientes_con_3_o_mas_sin_recibir": int(acum.get("tres_o_mas") or 0),
+        "clientes_con_2_o_mas_sin_recibir": int(acum.get("dos_o_mas") or 0),
+        "clientes_con_algun_fallo_7d": int(acum.get("con_algun_fallo") or 0),
+    }
+
+
+def _salud_texto(r):
+    """El mensaje de Slack. Siempre con números, nunca 'ningún caso'."""
+    if r["anomalo"]:
+        cab = (f":red_circle: *Salud de mensajería · {r['fecha']}*\n"
+               f"Ayer salieron {r['enviados']:,} mensajes y *no llegaron {r['no_llegaron']}* "
+               f"({r['pct']}%). Son {r['diferencia_puntos']} puntos peor que la semana "
+               f"({r['pct_promedio_7d']}% de promedio).")
+    else:
+        cab = (f":white_check_mark: *Salud de mensajería · {r['fecha']}*\n"
+               f"Ayer salieron {r['enviados']:,} mensajes y no llegaron {r['no_llegaron']} "
+               f"({r['pct']}%). En línea con la semana ({r['pct_promedio_7d']}%).")
+    cab = cab.replace(",", ".")
+
+    partes = [cab]
+    if r["causas"]:
+        lineas = [f"  • *{c['casos']}* — {c['que_paso']} _({c['que_hacer']})_" for c in r["causas"]]
+        partes.append("*Por qué no llegaron:*\n" + "\n".join(lineas))
+    if r["pushes_mas_afectados"]:
+        p = r["pushes_mas_afectados"][0]
+        partes.append(f"*Push más afectado esta semana:* conversación {p['conversation_id']} — "
+                      f"no llega el {p['pct']}% de sus envíos ({p['no_llegaron']} de {p['enviados']}).")
+    partes.append(
+        f"*Clientes acumulando fallos (7 días):* {r['clientes_con_3_o_mas_sin_recibir']} llevan 3 o más "
+        f"mensajes sin recibir, {r['clientes_con_2_o_mas_sin_recibir']} llevan 2 o más, "
+        f"{r['clientes_con_algun_fallo_7d']} tuvieron al menos uno.")
+    return "\n\n".join(partes)
+
+
+@app.get("/salud/mensajeria")
+def salud_mensajeria(x_api_key: str | None = Header(default=None)):
+    """El parte del día en JSON, para consultarlo cuando se quiera."""
+    _chequear_clave(x_api_key)
+    r = _salud_armar()
+    if not r:
+        raise HTTPException(503, "Sin datos suficientes para armar el parte.")
+    r["texto_slack"] = _salud_texto(r)
+    return r
+
+
+@app.post("/salud/enviar")
+def salud_enviar(x_api_key: str | None = Header(default=None), aplicar: str | None = None):
+    """Manda el parte a Slack. DRY-RUN por defecto: sin ?aplicar=true solo lo muestra."""
+    _chequear_clave(x_api_key)
+    r = _salud_armar()
+    if not r:
+        raise HTTPException(503, "Sin datos suficientes.")
+    texto = _salud_texto(r)
+    if not _a_bool(aplicar, por_defecto=False):
+        return {"modo": "simulacion", "texto": texto,
+                "aviso": "Para enviarlo de verdad: POST /salud/enviar?aplicar=true"}
+    if not SALUD_SLACK_WEBHOOK_URL:
+        raise HTTPException(409, "Falta configurar SALUD_SLACK_WEBHOOK_URL.")
+    _slack_enviar(SALUD_SLACK_WEBHOOK_URL, texto, nombre="salud_mensajeria")
+    METRICAS["partes_salud_enviados"] += 1
+    log.warning(f"[salud] parte enviado · {r['fecha']} · {r['no_llegaron']} sin llegar")
+    return {"modo": "aplicado", "enviado": True, "texto": texto}
+
+
+def _salud_monitor_loop():
+    """
+    Una vez al día, a la hora configurada. La deduplicación va contra la
+    tabla de eventos y no contra una variable en memoria: si Render levanta
+    más de una instancia, en memoria cada una creería que le toca mandarlo
+    y el canal recibiría el parte repetido.
+    """
+    while True:
+        try:
+            ahora = datetime.now(timezone.utc)
+            if ahora.hour == SALUD_HORA_UTC:
+                marca = str(ahora.date())
+                if not _evento_ya_notificado("parte_salud", marca):
+                    r = _salud_armar()
+                    if r:
+                        _slack_enviar(SALUD_SLACK_WEBHOOK_URL, _salud_texto(r), nombre="salud_mensajeria")
+                        _evento_marcar("parte_salud", marca, "notified", notified=True)
+                        METRICAS["partes_salud_enviados"] += 1
+                        log.warning(f"[salud] parte diario enviado · {r['fecha']}")
+        except Exception as e:
+            log.error(f"[salud] fallo armando el parte: {e}")
+        time.sleep(300)
+
+
+@app.on_event("startup")
+def arrancar_monitor_salud():
+    """
+    Handler de arranque propio. FastAPI ejecuta todos los registrados, así
+    que este convive con el de los monitores viejos sin tocarlo.
+    """
+    if not SALUD_SLACK_WEBHOOK_URL:
+        log.warning("[startup] parte de salud no arranca — falta SALUD_SLACK_WEBHOOK_URL")
+        return
+    threading.Thread(target=_salud_monitor_loop, daemon=True).start()
+    log.warning(f"[startup] parte de salud activo · se envía a las {SALUD_HORA_UTC}:00 UTC")
 
 
 @app.on_event("startup")
