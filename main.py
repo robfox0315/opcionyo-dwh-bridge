@@ -2022,7 +2022,7 @@ def version_bloques(x_api_key: str | None = Header(default=None)):
     _chequear_clave(x_api_key)
     return {
         "base": "1.3.3",
-        "bloques": ["workflows_push (1.3.4)", "cohorte_renovaciones (1.3.5)", "reintento_pushes (1.3.5)", "contador_sesiones (1.3.6)", "workflows_crudo (1.3.7)", "riesgo_cancelacion (1.3.8)", "salud_mensajeria (1.3.9)", "correccion_veteranos (1.4.0)"],
+        "bloques": ["workflows_push (1.3.4)", "cohorte_renovaciones (1.3.5)", "reintento_pushes (1.3.5)", "contador_sesiones (1.3.6)", "workflows_crudo (1.3.7)", "riesgo_cancelacion (1.3.8)", "salud_mensajeria (1.3.9)", "correccion_veteranos (1.4.0)", "salud_detalle (1.4.1)"],
         "endpoints_nuevos": [
             "POST /cohorte/setup", "POST /cohorte/procesar",
             "GET /cohorte/renovaciones", "GET /cohorte/kpis",
@@ -2032,6 +2032,7 @@ def version_bloques(x_api_key: str | None = Header(default=None)):
             "POST /riesgo/setup", "POST /riesgo/calcular", "GET /riesgo/lista",
             "GET /salud/mensajeria", "POST /salud/enviar",
             "GET /sesiones/estado", "POST /sesiones/corregir-veteranos",
+            "GET /salud/detalle",
         ],
     }
 
@@ -3088,3 +3089,260 @@ def arrancar_monitores():
         threading.Thread(target=_onboarding_monitor_loop, daemon=True).start()
     else:
         log.warning("[startup] monitor_onboarding no arranca — falta ONBOARDING_SLACK_WEBHOOK_URL")
+
+
+# ══════════════════════════════════════════════════════════════════
+#  PARTE DE SALUD · DESGLOSE POR PUSH Y LISTA DE CLIENTES
+#  Agregado 08/09/2026 (v1.4.1). BLOQUE PURAMENTE ADITIVO.
+#
+#  ── Por qué ───────────────────────────────────────────────────────
+#  Iva leyó el parte y preguntó dos cosas razonables: "¿se puede ver la
+#  lista de quiénes son?" y "esos 61, ¿qué pushes eran?".
+#  Tenía razón: el parte decía CUÁNTOS fallaban y POR QUÉ, pero no DÓNDE,
+#  y sin eso no se puede accionar. Un número sin destinatario no sirve.
+#
+#  ── Qué cambia ────────────────────────────────────────────────────
+#  1. Cada causa del parte ahora abre los pushes que la concentran.
+#     Ejemplo real del 07/09: de los 12 que rechazó Meta, 10 eran del
+#     mismo push. Eso es una plantilla rota, no un problema general —
+#     y en el parte viejo se leía como si fuera lo segundo.
+#  2. GET /salud/detalle devuelve el desglose completo y la lista de
+#     clientes con fallos acumulados, ya cruzada con HubSpot.
+#
+#  ── Cómo se sobreescribe sin tocar el bloque anterior ─────────────
+#  Se redefinen `_salud_datos`, `_salud_armar` y `_salud_texto`. Python
+#  resuelve por nombre en el momento de la llamada, así que los endpoints
+#  y el hilo del monitor —que ya están registrados— toman estas versiones
+#  sin que haya que modificar una sola línea de lo que ya funciona.
+# ══════════════════════════════════════════════════════════════════
+
+# Cuántos pushes se nombran por causa en el mensaje de Slack. Más que
+# esto y el parte deja de leerse de un vistazo, que es su única virtud.
+SALUD_PUSHES_POR_CAUSA = int(os.environ.get("SALUD_PUSHES_POR_CAUSA", "2"))
+# Solo para armar el link a la ficha. Si no está, se devuelve el id pelado.
+HUBSPOT_PORTAL_ID = os.environ.get("HUBSPOT_PORTAL_ID", "40159402")
+_CACHE_NOMBRES_PUSH = {"datos": None, "ts": 0.0}
+
+
+def _salud_nombres_push():
+    """
+    poll_id -> nombre. Treble cambia el poll_id en cada publicación y a
+    veces reporta el nombre vacío, así que se toma el último no vacío que
+    se haya visto para ese id. Cacheado media hora.
+    """
+    ahora = time.time()
+    if _CACHE_NOMBRES_PUSH["datos"] is not None and (ahora - _CACHE_NOMBRES_PUSH["ts"]) < 1800:
+        return _CACHE_NOMBRES_PUSH["datos"]
+    filas = _query_interna("""
+        SELECT toString(poll_id) pid, argMax(poll_name, timestamps_eta) nombre
+        FROM fact_deployment_status
+        WHERE poll_name != '' AND timestamps_eta >= now() - INTERVAL 120 DAY
+        GROUP BY pid
+    """) or []
+    m = {f["pid"]: str(f["nombre"]).strip() for f in filas if str(f.get("nombre") or "").strip()}
+    _CACHE_NOMBRES_PUSH.update({"datos": m, "ts": ahora})
+    return m
+
+
+def _salud_push_etiqueta(pid, nombres=None):
+    """Nombre del push, o el id a secas si Treble nunca lo reportó."""
+    nombres = nombres if nombres is not None else _salud_nombres_push()
+    n = nombres.get(str(pid))
+    return n if n else f"conversación {pid}"
+
+
+def _salud_datos():
+    """
+    Igual que la versión anterior pero agregando el desglose causa×push.
+    Es una consulta más, no cinco: se agrupa por las dos dimensiones y el
+    resumen por causa se arma sumando en Python.
+    """
+    cia = int(SALUD_COMPANY_ID)
+    dias = _query_interna(f"""
+        SELECT toDate(timestamps_eta) dia, count() enviados,
+               countIf(status NOT IN ('DELIVERED','SUCCESS')) no_llegaron
+        FROM fact_deployment_status
+        WHERE company_id = {cia} AND timestamps_eta >= today() - 8
+        GROUP BY dia ORDER BY dia DESC LIMIT 9
+    """)
+    detalle = _query_interna(f"""
+        SELECT status, toString(poll_id) pid, count() c
+        FROM fact_deployment_status
+        WHERE company_id = {cia} AND toDate(timestamps_eta) = today() - 1
+          AND status NOT IN ('DELIVERED','SUCCESS')
+        GROUP BY status, pid ORDER BY status, c DESC
+    """) or []
+    peor = _query_interna(f"""
+        SELECT poll_id, count() enviados,
+               countIf(status NOT IN ('DELIVERED','SUCCESS')) fallan
+        FROM fact_deployment_status
+        WHERE company_id = {cia} AND timestamps_eta >= today() - 7
+        GROUP BY poll_id HAVING enviados >= 20 AND fallan >= 5
+        ORDER BY fallan / enviados DESC LIMIT 3
+    """)
+    acumulan = _query_interna(f"""
+        SELECT countIf(veces >= 3) tres_o_mas, countIf(veces >= 2) dos_o_mas, count() con_algun_fallo
+        FROM (SELECT treble_id, count() veces FROM fact_deployment_status
+              WHERE company_id = {cia} AND timestamps_eta >= today() - 7
+                AND status NOT IN ('DELIVERED','SUCCESS')
+              GROUP BY treble_id)
+        LIMIT 1
+    """)
+
+    porcausa = {}
+    for f in detalle:
+        st = f["status"]
+        d = porcausa.setdefault(st, {"status": st, "c": 0, "pushes": []})
+        d["c"] += int(f["c"])
+        d["pushes"].append({"poll_id": f["pid"], "casos": int(f["c"])})
+    causas = sorted(porcausa.values(), key=lambda d: -d["c"])[:8]
+    return dias, causas, peor, (acumulan or [{}])[0]
+
+
+def _salud_armar():
+    dias, causas, peor, acum = _salud_datos()
+    if not dias:
+        return None
+    ayer = dias[1] if len(dias) > 1 else dias[0]
+    previos = dias[2:9] if len(dias) > 2 else []
+    env_ayer = int(ayer.get("enviados") or 0)
+    mal_ayer = int(ayer.get("no_llegaron") or 0)
+    pct_ayer = round(100 * mal_ayer / env_ayer, 1) if env_ayer else 0.0
+
+    tot_e = sum(int(d.get("enviados") or 0) for d in previos)
+    tot_m = sum(int(d.get("no_llegaron") or 0) for d in previos)
+    pct_prev = round(100 * tot_m / tot_e, 1) if tot_e else 0.0
+    delta = round(pct_ayer - pct_prev, 1)
+    nombres = _salud_nombres_push()
+
+    return {
+        "fecha": str(ayer.get("dia")),
+        "enviados": env_ayer, "no_llegaron": mal_ayer, "pct": pct_ayer,
+        "pct_promedio_7d": pct_prev, "diferencia_puntos": delta,
+        "anomalo": delta >= SALUD_UMBRAL_ALERTA,
+        "causas": [{
+            "status": c["status"], "casos": c["c"],
+            "que_paso": CAUSAS.get(c["status"], ("sin clasificar", "revisar"))[0],
+            "que_hacer": CAUSAS.get(c["status"], ("sin clasificar", "revisar"))[1],
+            "pushes": [{"poll_id": p["poll_id"], "push": _salud_push_etiqueta(p["poll_id"], nombres),
+                        "casos": p["casos"]} for p in c["pushes"]],
+        } for c in causas],
+        "pushes_mas_afectados": [
+            {"conversation_id": str(p["poll_id"]), "push": _salud_push_etiqueta(p["poll_id"], nombres),
+             "enviados": int(p["enviados"]), "no_llegaron": int(p["fallan"]),
+             "pct": round(100 * int(p["fallan"]) / int(p["enviados"]), 1)} for p in peor],
+        "clientes_con_3_o_mas_sin_recibir": int(acum.get("tres_o_mas") or 0),
+        "clientes_con_2_o_mas_sin_recibir": int(acum.get("dos_o_mas") or 0),
+        "clientes_con_algun_fallo_7d": int(acum.get("con_algun_fallo") or 0),
+    }
+
+
+def _salud_texto(r):
+    """
+    El mensaje de Slack. Ahora cada causa abre los pushes que la
+    concentran, que es lo que permite hacer algo con el número.
+    """
+    if r["anomalo"]:
+        cab = (f":red_circle: *Salud de mensajería · {r['fecha']}*\n"
+               f"Ayer salieron {r['enviados']:,} mensajes y *no llegaron {r['no_llegaron']}* "
+               f"({r['pct']}%). Son {r['diferencia_puntos']} puntos peor que la semana "
+               f"({r['pct_promedio_7d']}% de promedio).")
+    else:
+        cab = (f":white_check_mark: *Salud de mensajería · {r['fecha']}*\n"
+               f"Ayer salieron {r['enviados']:,} mensajes y no llegaron {r['no_llegaron']} "
+               f"({r['pct']}%). En línea con la semana ({r['pct_promedio_7d']}%).")
+    cab = cab.replace(",", ".")
+
+    partes = [cab]
+    if r["causas"]:
+        lineas = []
+        for c in r["causas"]:
+            lineas.append(f"  • *{c['casos']}* — {c['que_paso']} _({c['que_hacer']})_")
+            top = c.get("pushes") or []
+            if top:
+                muestra = " · ".join(f"{p['push']} ({p['casos']})"
+                                     for p in top[:SALUD_PUSHES_POR_CAUSA])
+                resto = len(top) - SALUD_PUSHES_POR_CAUSA
+                if resto > 0:
+                    muestra += f" · y {resto} push{'es' if resto > 1 else ''} más"
+                lineas.append(f"       ↳ {muestra}")
+        partes.append("*Por qué no llegaron:*\n" + "\n".join(lineas))
+    if r["pushes_mas_afectados"]:
+        p = r["pushes_mas_afectados"][0]
+        partes.append(f"*Push más afectado esta semana:* {p['push']} — "
+                      f"no llega el {p['pct']}% de sus envíos ({p['no_llegaron']} de {p['enviados']}).")
+    partes.append(
+        f"*Clientes acumulando fallos (7 días):* {r['clientes_con_3_o_mas_sin_recibir']} llevan 3 o más "
+        f"mensajes sin recibir, {r['clientes_con_2_o_mas_sin_recibir']} llevan 2 o más, "
+        f"{r['clientes_con_algun_fallo_7d']} tuvieron al menos uno.")
+    return "\n\n".join(partes)
+
+
+@app.get("/salud/detalle")
+def salud_detalle(x_api_key: str | None = Header(default=None),
+                  dias: int = 7, minimo: int = 2, tope: int = 500):
+    """
+    Lo que el parte no entra a decir: quiénes son.
+    Devuelve el desglose completo causa×push del último día cerrado y la
+    lista de clientes con `minimo` o más mensajes sin recibir, ya cruzada
+    con su ficha de HubSpot para poder ir a buscarlos.
+    """
+    _chequear_clave(x_api_key)
+    cia = int(SALUD_COMPANY_ID)
+    d = max(1, min(int(dias), 30))
+    m = max(1, int(minimo))
+    nombres = _salud_nombres_push()
+
+    detalle = _query_interna(f"""
+        SELECT status, toString(poll_id) pid, count() c
+        FROM fact_deployment_status
+        WHERE company_id = {cia} AND toDate(timestamps_eta) = today() - 1
+          AND status NOT IN ('DELIVERED','SUCCESS')
+        GROUP BY status, pid ORDER BY status, c DESC
+    """) or []
+
+    clientes = _query_interna(f"""
+    WITH c AS (
+      SELECT contact_wa_id wa, any(helpdesk_contact_id) hs
+      FROM fact_conversations WHERE helpdesk_contact_id != '' GROUP BY wa
+    )
+    SELECT f.treble_id tid, any(c.hs) hubspot_id, count() fallos,
+           topK(1)(f.status) causa_principal,
+           groupUniqArray(toString(f.poll_id)) polls,
+           max(f.timestamps_eta) ultimo
+    FROM (SELECT treble_id, status, poll_id, timestamps_eta
+          FROM fact_deployment_status
+          WHERE company_id = {cia} AND timestamps_eta >= now() - INTERVAL {d} DAY
+            AND status NOT IN ('DELIVERED','SUCCESS')) f
+    LEFT JOIN c ON f.treble_id = c.wa
+    GROUP BY tid HAVING fallos >= {m}
+    ORDER BY fallos DESC LIMIT {max(1, min(int(tope), 2000))}
+    """) or []
+
+    def _causa(st):
+        return CAUSAS.get(st, ("sin clasificar", "revisar"))
+
+    return {
+        "generado": datetime.now(timezone.utc).isoformat(),
+        "ventana_clientes_dias": d,
+        "por_causa_y_push": [{
+            "status": f["status"], "que_paso": _causa(f["status"])[0],
+            "que_hacer": _causa(f["status"])[1],
+            "poll_id": f["pid"], "push": _salud_push_etiqueta(f["pid"], nombres),
+            "casos": int(f["c"]),
+        } for f in detalle],
+        "clientes": [{
+            "hubspot_id": str(f.get("hubspot_id") or "") or None,
+            "ficha": (f"https://app.hubspot.com/contacts/{HUBSPOT_PORTAL_ID}/record/0-1/{f['hubspot_id']}"
+                      if str(f.get("hubspot_id") or "").isdigit() and HUBSPOT_PORTAL_ID else None),
+            "telefono": str(f.get("tid") or ""),
+            "mensajes_sin_recibir": int(f["fallos"]),
+            "causa_principal": (list(f["causa_principal"]) or [""])[0],
+            "que_paso": _causa((list(f["causa_principal"]) or [""])[0])[0],
+            "pushes": [_salud_push_etiqueta(p, nombres) for p in (f.get("polls") or [])],
+            "ultimo_fallo": str(f.get("ultimo") or "")[:19],
+        } for f in clientes],
+        "nota": ("El desglose por causa y push corresponde al último día cerrado, igual que el parte. "
+                 "La lista de clientes cubre la ventana pedida en ?dias= (7 por defecto). "
+                 "Un cliente sin hubspot_id es un número que no está asociado a ningún contacto del CRM."),
+    }
