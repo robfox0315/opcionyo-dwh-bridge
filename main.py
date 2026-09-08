@@ -2022,7 +2022,7 @@ def version_bloques(x_api_key: str | None = Header(default=None)):
     _chequear_clave(x_api_key)
     return {
         "base": "1.3.3",
-        "bloques": ["workflows_push (1.3.4)", "cohorte_renovaciones (1.3.5)", "reintento_pushes (1.3.5)", "contador_sesiones (1.3.6)", "workflows_crudo (1.3.7)", "riesgo_cancelacion (1.3.8)", "salud_mensajeria (1.3.9)"],
+        "bloques": ["workflows_push (1.3.4)", "cohorte_renovaciones (1.3.5)", "reintento_pushes (1.3.5)", "contador_sesiones (1.3.6)", "workflows_crudo (1.3.7)", "riesgo_cancelacion (1.3.8)", "salud_mensajeria (1.3.9)", "correccion_veteranos (1.4.0)"],
         "endpoints_nuevos": [
             "POST /cohorte/setup", "POST /cohorte/procesar",
             "GET /cohorte/renovaciones", "GET /cohorte/kpis",
@@ -2031,6 +2031,7 @@ def version_bloques(x_api_key: str | None = Header(default=None)):
             "GET /workflows/{id}/crudo", "GET /workflows/buscar", "POST /workflows/crear-crudo",
             "POST /riesgo/setup", "POST /riesgo/calcular", "GET /riesgo/lista",
             "GET /salud/mensajeria", "POST /salud/enviar",
+            "GET /sesiones/estado", "POST /sesiones/corregir-veteranos",
         ],
     }
 
@@ -2912,6 +2913,153 @@ def arrancar_monitor_salud():
         return
     threading.Thread(target=_salud_monitor_loop, daemon=True).start()
     log.warning(f"[startup] parte de salud activo · se envía a las {SALUD_HORA_UTC}:00 UTC")
+
+
+# ══════════════════════════════════════════════════════════════════
+#  CORRECCIÓN: CLIENTES ANTERIORES AL REGISTRO DE SESIONES
+#  Agregado 08/09/2026 (v1.4.0). BLOQUE PURAMENTE ADITIVO.
+#
+#  ── El error que corrige ──────────────────────────────────────────
+#  Angela lo detectó desde el sentido común: "me parece raro que el 70%
+#  de los envíos quede en las 4 primeras sesiones, teniendo casi 5.000
+#  clientes activos". Tenía razón.
+#
+#  El contador de sesiones se deriva de los pushes de cierre, y ese
+#  registro EMPIEZA EL 16/06/2026. No hay datos antes. Entonces un
+#  cliente con un año de antigüedad y 40 sesiones hechas, si en estos
+#  84 días hizo 3, el contador dice 3 y la bifurcación lo manda a
+#  gestoras de consultoría como si fuera nuevo.
+#
+#  Medido: 733 clientes marcados como "primeras 4 sesiones" habían
+#  comprado ANTES del 16/06 — el 40% de ese grupo, mal clasificado.
+#
+#  ── La regla ──────────────────────────────────────────────────────
+#  Si el cliente compró antes de que exista el registro, el contador no
+#  es confiable y va a ATC. Después de tres meses con un plan de 2 o 4
+#  sesiones mensuales es casi imposible que siga en sus primeras 4.
+#  El error, si lo hay, cae del lado conservador: ATC es exactamente lo
+#  que pasaba antes de la bifurcación, así que nadie queda sin atender.
+#
+#  ── Por qué es un endpoint aparte ─────────────────────────────────
+#  Para no tocar `sesiones_sincronizar`, que ya está en producción y
+#  funciona. Este corre DESPUÉS y arregla lo que aquel no puede saber,
+#  porque la fecha de compra vive en HubSpot y no en el DWH.
+#  IMPORTANTE: hay que correr los dos, en orden. `/sesiones/estado`
+#  avisa si quedó la corrección pendiente.
+# ══════════════════════════════════════════════════════════════════
+
+PROP_FECHA_COMPRA = "fecha_compra"
+# Se calcula del DWH en vez de dejarlo fijo: si mañana se carga más
+# historia, el umbral se mueve solo y la corrección deja de hacer falta.
+_CACHE_INICIO_REGISTRO = {"fecha": None, "ts": 0.0}
+
+
+def _sesiones_inicio_registro():
+    """Primer día con datos de sesiones. Cacheado una hora."""
+    ahora = time.time()
+    if _CACHE_INICIO_REGISTRO["fecha"] and (ahora - _CACHE_INICIO_REGISTRO["ts"]) < 3600:
+        return _CACHE_INICIO_REGISTRO["fecha"]
+    ses = ",".join(f"'{k}'" for k in PUSHES_ASISTIO)
+    filas = _query_interna(f"""
+        SELECT min(toDate(timestamps_eta)) inicio FROM fact_deployment_status
+        WHERE toString(poll_id) IN ({ses}) LIMIT 1
+    """)
+    fecha = _a_fecha((filas or [{}])[0].get("inicio")) if filas else None
+    if fecha:
+        _CACHE_INICIO_REGISTRO.update({"fecha": fecha, "ts": ahora})
+    return fecha
+
+
+@app.get("/sesiones/estado")
+def sesiones_estado(x_api_key: str | None = Header(default=None)):
+    """
+    Cuánto se puede confiar en el contador hoy, y si quedó la corrección
+    pendiente. Sirve para no volver a publicar una cifra sesgada.
+    """
+    _chequear_clave(x_api_key)
+    inicio = _sesiones_inicio_registro()
+    if not inicio:
+        raise HTTPException(503, "No se pudo determinar el inicio del registro de sesiones.")
+    dias = (datetime.now(timezone.utc).date() - inicio).days
+
+    def _contar(filtros):
+        try:
+            d = _hubspot_api("POST", "/crm/v3/objects/contacts/search",
+                             {"filterGroups": [{"filters": filtros}], "properties": ["hs_object_id"], "limit": 1})
+            return d.get("total", 0)
+        except Exception:
+            return None
+
+    pendientes = _contar([
+        {"propertyName": PROP_SES_ETAPA, "operator": "EQ", "value": "acompanamiento"},
+        {"propertyName": PROP_FECHA_COMPRA, "operator": "LT", "value": str(_dia_ms(inicio))},
+    ])
+    activos = _contar([
+        {"propertyName": "lifecyclestage", "operator": "EQ", "value": "customer"},
+        {"propertyName": "fecha_ultimo_pago", "operator": "GTE",
+         "value": str(_dia_ms(datetime.now(timezone.utc).date() - timedelta(days=35)))},
+    ])
+    con_etapa = _contar([{"propertyName": PROP_SES_ETAPA, "operator": "HAS_PROPERTY"}])
+
+    return {
+        "inicio_del_registro": inicio.isoformat(),
+        "dias_de_historia": dias,
+        "clientes_activos": activos,
+        "con_etapa_calculada": con_etapa,
+        "cobertura": round(con_etapa / activos, 3) if activos and con_etapa else None,
+        "correccion_pendiente": pendientes,
+        "listo": pendientes == 0,
+        "nota": ("El contador solo ve desde el inicio del registro. Un cliente que compró antes "
+                 "tiene el conteo truncado, así que va a ATC. 'correccion_pendiente' debe ser 0: "
+                 "si no lo es, falta correr POST /sesiones/corregir-veteranos."),
+    }
+
+
+@app.post("/sesiones/corregir-veteranos")
+def sesiones_corregir_veteranos(x_api_key: str | None = Header(default=None), aplicar: str | None = None):
+    """
+    Pasa a ATC a los clientes que compraron antes de que existiera el
+    registro de sesiones. DRY-RUN por defecto.
+    """
+    _chequear_clave(x_api_key)
+    inicio = _sesiones_inicio_registro()
+    if not inicio:
+        raise HTTPException(503, "No se pudo determinar el inicio del registro.")
+    escribir = _a_bool(aplicar, por_defecto=False)
+
+    afectados = _hs_buscar_todo("contacts", {
+        "filterGroups": [{"filters": [
+            {"propertyName": PROP_SES_ETAPA, "operator": "EQ", "value": "acompanamiento"},
+            {"propertyName": PROP_FECHA_COMPRA, "operator": "LT", "value": str(_dia_ms(inicio))},
+        ]}],
+        "properties": ["hs_object_id", "hs_full_name_or_email", PROP_FECHA_COMPRA, PROP_SES_ASISTIDAS],
+    })
+
+    entradas = [{"id": r["id"], "properties": {
+        PROP_SES_ETAPA: "soporte",
+        PROP_SES_ORIGEN: (f"Compró antes del {inicio.isoformat()}, cuando empieza el registro de "
+                          "sesiones: el conteo está truncado y no sirve para decidir la etapa."),
+    }} for r in afectados]
+
+    resultado = {
+        "modo": "aplicado" if escribir else "simulacion",
+        "inicio_del_registro": inicio.isoformat(),
+        "a_corregir": len(entradas),
+        "muestra": [{"nombre": r["properties"].get("hs_full_name_or_email"),
+                     "compro": r["properties"].get(PROP_FECHA_COMPRA),
+                     "sesiones_que_contaba": r["properties"].get(PROP_SES_ASISTIDAS)}
+                    for r in afectados[:8]],
+        "razon": ("Su conteo de sesiones está truncado por el inicio del registro. Pasan a ATC, "
+                  "que es el destino conservador: es lo que pasaba antes de la bifurcación."),
+    }
+    if not escribir:
+        resultado["aviso"] = "Simulación. Para aplicarlo: POST /sesiones/corregir-veteranos?aplicar=true"
+        return resultado
+
+    escritos, errores = _hs_batch_update("contacts", entradas) if entradas else (0, [])
+    resultado.update({"corregidos": escritos, "errores": errores})
+    log.warning(f"[sesiones] veteranos corregidos={escritos} errores={len(errores)}")
+    return resultado
 
 
 @app.on_event("startup")
