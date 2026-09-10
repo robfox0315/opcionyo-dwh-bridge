@@ -2022,7 +2022,7 @@ def version_bloques(x_api_key: str | None = Header(default=None)):
     _chequear_clave(x_api_key)
     return {
         "base": "1.3.3",
-        "bloques": ["workflows_push (1.3.4)", "cohorte_renovaciones (1.3.5)", "reintento_pushes (1.3.5)", "contador_sesiones (1.3.6)", "workflows_crudo (1.3.7)", "riesgo_cancelacion (1.3.8)", "salud_mensajeria (1.3.9)", "correccion_veteranos (1.4.0)", "salud_detalle (1.4.1)"],
+        "bloques": ["workflows_push (1.3.4)", "cohorte_renovaciones (1.3.5)", "reintento_pushes (1.3.5)", "contador_sesiones (1.3.6)", "workflows_crudo (1.3.7)", "riesgo_cancelacion (1.3.8)", "salud_mensajeria (1.3.9)", "correccion_veteranos (1.4.0)", "salud_detalle (1.4.1)", "arreglos_cruce_y_auditoria (1.4.2)", "reintento_automatico (1.4.2)", "cobertura_bifurcacion (1.4.2)", "sesiones_agendadas (1.4.3)"],
         "endpoints_nuevos": [
             "POST /cohorte/setup", "POST /cohorte/procesar",
             "GET /cohorte/renovaciones", "GET /cohorte/kpis",
@@ -2032,7 +2032,11 @@ def version_bloques(x_api_key: str | None = Header(default=None)):
             "POST /riesgo/setup", "POST /riesgo/calcular", "GET /riesgo/lista",
             "GET /salud/mensajeria", "POST /salud/enviar",
             "GET /sesiones/estado", "POST /sesiones/corregir-veteranos",
-            "GET /salud/detalle",
+            "GET /salud/detalle", "GET /salud/detalle-v2",
+            "GET /sesiones/polls", "GET /auditoria/contactos",
+            "GET /pushes/reintento-estado",
+            "POST /sesiones/completar-nuevos", "GET /sesiones/cobertura",
+            "GET /sesiones/senal", "POST /sesiones/recalcular-agendadas",
         ],
     }
 
@@ -3346,3 +3350,977 @@ def salud_detalle(x_api_key: str | None = Header(default=None),
                  "La lista de clientes cubre la ventana pedida en ?dias= (7 por defecto). "
                  "Un cliente sin hubspot_id es un número que no está asociado a ningún contacto del CRM."),
     }
+
+
+# ══════════════════════════════════════════════════════════════════
+#  v1.4.2 · TRES ARREGLOS QUE SALIERON DE ERRORES REALES
+#  Agregado 10/09/2026. BLOQUE PURAMENTE ADITIVO.
+#
+#  ── 1. El parte decía una mentira ─────────────────────────────────
+#  El texto afirmaba "el reintento automático los recupera". No existe
+#  tal reintento automático: el endpoint está, pero nunca quedó nada
+#  ejecutándolo. Iva lo preguntó y ahí se descubrió. Durante días el
+#  parte tranquilizó al equipo sobre ~50 mensajes diarios que nadie
+#  recuperaba. Ahora el texto dice la verdad y muestra cuántos hay
+#  pendientes de verdad.
+#
+#  ── 2. El contador se rompía al republicar un flujo ───────────────
+#  Los cuatro pushes de sesión estaban clavados por poll_id. Treble
+#  cambia el poll_id en cada publicación del flujo Y reescribe el
+#  histórico con el id nuevo, así que republicar "Cuarta sesión sí
+#  asistió" habría borrado de golpe todo el conteo de cuartas sesiones.
+#  Ahora los ids se resuelven por NOMBRE del push contra el DWH, con
+#  los ids conocidos como respaldo. Se toma la unión de ambos: si el
+#  nombre cambia sirven los ids, si los ids cambian sirve el nombre.
+#
+#  ── 3. El cruce con HubSpot marcaba clientes como inexistentes ────
+#  Se cruzaba por `helpdesk_contact_id` de fact_conversations, que solo
+#  existe si hubo una conversación con el enlace guardado. Iva marcó que
+#  era raro que hubiera clientes sin ficha: de 32 revisados a mano, 29
+#  sí tenían. Ahora se cruza por teléfono contra HubSpot, normalizando
+#  ambos lados, con el cruce viejo como respaldo.
+# ══════════════════════════════════════════════════════════════════
+
+# Nombre del push -> número de sesión. Es la fuente de verdad nueva.
+# Los poll_id de abajo quedan como red de seguridad, no como definición.
+PUSHES_ASISTIO_NOMBRE = {
+    "Primera sesión sí asistió": 1,
+    "Segunda Sesión - Sí asistió": 2,
+    "Tercera sesión sí asistió": 3,
+    "Cuarta sesión sí asistió": 4,
+}
+PUSHES_NO_ASISTIO_NOMBRE = {
+    "Inasistencia Primera sesión": 1,
+    "Inasistencia 2, 3, o 4ta sesión": 0,
+    "Inasistencia 2, 3 o 4ta sesión con AR": 0,
+}
+_CACHE_POLLS_SESION = {"asistio": None, "no_asistio": None, "ts": 0.0}
+
+
+def _norm_push(s):
+    """Compara nombres de push ignorando tildes, mayúsculas y espacios de más."""
+    import unicodedata
+    s = unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode("ascii")
+    return " ".join(s.lower().split())
+
+
+def _polls_de_sesion():
+    """
+    Resuelve los poll_id vigentes de los pushes de sesión buscándolos por
+    nombre en el DWH. Devuelve (set_asistio, set_no_asistio) como strings.
+    Cacheado media hora. Si el DWH falla, caen los ids clavados de v1.3.6,
+    que es exactamente el comportamiento anterior: nunca queda peor.
+    """
+    ahora = time.time()
+    if _CACHE_POLLS_SESION["asistio"] is not None and (ahora - _CACHE_POLLS_SESION["ts"]) < 1800:
+        return _CACHE_POLLS_SESION["asistio"], _CACHE_POLLS_SESION["no_asistio"]
+
+    asistio = set(PUSHES_ASISTIO)          # red de seguridad: los ids de siempre
+    no_asistio = set(PUSHES_NO_ASISTIO)
+    try:
+        filas = _query_interna("""
+            SELECT toString(poll_id) pid, argMax(poll_name, timestamps_eta) nombre
+            FROM fact_deployment_status
+            WHERE poll_name != '' AND timestamps_eta >= now() - INTERVAL 365 DAY
+            GROUP BY pid
+        """) or []
+        buscados_si = {_norm_push(k) for k in PUSHES_ASISTIO_NOMBRE}
+        buscados_no = {_norm_push(k) for k in PUSHES_NO_ASISTIO_NOMBRE}
+        for f in filas:
+            n = _norm_push(f.get("nombre"))
+            if n in buscados_si:
+                asistio.add(str(f["pid"]))
+            elif n in buscados_no:
+                no_asistio.add(str(f["pid"]))
+    except Exception as e:
+        log.error(f"[sesiones] no se pudieron resolver los polls por nombre, uso los fijos: {e}")
+
+    _CACHE_POLLS_SESION.update({"asistio": asistio, "no_asistio": no_asistio, "ts": ahora})
+    log.warning(f"[sesiones] polls resueltos · asistio={len(asistio)} no_asistio={len(no_asistio)}")
+    return asistio, no_asistio
+
+
+# ── Mapa teléfono -> contacto de HubSpot ──────────────────────────
+# Se arma UNA vez y sirve para el contador, el parte de salud y la
+# auditoría. Es la pieza que reemplaza el cruce por conversaciones.
+_CACHE_MAPA_TEL = {"datos": None, "ts": 0.0}
+AUDITORIA_DIAS_ACTIVO = int(os.environ.get("AUDITORIA_DIAS_ACTIVO", "35"))
+# COHORTE_MAX_CONTACTOS son 2.000 y los clientes activos son más de 4.000:
+# con el tope por defecto la auditoría se quedaría con la mitad del padrón.
+AUDITORIA_MAX_CONTACTOS = int(os.environ.get("AUDITORIA_MAX_CONTACTOS", "12000"))
+
+
+def _solo_digitos(t):
+    return re.sub(r"\D", "", str(t or ""))
+
+
+def _contactos_activos_hubspot(props=None):
+    """
+    Todos los clientes activos: lifecyclestage=customer con pago en los
+    últimos AUDITORIA_DIAS_ACTIVO días. Una sola pasada paginada.
+    """
+    corte = _dia_ms(datetime.now(timezone.utc).date() - timedelta(days=AUDITORIA_DIAS_ACTIVO))
+    pedidas = ["hs_object_id", "hs_whatsapp_phone_number", "phone", "mobilephone",
+               "email", "firstname", "lastname", PROP_SES_ETAPA, "fecha_compra",
+               "sesiones_plan", "fecha_ultimo_pago"]
+    if props:
+        pedidas = sorted(set(pedidas) | set(props))
+    return _hs_buscar_todo("contacts", {
+        "filterGroups": [{"filters": [
+            {"propertyName": "lifecyclestage", "operator": "EQ", "value": "customer"},
+            {"propertyName": "fecha_ultimo_pago", "operator": "GTE", "value": str(corte)},
+        ]}],
+        "properties": pedidas,
+    }, tope=AUDITORIA_MAX_CONTACTOS)
+
+
+def _mapa_telefono_hubspot(forzar=False):
+    """
+    { solo_dígitos_del_teléfono : hubspot_id } para todos los activos.
+    Indexa los tres campos de teléfono, porque el número de WhatsApp real
+    aparece tanto en `hs_whatsapp_phone_number` como en `mobilephone`
+    según cómo se haya cargado el contacto. Cacheado una hora.
+    """
+    ahora = time.time()
+    if not forzar and _CACHE_MAPA_TEL["datos"] is not None and (ahora - _CACHE_MAPA_TEL["ts"]) < 3600:
+        return _CACHE_MAPA_TEL["datos"]
+    mapa = {}
+    for c in _contactos_activos_hubspot():
+        hs = str(c.get("id") or "")
+        p = c.get("properties") or {}
+        for campo in ("hs_whatsapp_phone_number", "mobilephone", "phone"):
+            d = _solo_digitos(p.get(campo))
+            if len(d) >= 8:
+                mapa.setdefault(d, hs)
+    _CACHE_MAPA_TEL.update({"datos": mapa, "ts": ahora})
+    log.warning(f"[mapa] teléfonos indexados: {len(mapa)}")
+    return mapa
+
+
+def _resolver_hubspot(tid, hs_conversaciones, mapa):
+    """
+    El id de HubSpot de un número de Treble. Primero lo que ya venía del
+    cruce por conversaciones; si no hay, se busca por teléfono.
+    """
+    hs = str(hs_conversaciones or "").strip()
+    if hs.isdigit():
+        return hs, "conversacion"
+    d = _solo_digitos(tid)
+    for cand in (d, d[1:] if len(d) > 10 else None):
+        if cand and cand in mapa:
+            return mapa[cand], "telefono"
+    return None, "no_encontrado"
+
+
+# ══════════════════════════════════════════════════════════════════
+#  ARREGLO 2 · El contador deja de depender de los poll_id fijos
+# ══════════════════════════════════════════════════════════════════
+def _sesiones_desde_dwh(dias=None):
+    """
+    Igual que la versión de v1.3.6 en su lógica de conteo — un push
+    repetido el mismo día es un reintento, no otra sesión — pero con dos
+    diferencias que importan:
+      · los poll_id se resuelven por nombre (ver _polls_de_sesion)
+      · si el cruce por conversaciones no encuentra la ficha, se busca
+        por teléfono en vez de descartar al cliente
+    """
+    a_set, n_set = _polls_de_sesion()
+    asistio = ",".join(f"'{k}'" for k in sorted(a_set))
+    no_asistio = ",".join(f"'{k}'" for k in sorted(n_set))
+    corte = f"AND timestamps_eta >= now() - INTERVAL {int(dias)} DAY" if dias else ""
+    sql = f"""
+    WITH d AS (
+      SELECT treble_id tid, toString(poll_id) pid, timestamps_eta ts
+      FROM fact_deployment_status
+      WHERE toString(poll_id) IN ({asistio},{no_asistio}) {corte}
+    ),
+    c AS (
+      SELECT contact_wa_id wa, any(helpdesk_contact_id) hs
+      FROM fact_conversations WHERE helpdesk_contact_id != '' GROUP BY wa
+    )
+    SELECT d.tid tid, any(c.hs) hubspot_id,
+           uniqExactIf(concat(d.pid, '|', toString(toDate(d.ts))), d.pid IN ({asistio})) asistidas,
+           uniqExactIf(concat(d.pid, '|', toString(toDate(d.ts))), d.pid IN ({no_asistio})) inasistencias,
+           toDate(max(d.ts)) ultima
+    FROM d LEFT JOIN c ON d.tid = c.wa
+    GROUP BY tid
+    ORDER BY ultima DESC
+    LIMIT {SESIONES_MAX_CONTACTOS}
+    """
+    filas = _query_interna(sql) or []
+
+    # El HAVING hubspot_id != '' de la versión anterior descartaba en el SQL
+    # a todo el que no tuviera conversación enlazada. Ahora se rescatan acá.
+    try:
+        mapa = _mapa_telefono_hubspot()
+    except Exception as e:
+        log.error(f"[sesiones] sin mapa de teléfonos, uso solo el cruce viejo: {e}")
+        mapa = {}
+    rescatados = 0
+    salida = []
+    for f in filas:
+        hs, via = _resolver_hubspot(f.get("tid"), f.get("hubspot_id"), mapa)
+        if not hs:
+            continue
+        if via == "telefono":
+            rescatados += 1
+        f["hubspot_id"] = hs
+        salida.append(f)
+    if rescatados:
+        log.warning(f"[sesiones] {rescatados} clientes rescatados por teléfono que antes se perdían")
+    return salida
+
+
+@app.get("/sesiones/polls")
+def sesiones_polls(x_api_key: str | None = Header(default=None), refrescar: str | None = None):
+    """
+    Qué poll_id está usando hoy el contador y de dónde salió cada uno.
+    Sirve para verificar, después de republicar un flujo en Treble, que el
+    contador siguió al push nuevo en vez de quedarse con el id viejo.
+    """
+    _chequear_clave(x_api_key)
+    if _a_bool(refrescar, por_defecto=False):
+        _CACHE_POLLS_SESION.update({"asistio": None, "no_asistio": None, "ts": 0.0})
+    a_set, n_set = _polls_de_sesion()
+    nombres = _salud_nombres_push()
+    def _detalle(ids, fijos):
+        return sorted(({"poll_id": p, "push": nombres.get(p, f"conversación {p}"),
+                        "origen": "id fijo de respaldo" if p in fijos else "resuelto por nombre"}
+                       for p in ids), key=lambda d: d["push"])
+    return {
+        "asistio": _detalle(a_set, set(PUSHES_ASISTIO)),
+        "no_asistio": _detalle(n_set, set(PUSHES_NO_ASISTIO)),
+        "nota": ("Los poll_id cambian cada vez que se publica el flujo en Treble, y el histórico se "
+                 "reescribe con el id nuevo. Por eso se resuelven por nombre y los ids fijos quedan "
+                 "solo como respaldo. Si acá falta un push que sí existe, revisá que su nombre en "
+                 "Treble coincida con el esperado."),
+        "nombres_esperados": {"asistio": list(PUSHES_ASISTIO_NOMBRE),
+                              "no_asistio": list(PUSHES_NO_ASISTIO_NOMBRE)},
+    }
+
+
+# ══════════════════════════════════════════════════════════════════
+#  ARREGLO 1 · El parte deja de prometer un reintento que no corre
+# ══════════════════════════════════════════════════════════════════
+# La frase que había que corregir vivía acá: cada línea de causa cerraba con
+# "(el reintento automático los recupera)". Se cambia el diccionario global,
+# así queda arreglado tanto en el parte de Slack como en /salud/detalle.
+CAUSAS["FAILURE_BY_HUMAN_HANDOVER"] = (
+    "el cliente tenía un chat abierto en Treble",
+    "recuperable, pero el reenvío hay que ejecutarlo a mano",
+)
+
+
+def _salud_texto(r):
+    """
+    Igual que v1.4.1 — cada causa abre sus pushes — con una corrección
+    importante: ya no afirma que el reintento es automático, porque no lo
+    es. En su lugar informa cuántos hay esperando de verdad.
+    """
+    if r["anomalo"]:
+        cab = (f":red_circle: *Salud de mensajería · {r['fecha']}*\n"
+               f"Ayer salieron {r['enviados']:,} mensajes y *no llegaron {r['no_llegaron']}* "
+               f"({r['pct']}%). Son {r['diferencia_puntos']} puntos peor que la semana "
+               f"({r['pct_promedio_7d']}% de promedio).")
+    else:
+        cab = (f":white_check_mark: *Salud de mensajería · {r['fecha']}*\n"
+               f"Ayer salieron {r['enviados']:,} mensajes y no llegaron {r['no_llegaron']} "
+               f"({r['pct']}%). En línea con la semana ({r['pct_promedio_7d']}%).")
+    cab = cab.replace(",", ".")
+
+    partes = [cab]
+    if r["causas"]:
+        lineas = []
+        for c in r["causas"]:
+            lineas.append(f"  • *{c['casos']}* — {c['que_paso']} _({c['que_hacer']})_")
+            top = c.get("pushes") or []
+            if top:
+                muestra = " · ".join(f"{p['push']} ({p['casos']})"
+                                     for p in top[:SALUD_PUSHES_POR_CAUSA])
+                resto = len(top) - SALUD_PUSHES_POR_CAUSA
+                if resto > 0:
+                    muestra += f" · y {resto} push{'es' if resto > 1 else ''} más"
+                lineas.append(f"       ↳ {muestra}")
+        partes.append("*Por qué no llegaron:*\n" + "\n".join(lineas))
+
+    pend, recup = r.get("reintento_pendientes"), r.get("reintento_recuperables")
+    if pend is not None:
+        if recup is not None and recup > 0:
+            partes.append(f":warning: *Reintento:* hay *{pend}* pushes bloqueados esperando, "
+                          f"de los cuales *{recup}* se pueden reenviar. El reenvío NO es automático: "
+                          f"alguien tiene que ejecutarlo.")
+        elif pend > 0:
+            partes.append(f":warning: *Reintento:* hay *{pend}* pushes bloqueados esperando y ninguno "
+                          f"es reenviable todavía — sus campañas no están dadas de alta en el sistema.")
+
+    if r["pushes_mas_afectados"]:
+        p = r["pushes_mas_afectados"][0]
+        partes.append(f"*Push más afectado esta semana:* {p['push']} — "
+                      f"no llega el {p['pct']}% de sus envíos ({p['no_llegaron']} de {p['enviados']}).")
+    partes.append(
+        f"*Clientes acumulando fallos (7 días):* {r['clientes_con_3_o_mas_sin_recibir']} llevan 3 o más "
+        f"mensajes sin recibir, {r['clientes_con_2_o_mas_sin_recibir']} llevan 2 o más, "
+        f"{r['clientes_con_algun_fallo_7d']} tuvieron al menos uno.")
+    return "\n\n".join(partes)
+
+
+_salud_armar_v141 = _salud_armar
+
+
+def _salud_armar():
+    """Lo de v1.4.1 más el estado real de la cola de reintento."""
+    r = _salud_armar_v141()
+    if not r:
+        return r
+    try:
+        d = _query_interna(f"""
+            SELECT count() pendientes FROM fact_deployment_status
+            WHERE company_id = {int(SALUD_COMPANY_ID)}
+              AND status = 'FAILURE_BY_HUMAN_HANDOVER'
+              AND timestamps_eta >= now() - INTERVAL 72 HOUR
+        """)
+        r["reintento_pendientes"] = int((d or [{}])[0].get("pendientes") or 0)
+        r["reintento_recuperables"] = None
+        r["reintento_automatico"] = False
+    except Exception as e:
+        log.error(f"[salud] no se pudo contar la cola de reintento: {e}")
+    return r
+
+
+# ══════════════════════════════════════════════════════════════════
+#  ARREGLO 3 · /salud/detalle deja de inventar clientes "sin ficha"
+# ══════════════════════════════════════════════════════════════════
+_salud_detalle_v141 = salud_detalle
+
+
+@app.get("/salud/detalle-v2")
+def salud_detalle_v2(x_api_key: str | None = Header(default=None),
+                     dias: int = 7, minimo: int = 2, tope: int = 500):
+    """
+    Lo mismo que /salud/detalle pero resolviendo la ficha por teléfono
+    cuando el cruce por conversaciones no la encuentra. En la revisión a
+    mano del 09/09, de 32 clientes marcados como "sin ficha" 29 sí la
+    tenían: el que fallaba era el cruce, no el dato.
+    """
+    _chequear_clave(x_api_key)
+    base = _salud_detalle_v141(x_api_key=x_api_key, dias=dias, minimo=minimo, tope=tope)
+    try:
+        mapa = _mapa_telefono_hubspot()
+    except Exception as e:
+        base["aviso"] = f"No se pudo construir el mapa de teléfonos: {e}"
+        return base
+
+    rescatados = 0
+    for c in base.get("clientes", []):
+        if c.get("hubspot_id"):
+            continue
+        hs, via = _resolver_hubspot(c.get("telefono"), None, mapa)
+        if hs:
+            c["hubspot_id"] = hs
+            c["ficha"] = f"https://app.hubspot.com/contacts/{HUBSPOT_PORTAL_ID}/record/0-1/{hs}"
+            c["cruce"] = "por teléfono"
+            rescatados += 1
+    total = len(base.get("clientes", []))
+    sin_ficha = sum(1 for c in base.get("clientes", []) if not c.get("hubspot_id"))
+    base["cruce"] = {
+        "rescatados_por_telefono": rescatados,
+        "siguen_sin_ficha": sin_ficha,
+        "total": total,
+        "nota": ("Un cliente que sigue sin ficha después de buscar por teléfono es un número que "
+                 "de verdad no está asociado a ningún contacto activo del CRM."),
+    }
+    return base
+
+
+# ══════════════════════════════════════════════════════════════════
+#  NUEVO · AUDITORÍA DE CONTACTOS ACTIVOS
+#  Lo que el 09/09 hubo que hacer a mano: una pasada completa sobre los
+#  clientes activos revisando formato de teléfono, campos faltantes y
+#  duplicados. La API de búsqueda de HubSpot no permite filtrar por
+#  formato, así que hay que traer el universo y revisarlo acá.
+# ══════════════════════════════════════════════════════════════════
+def _revisar_telefono(valor):
+    """
+    Devuelve (problema, sugerencia) o (None, None) si está bien.
+    E.164: un '+' seguido de 8 a 15 dígitos, sin espacios ni separadores.
+    """
+    t = str(valor or "").strip()
+    if not t:
+        return "vacío", None
+    d = _solo_digitos(t)
+    if not t.startswith("+"):
+        return "sin prefijo internacional", None
+    if t != "+" + d:
+        return "tiene espacios o separadores", "+" + d
+    if len(d) < 8:
+        return "demasiado corto", None
+    if len(d) > 15:
+        return "demasiado largo", None
+    if re.fullmatch(r"1\d{11}", d):
+        return "posible prefijo +1 duplicado", "+" + d[1:]
+    for cc in ("58", "57", "52", "51", "34", "56", "54"):
+        if d.startswith(cc + cc):
+            return f"posible prefijo +{cc} duplicado", "+" + d[len(cc):]
+    return None, None
+
+
+@app.get("/auditoria/contactos")
+def auditoria_contactos(x_api_key: str | None = Header(default=None), tope_detalle: int = 300):
+    """
+    Auditoría completa de los clientes activos. Solo lectura: no corrige
+    nada, devuelve lo que hay que corregir con el link a cada ficha.
+    """
+    _chequear_clave(x_api_key)
+    contactos = _contactos_activos_hubspot()
+    if not contactos:
+        raise HTTPException(503, "No se pudieron traer los contactos activos de HubSpot.")
+
+    def link(hs):
+        return f"https://app.hubspot.com/contacts/{HUBSPOT_PORTAL_ID}/record/0-1/{hs}"
+
+    hallazgos = {k: [] for k in (
+        "sin_whatsapp_pero_con_movil", "sin_ningun_telefono", "telefono_mal_formado",
+        "whatsapp_distinto_de_movil", "sin_email", "sin_etapa", "sin_fecha_compra",
+        "sin_sesiones_plan")}
+    por_telefono, por_email = {}, {}
+
+    for c in contactos:
+        hs = str(c.get("id") or "")
+        p = c.get("properties") or {}
+        nombre = (f"{p.get('firstname') or ''} {p.get('lastname') or ''}").strip() or p.get("email") or hs
+        wa, mov, tel = p.get("hs_whatsapp_phone_number"), p.get("mobilephone"), p.get("phone")
+        base = {"hubspot_id": hs, "cliente": nombre, "ficha": link(hs)}
+
+        if not str(wa or "").strip():
+            otro = next((x for x in (mov, tel) if str(x or "").strip()), None)
+            (hallazgos["sin_whatsapp_pero_con_movil"] if otro else hallazgos["sin_ningun_telefono"]).append(
+                dict(base, telefono_alternativo=otro))
+        else:
+            problema, sugerencia = _revisar_telefono(wa)
+            if problema:
+                hallazgos["telefono_mal_formado"].append(
+                    dict(base, campo="Número de WhatsApp", valor=wa,
+                         problema=problema, sugerencia=sugerencia))
+            dw, dm = _solo_digitos(wa), _solo_digitos(mov)
+            if dm and dw and dm != dw and not (dw.endswith(dm) or dm.endswith(dw)):
+                hallazgos["whatsapp_distinto_de_movil"].append(
+                    dict(base, whatsapp=wa, movil=mov))
+
+        for campo, clave in ((wa, "telefono"), (mov, "telefono")):
+            d = _solo_digitos(campo)
+            if len(d) >= 8:
+                por_telefono.setdefault(d, set()).add(hs)
+        em = str(p.get("email") or "").strip().lower()
+        if em:
+            por_email.setdefault(em, set()).add(hs)
+        else:
+            hallazgos["sin_email"].append(base)
+
+        if not str(p.get(PROP_SES_ETAPA) or "").strip():
+            hallazgos["sin_etapa"].append(base)
+        if not str(p.get("fecha_compra") or "").strip():
+            hallazgos["sin_fecha_compra"].append(base)
+        if not str(p.get("sesiones_plan") or "").strip():
+            hallazgos["sin_sesiones_plan"].append(base)
+
+    dup_tel = [{"telefono": _mask_phone(t), "fichas": sorted(ids), "enlaces": [link(i) for i in sorted(ids)]}
+               for t, ids in por_telefono.items() if len(ids) > 1]
+    dup_mail = [{"email": e, "fichas": sorted(ids), "enlaces": [link(i) for i in sorted(ids)]}
+                for e, ids in por_email.items() if len(ids) > 1]
+
+    SEV = {"sin_ningun_telefono": "critico", "sin_whatsapp_pero_con_movil": "critico",
+           "telefono_mal_formado": "alto", "whatsapp_distinto_de_movil": "alto",
+           "sin_etapa": "alto", "sin_sesiones_plan": "medio",
+           "sin_fecha_compra": "medio", "sin_email": "bajo"}
+    tope = max(1, min(int(tope_detalle), 2000))
+
+    return {
+        "generado": datetime.now(timezone.utc).isoformat(),
+        "universo": {
+            "clientes_activos": len(contactos),
+            "criterio": f"lifecyclestage=customer y pago en los últimos {AUDITORIA_DIAS_ACTIVO} días",
+        },
+        "resumen": [{"hallazgo": k, "contactos": len(v), "severidad": SEV.get(k, "medio"),
+                     "pct": round(100 * len(v) / len(contactos), 1)}
+                    for k, v in sorted(hallazgos.items(), key=lambda kv: -len(kv[1]))]
+                   + [{"hallazgo": "telefono_duplicado_entre_fichas", "contactos": len(dup_tel),
+                       "severidad": "critico", "pct": round(100 * len(dup_tel) / len(contactos), 1)},
+                      {"hallazgo": "email_duplicado_entre_fichas", "contactos": len(dup_mail),
+                       "severidad": "alto", "pct": round(100 * len(dup_mail) / len(contactos), 1)}],
+        "detalle": {k: v[:tope] for k, v in hallazgos.items()},
+        "duplicados": {"por_telefono": dup_tel[:tope], "por_email": dup_mail[:tope]},
+        "nota": ("Solo lectura: no se corrigió nada. 'sin_whatsapp_pero_con_movil' es el más rentable "
+                 "de arreglar — el dato ya está en la ficha, solo está en el campo equivocado, y hasta "
+                 "que se copie el cliente no recibe ningún push."),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════
+#  EL ARREGLO DE VERDAD · QUE EL REINTENTO CORRA SOLO
+#
+#  Hasta hoy el reintento existía como endpoint y nadie lo ejecutaba:
+#  ~50 mensajes por día quedaban bloqueados y ahí morían. Corregir el
+#  texto del parte habría sido describir mejor el problema; esto lo
+#  resuelve.
+#
+#  ── Salvaguardas, porque son mensajes a clientes reales ───────────
+#  · Solo reenvía lo que YA se puede: contactos cuya conversación en
+#    Treble está cerrada. Si sigue abierta, se espera a la vuelta
+#    siguiente en vez de forzar.
+#  · Nunca reenvía dos veces el mismo push: el candado va contra la
+#    tabla de eventos, no contra memoria, así que sobrevive a un
+#    reinicio de Render y a que haya más de una instancia.
+#  · Tope por corrida (REINTENTO_MAX_POR_CORRIDA).
+#  · Solo dentro de una franja horaria razonable: a nadie le sirve
+#    recibir un recordatorio a las 4 de la mañana.
+#  · Se apaga con REINTENTO_AUTOMATICO=false sin tocar código.
+#  · Cada corrida queda en el log con cuántos salieron.
+# ══════════════════════════════════════════════════════════════════
+REINTENTO_AUTOMATICO = os.environ.get("REINTENTO_AUTOMATICO", "true").strip().lower() not in ("false", "0", "no")
+REINTENTO_CADA_MINUTOS = int(os.environ.get("REINTENTO_CADA_MINUTOS", "60"))
+REINTENTO_HORA_DESDE = int(os.environ.get("REINTENTO_HORA_DESDE", "12"))  # UTC
+REINTENTO_HORA_HASTA = int(os.environ.get("REINTENTO_HORA_HASTA", "23"))  # UTC
+
+for _m in ("reintentos_automaticos", "corridas_reintento"):
+    METRICAS.setdefault(_m, 0)
+
+
+def _reintento_en_horario(ahora=None):
+    """
+    Los clientes están mayormente en América. La franja por defecto va de
+    las 12:00 a las 23:00 UTC, que son las 8 de la mañana a las 7 de la
+    tarde en Colombia y las 9 a 20 en Venezuela.
+    """
+    h = (ahora or datetime.now(timezone.utc)).hour
+    return REINTENTO_HORA_DESDE <= h <= REINTENTO_HORA_HASTA
+
+
+def _reintento_corrida():
+    """Una vuelta del reintento. Devuelve el resultado del endpoint."""
+    return pushes_reintentar(x_api_key=API_KEY, aplicar="true")
+
+
+def _reintento_monitor_loop():
+    while True:
+        try:
+            ahora = datetime.now(timezone.utc)
+            if _reintento_en_horario(ahora):
+                marca = ahora.strftime("%Y-%m-%dT%H")
+                # La deduplicación por hora evita que dos instancias de Render
+                # disparen la misma corrida en paralelo.
+                if not _evento_ya_notificado("corrida_reintento", marca):
+                    _evento_marcar("corrida_reintento", marca, "notified", notified=True)
+                    r = _reintento_corrida()
+                    n = int(r.get("reintentados") or 0)
+                    METRICAS["corridas_reintento"] += 1
+                    METRICAS["reintentos_automaticos"] += n
+                    om = r.get("omitidos") or {}
+                    log.warning(
+                        f"[reintento-auto] reenviados={n} pendientes={r.get('pendientes_totales')} "
+                        f"sin_workflow={om.get('sin_workflow')} ya_hechos={om.get('ya_reintentado')}")
+                    if om.get("sin_workflow"):
+                        log.warning(
+                            f"[reintento-auto] {om['sin_workflow']} quedaron fuera porque su campaña no "
+                            f"está dada de alta. Ver GET /pushes/bloqueados → sin_workflow_asociado.")
+        except Exception as e:
+            log.error(f"[reintento-auto] fallo la corrida: {e}")
+        time.sleep(max(60, REINTENTO_CADA_MINUTOS * 60))
+
+
+@app.get("/pushes/reintento-estado")
+def pushes_reintento_estado(x_api_key: str | None = Header(default=None)):
+    """Si el reintento automático está corriendo y cuánto lleva hecho."""
+    _chequear_clave(x_api_key)
+    ahora = datetime.now(timezone.utc)
+    return {
+        "automatico_activo": REINTENTO_AUTOMATICO,
+        "cada_minutos": REINTENTO_CADA_MINUTOS,
+        "franja_utc": f"{REINTENTO_HORA_DESDE}:00 a {REINTENTO_HORA_HASTA}:59",
+        "dentro_de_franja_ahora": _reintento_en_horario(ahora),
+        "corridas": METRICAS.get("corridas_reintento", 0),
+        "mensajes_reenviados": METRICAS.get("reintentos_automaticos", 0),
+        "tope_por_corrida": REINTENTO_MAX_POR_CORRIDA,
+        "nota": ("Los contadores se reinician cuando Render reinicia el proceso. "
+                 "Para apagarlo: REINTENTO_AUTOMATICO=false."),
+    }
+
+
+@app.on_event("startup")
+def arrancar_reintento_automatico():
+    """
+    Handler de arranque propio, como el del parte de salud: FastAPI corre
+    todos los registrados, así que este convive con los anteriores sin
+    tocarlos.
+    """
+    if not REINTENTO_AUTOMATICO:
+        log.warning("[startup] reintento automático APAGADO por configuración")
+        return
+    threading.Thread(target=_reintento_monitor_loop, daemon=True).start()
+    log.warning(f"[startup] reintento automático activo · cada {REINTENTO_CADA_MINUTOS} min · "
+                f"franja {REINTENTO_HORA_DESDE}-{REINTENTO_HORA_HASTA} UTC · "
+                f"tope {REINTENTO_MAX_POR_CORRIDA} por corrida")
+
+
+# ══════════════════════════════════════════════════════════════════
+#  COBERTURA · CLIENTES NUEVOS QUE TODAVÍA NO TIENEN SESIONES
+#
+#  ── El problema ───────────────────────────────────────────────────
+#  De 4.265 clientes activos, 2.703 no tienen `sesiones_etapa` y por eso
+#  caen en la rama por defecto (ATC). Angela lo notó por el lado de la
+#  consecuencia: las gestoras casi no reciben nada. De 35 envíos del push
+#  de 72 h, solo 11 fueron por consultoría.
+#
+#  ── Qué se puede afirmar con certeza y qué no ─────────────────────
+#  Un cliente que compró hace menos de 35 días y no tiene NINGÚN cierre
+#  de sesión registrado está, necesariamente, en sus primeras 4 sesiones:
+#  o todavía no tuvo la primera, o la tuvo y el push de cierre falló. En
+#  los dos casos su etapa correcta es `acompanamiento`. Son 288 clientes.
+#
+#  De los otros ~2.400 NO se puede afirmar lo mismo: compraron hace meses
+#  y no registran sesiones, así que o están inactivos o su historial es
+#  anterior al 16/06. Esos se quedan en ATC, que es el destino
+#  conservador. Inventarles una etapa sería peor que no tenerla.
+#
+#  ── Por qué esto no pisa al contador ──────────────────────────────
+#  `sesiones_sincronizar` solo escribe sobre clientes que aparecen en el
+#  DWH. Estos no aparecen — justamente por eso no tienen etapa. En cuanto
+#  tengan su primera sesión real, el contador toma el mando y este
+#  respaldo deja de aplicarse solo.
+# ══════════════════════════════════════════════════════════════════
+COBERTURA_DIAS_NUEVO = int(os.environ.get("COBERTURA_DIAS_NUEVO", "35"))
+
+
+def _clientes_nuevos_sin_etapa():
+    """Activos, sin etapa, que compraron hace menos de COBERTURA_DIAS_NUEVO días."""
+    corte = _dia_ms(datetime.now(timezone.utc).date() - timedelta(days=COBERTURA_DIAS_NUEVO))
+    return _hs_buscar_todo("contacts", {
+        "filterGroups": [{"filters": [
+            {"propertyName": "lifecyclestage", "operator": "EQ", "value": "customer"},
+            {"propertyName": "fecha_ultimo_pago", "operator": "GTE", "value": str(corte)},
+            {"propertyName": PROP_SES_ETAPA, "operator": "NOT_HAS_PROPERTY"},
+            {"propertyName": "fecha_compra", "operator": "GTE", "value": str(corte)},
+        ]}],
+        "properties": ["hs_object_id", "hs_full_name_or_email", "fecha_compra", "sesiones_plan"],
+    }, tope=AUDITORIA_MAX_CONTACTOS)
+
+
+@app.post("/sesiones/completar-nuevos")
+def sesiones_completar_nuevos(x_api_key: str | None = Header(default=None), aplicar: str | None = None):
+    """
+    Marca como `acompanamiento` a los clientes recién comprados que aún no
+    tienen ninguna sesión registrada. DRY-RUN por defecto.
+
+    Es idempotente y seguro de repetir: solo toca fichas sin etapa, así que
+    nunca sobreescribe un valor que haya calculado el contador.
+    """
+    _chequear_clave(x_api_key)
+    escribir = _a_bool(aplicar, por_defecto=False)
+    nuevos = _clientes_nuevos_sin_etapa()
+
+    entradas = [{"id": c["id"], "properties": {
+        PROP_SES_ETAPA: "acompanamiento",
+        PROP_SES_ORIGEN: (f"Compró hace menos de {COBERTURA_DIAS_NUEVO} días y todavía no tiene "
+                          "ninguna sesión registrada, así que está en sus primeras 4. Se recalcula "
+                          "solo en cuanto tenga su primera sesión."),
+    }} for c in nuevos]
+
+    resultado = {
+        "modo": "aplicado" if escribir else "simulacion",
+        "ventana_dias": COBERTURA_DIAS_NUEVO,
+        "a_marcar_acompanamiento": len(entradas),
+        "muestra": [{"cliente": (c.get("properties") or {}).get("hs_full_name_or_email"),
+                     "compro": (c.get("properties") or {}).get("fecha_compra"),
+                     "plan": (c.get("properties") or {}).get("sesiones_plan")}
+                    for c in nuevos[:8]],
+        "razon": ("Sin cierre de sesión registrado y compra reciente: o no tuvo la primera sesión "
+                  "todavía, o la tuvo y el push falló. En los dos casos está en sus primeras 4."),
+    }
+    if not escribir:
+        resultado["aviso"] = "Simulación. Para aplicarlo: POST /sesiones/completar-nuevos?aplicar=true"
+        return resultado
+
+    escritos, errores = _hs_batch_update("contacts", entradas) if entradas else (0, [])
+    resultado.update({"marcados": escritos, "errores": errores})
+    log.warning(f"[cobertura] nuevos marcados como acompanamiento={escritos} errores={len(errores)}")
+    return resultado
+
+
+@app.get("/sesiones/cobertura")
+def sesiones_cobertura(x_api_key: str | None = Header(default=None)):
+    """
+    Cuánto del padrón activo puede enrutar la bifurcación y cuánto cae en
+    ATC solo por falta de dato. Es el número que hay que mirar cuando
+    alguien pregunta por qué las gestoras reciben poco.
+    """
+    _chequear_clave(x_api_key)
+
+    def _contar(filtros):
+        try:
+            return _hubspot_api("POST", "/crm/v3/objects/contacts/search",
+                                {"filterGroups": [{"filters": filtros}],
+                                 "properties": ["hs_object_id"], "limit": 1}).get("total", 0)
+        except Exception:
+            return None
+
+    corte_pago = str(_dia_ms(datetime.now(timezone.utc).date() - timedelta(days=AUDITORIA_DIAS_ACTIVO)))
+    base = [{"propertyName": "lifecyclestage", "operator": "EQ", "value": "customer"},
+            {"propertyName": "fecha_ultimo_pago", "operator": "GTE", "value": corte_pago}]
+    activos = _contar(base)
+    acomp = _contar(base + [{"propertyName": PROP_SES_ETAPA, "operator": "EQ", "value": "acompanamiento"}])
+    sop = _contar(base + [{"propertyName": PROP_SES_ETAPA, "operator": "EQ", "value": "soporte"}])
+    sin = _contar(base + [{"propertyName": PROP_SES_ETAPA, "operator": "NOT_HAS_PROPERTY"}])
+
+    def _pct(n):
+        return round(100 * n / activos, 1) if activos and n is not None else None
+
+    return {
+        "clientes_activos": activos,
+        "a_consultoria": {"clientes": acomp, "pct": _pct(acomp)},
+        "a_atc_por_dato": {"clientes": sop, "pct": _pct(sop)},
+        "a_atc_por_falta_de_dato": {"clientes": sin, "pct": _pct(sin)},
+        "cobertura_del_dato": _pct((acomp or 0) + (sop or 0)),
+        "nota": ("'a_atc_por_falta_de_dato' son clientes que van a ATC porque no sabemos en qué "
+                 "sesión están, no porque les corresponda. Es el número a bajar. "
+                 "POST /sesiones/completar-nuevos recupera la parte que se puede afirmar con certeza."),
+    }
+
+
+
+# ══════════════════════════════════════════════════════════════════
+#  v1.4.3 · EL CONTADOR PASA A MEDIR SESIONES AGENDADAS
+#  Agregado 10/09/2026. BLOQUE PURAMENTE ADITIVO.
+#
+#  ── Por qué ───────────────────────────────────────────────────────
+#  Angela lo detectó sin ver una sola línea de código: "me parece muy
+#  raro que desde el jueves solo haya 11 personas que estén por tener su
+#  primera, segunda, tercera o cuarta sesión". Tenía razón. El sistema
+#  veía 669 clientes en sus primeras 4 sesiones; el número real es 2.586.
+#
+#  ── Qué estaba mal ────────────────────────────────────────────────
+#  El contador contaba los pushes de "sí asistió", que tienen tres
+#  defectos que se suman:
+#    1. Solo existen para las sesiones 1 a 4. De la quinta en adelante
+#       no hay señal, así que un cliente con 20 sesiones se ve igual
+#       que uno con 5.
+#    2. Meta rechaza el de 4ta sesión el 53% de las veces: sesiones
+#       reales que nunca quedan registradas.
+#    3. Cubren 2.758 clientes de un padrón activo de 4.265.
+#
+#  ── La señal nueva ────────────────────────────────────────────────
+#  El recordatorio que sale antes de CADA sesión agendada. Cubre 6.212
+#  clientes y no tiene ninguno de los tres problemas.
+#  Son dos pushes que se relevan sin solaparse (verificado: cero
+#  coincidencias el mismo día para el mismo cliente):
+#    · "Recordatorio Sesión en 28hs"          10/06/2026 → 03/09/2026
+#    · "Especialista confirmación 6 horas antes"  03/09/2026 → hoy
+#  Se usa el de 6 horas y no el de 3 días porque sale el MISMO día de la
+#  sesión: así una fecha distinta es una sesión distinta.
+#
+#  ── El límite honesto ─────────────────────────────────────────────
+#  Un recordatorio significa sesión AGENDADA, no necesariamente asistida.
+#  Para decidir a qué equipo va la respuesta alcanza — mide dónde está el
+#  cliente en su plan — pero no es lo mismo que "asistió". Las
+#  inasistencias registradas se descuentan; las que no dejaron rastro, no.
+#
+#  ── Sesgo de veteranos, otra vez ──────────────────────────────────
+#  El registro empieza el 10/06. Un cliente que compró antes tiene el
+#  conteo truncado igual que con la señal vieja, así que se lo deja en
+#  ATC. Es el mismo criterio conservador de v1.4.0.
+# ══════════════════════════════════════════════════════════════════
+
+PUSHES_AGENDADA_NOMBRE = (
+    "Recordatorio Sesión en 28hs",
+    "Especialista confirmación 6 horas antes",
+)
+_CACHE_POLLS_AGENDADA = {"datos": None, "ts": 0.0}
+
+
+def _polls_de_sesion_agendada():
+    """poll_id vigentes de los recordatorios, resueltos por nombre."""
+    ahora = time.time()
+    if _CACHE_POLLS_AGENDADA["datos"] is not None and (ahora - _CACHE_POLLS_AGENDADA["ts"]) < 1800:
+        return _CACHE_POLLS_AGENDADA["datos"]
+    buscados = {_norm_push(n) for n in PUSHES_AGENDADA_NOMBRE}
+    ids = set()
+    try:
+        for f in _query_interna("""
+            SELECT toString(poll_id) pid, argMax(poll_name, timestamps_eta) nombre
+            FROM fact_deployment_status
+            WHERE poll_name != '' AND timestamps_eta >= now() - INTERVAL 365 DAY
+            GROUP BY pid
+        """) or []:
+            if _norm_push(f.get("nombre")) in buscados:
+                ids.add(str(f["pid"]))
+    except Exception as e:
+        log.error(f"[agendadas] no se pudieron resolver los polls: {e}")
+    _CACHE_POLLS_AGENDADA.update({"datos": ids, "ts": ahora})
+    log.warning(f"[agendadas] polls de recordatorio resueltos: {sorted(ids)}")
+    return ids
+
+
+def _sesiones_agendadas_dwh():
+    """
+    Sesiones por cliente contadas desde los recordatorios, ya cruzado con
+    HubSpot (por conversación y, si falta, por teléfono).
+    Una fecha distinta es una sesión distinta.
+    """
+    ids = _polls_de_sesion_agendada()
+    if not ids:
+        raise HTTPException(503, "No se encontraron los pushes de recordatorio en el DWH. "
+                                 "Revisá GET /sesiones/senal para ver qué está viendo el bridge.")
+    agend = ",".join(f"'{p}'" for p in sorted(ids))
+    inasis = ",".join(f"'{p}'" for p in sorted(_polls_de_sesion()[1]))
+    sql = f"""
+    WITH d AS (
+      SELECT treble_id tid, toString(poll_id) pid, toDate(timestamps_eta) dia
+      FROM fact_deployment_status
+      WHERE toString(poll_id) IN ({agend},{inasis})
+    ),
+    c AS (
+      SELECT contact_wa_id wa, any(helpdesk_contact_id) hs
+      FROM fact_conversations WHERE helpdesk_contact_id != '' GROUP BY wa
+    )
+    SELECT d.tid tid, any(c.hs) hubspot_id,
+           uniqExactIf(d.dia, d.pid IN ({agend})) agendadas,
+           uniqExactIf(d.dia, d.pid IN ({inasis})) inasistencias,
+           max(d.dia) ultima
+    FROM d LEFT JOIN c ON d.tid = c.wa
+    GROUP BY tid
+    ORDER BY ultima DESC
+    LIMIT {SESIONES_MAX_CONTACTOS}
+    """
+    filas = _query_interna(sql) or []
+    try:
+        mapa = _mapa_telefono_hubspot()
+    except Exception as e:
+        log.error(f"[agendadas] sin mapa de teléfonos: {e}")
+        mapa = {}
+    salida = []
+    for f in filas:
+        hs, _ = _resolver_hubspot(f.get("tid"), f.get("hubspot_id"), mapa)
+        if hs:
+            f["hubspot_id"] = hs
+            salida.append(f)
+    return salida
+
+
+@app.get("/sesiones/senal")
+def sesiones_senal(x_api_key: str | None = Header(default=None)):
+    """
+    Compara las dos señales para poder decidir con el dato a la vista, sin
+    tocar nada. Es lo que hay que mirar antes de cambiar el contador.
+    """
+    _chequear_clave(x_api_key)
+    nombres = _salud_nombres_push()
+    ids_ag = _polls_de_sesion_agendada()
+    a_set, _ = _polls_de_sesion()
+
+    def _cobertura(ids):
+        if not ids:
+            return 0
+        lst = ",".join(f"'{p}'" for p in sorted(ids))
+        d = _query_interna(f"""SELECT uniqExact(treble_id) n FROM fact_deployment_status
+                               WHERE toString(poll_id) IN ({lst})""")
+        return int((d or [{}])[0].get("n") or 0)
+
+    filas = _sesiones_agendadas_dwh()
+    tramos = {"1_a_4": 0, "5_a_8": 0, "9_o_mas": 0}
+    for f in filas:
+        n = max(0, int(f.get("agendadas") or 0) - int(f.get("inasistencias") or 0))
+        if n <= 0:
+            continue
+        tramos["1_a_4" if n <= 4 else ("5_a_8" if n <= 8 else "9_o_mas")] += 1
+
+    return {
+        "senal_actual": {
+            "pushes": sorted(nombres.get(p, f"conversación {p}") for p in a_set),
+            "clientes_cubiertos": _cobertura(a_set),
+        },
+        "senal_nueva": {
+            "pushes": sorted(nombres.get(p, f"conversación {p}") for p in ids_ag),
+            "clientes_cubiertos": _cobertura(ids_ag),
+        },
+        "reparto_con_la_senal_nueva": tramos,
+        "a_consultoria": tramos["1_a_4"],
+        "nota": ("Un recordatorio significa sesión AGENDADA. Se descuentan las inasistencias "
+                 "registradas. Para decidir el enrutamiento alcanza; no es lo mismo que asistencia "
+                 "verificada en plataforma."),
+    }
+
+
+@app.post("/sesiones/recalcular-agendadas")
+def sesiones_recalcular_agendadas(
+    x_api_key: str | None = Header(default=None),
+    aplicar: str | None = None,
+    hasta_sesiones: int | None = None,
+):
+    """
+    Recalcula la etapa usando los recordatorios. DRY-RUN por defecto.
+
+    `hasta_sesiones` permite activarlo por tramos: con ?hasta_sesiones=2
+    solo se marcan como acompañamiento los clientes con 1 o 2 sesiones, y
+    el resto queda como está. Sirve para que las gestoras absorban el
+    volumen de a poco en vez de recibirlo todo de golpe.
+    """
+    _chequear_clave(x_api_key)
+    _, faltan = _sesiones_props_existentes()
+    if faltan:
+        raise HTTPException(409, f"Faltan propiedades: {faltan}. Corré antes POST /sesiones/setup.")
+
+    escribir = _a_bool(aplicar, por_defecto=False)
+    # `corte` es el MÁXIMO de sesiones que todavía se considera "primeras 4".
+    # Con SESIONES_CORTE_ETAPA=4 el default es 3: de la cuarta en adelante ya es ATC.
+    tope = SESIONES_CORTE_ETAPA - 1
+    corte = int(hasta_sesiones) if hasta_sesiones else tope
+    corte = max(1, min(corte, tope))
+    inicio = _sesiones_inicio_registro()
+
+    filas = _sesiones_agendadas_dwh()
+    entradas, etapas, omitidos = [], {"acompanamiento": 0, "soporte": 0}, 0
+    for f in filas:
+        hs = str(f.get("hubspot_id") or "")
+        if not hs.isdigit():
+            continue
+        n = max(0, int(f.get("agendadas") or 0) - int(f.get("inasistencias") or 0))
+        if n <= 0:
+            continue
+        if n <= corte:
+            etapa = "acompanamiento"
+        elif n >= SESIONES_CORTE_ETAPA:
+            etapa = "soporte"
+        else:
+            # Está entre el corte gradual y el corte real: se deja como está
+            # para no adelantarle volumen a las gestoras antes de tiempo.
+            omitidos += 1
+            continue
+        etapas[etapa] += 1
+        entradas.append({"id": hs, "properties": {
+            PROP_SES_ASISTIDAS: n,
+            PROP_SES_ETAPA: etapa,
+            PROP_SES_ORIGEN: (f"Derivado de los recordatorios de sesión agendada "
+                              f"({n} sesiones, menos las inasistencias registradas)."),
+        }})
+
+    resultado = {
+        "modo": "aplicado" if escribir else "simulacion",
+        "corte_aplicado": corte,
+        "corte_real": SESIONES_CORTE_ETAPA - 1,
+        "activacion_gradual": corte < SESIONES_CORTE_ETAPA - 1,
+        "clientes_evaluados": len(filas),
+        "a_escribir": len(entradas),
+        "por_etapa": etapas,
+        "omitidos_por_activacion_gradual": omitidos,
+        "inicio_del_registro": inicio.isoformat() if inicio else None,
+        "muestra": [{"hubspot_id": e["id"], "sesiones": e["properties"][PROP_SES_ASISTIDAS],
+                     "etapa": e["properties"][PROP_SES_ETAPA]} for e in entradas[:10]],
+    }
+    if not escribir:
+        resultado["aviso"] = ("Simulación. Para aplicarlo: POST /sesiones/recalcular-agendadas?aplicar=true "
+                              "(agregá &hasta_sesiones=2 para arrancar solo con los de 1 y 2 sesiones).")
+        return resultado
+
+    escritos, errores = _hs_batch_update("contacts", entradas) if entradas else (0, [])
+    resultado.update({"escritos": escritos, "errores": errores})
+    log.warning(f"[agendadas] recalculadas={escritos} corte={corte} "
+                f"acomp={etapas['acompanamiento']} sop={etapas['soporte']} errores={len(errores)}")
+    return resultado
