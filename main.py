@@ -2022,7 +2022,7 @@ def version_bloques(x_api_key: str | None = Header(default=None)):
     _chequear_clave(x_api_key)
     return {
         "base": "1.3.3",
-        "bloques": ["workflows_push (1.3.4)", "cohorte_renovaciones (1.3.5)", "reintento_pushes (1.3.5)", "contador_sesiones (1.3.6)", "workflows_crudo (1.3.7)", "riesgo_cancelacion (1.3.8)", "salud_mensajeria (1.3.9)", "correccion_veteranos (1.4.0)", "salud_detalle (1.4.1)", "arreglos_cruce_y_auditoria (1.4.2)", "reintento_automatico (1.4.2)", "cobertura_bifurcacion (1.4.2)", "sesiones_agendadas (1.4.3)"],
+        "bloques": ["workflows_push (1.3.4)", "cohorte_renovaciones (1.3.5)", "reintento_pushes (1.3.5)", "contador_sesiones (1.3.6)", "workflows_crudo (1.3.7)", "riesgo_cancelacion (1.3.8)", "salud_mensajeria (1.3.9)", "correccion_veteranos (1.4.0)", "salud_detalle (1.4.1)", "arreglos_cruce_y_auditoria (1.4.2)", "reintento_automatico (1.4.2)", "cobertura_bifurcacion (1.4.2)", "sesiones_agendadas (1.4.3)", "monitor_riesgo (1.4.4)", "riesgo_lista_v2 (1.4.4)", "segmento_dormant (1.4.5)"],
         "endpoints_nuevos": [
             "POST /cohorte/setup", "POST /cohorte/procesar",
             "GET /cohorte/renovaciones", "GET /cohorte/kpis",
@@ -2036,7 +2036,7 @@ def version_bloques(x_api_key: str | None = Header(default=None)):
             "GET /sesiones/polls", "GET /auditoria/contactos",
             "GET /pushes/reintento-estado",
             "POST /sesiones/completar-nuevos", "GET /sesiones/cobertura",
-            "GET /sesiones/senal", "POST /sesiones/recalcular-agendadas",
+            "GET /sesiones/senal", "POST /sesiones/recalcular-agendadas", "GET /riesgo/lista-v2", "GET /riesgo/monitor-estado", "GET /riesgo/dormant", "GET /riesgo/embudo-retencion",
         ],
     }
 
@@ -4129,8 +4129,16 @@ def sesiones_cobertura(x_api_key: str | None = Header(default=None)):
 # ══════════════════════════════════════════════════════════════════
 
 PUSHES_AGENDADA_NOMBRE = (
+    # "Recordatorio Sesión en 28hs" murió el 03/09/2026: Yopsi-Admin dejó de
+    # inscribir en él y lo reemplazó por los dos de abajo. Se deja en la lista
+    # porque el histórico del contador todavía se apoya en sus envíos.
     "Recordatorio Sesión en 28hs",
     "Especialista confirmación 6 horas antes",
+    # Agregado 10/09/2026 (v1.4.4). Es el de MAYOR volumen desde la migración
+    # — 2.926 envíos en 7 días — y faltaba. Sin él, la cobertura del dato que
+    # subimos de 37% a 91,7% se degradaba en silencio a medida que envejecía
+    # el histórico del push de 28hs.
+    "Especialista confirmación 3 dias antes",
 )
 _CACHE_POLLS_AGENDADA = {"datos": None, "ts": 0.0}
 
@@ -4324,3 +4332,509 @@ def sesiones_recalcular_agendadas(
     log.warning(f"[agendadas] recalculadas={escritos} corte={corte} "
                 f"acomp={etapas['acompanamiento']} sop={etapas['soporte']} errores={len(errores)}")
     return resultado
+
+
+# ══════════════════════════════════════════════════════════════════
+#  MONITOR DE RIESGO DE CANCELACIÓN + LISTA CORREGIDA
+#  Agregado 10/09/2026 (v1.4.4). BLOQUE PURAMENTE ADITIVO.
+#
+#  ── Por qué existe ────────────────────────────────────────────────
+#  El análisis de cancelaciones del 10/09 encontró que el 94,7% de los
+#  clientes que piden la baja nunca recibieron un intento de retención,
+#  y que la causa raíz es de infraestructura, no de criterio:
+#
+#  1. El riesgo NO se recalculaba solo. De los 6 monitores del bridge
+#     (SLA, pedidos, escalamiento, onboarding, salud, reintento),
+#     ninguno era de riesgo. `/riesgo/calcular` solo corría si alguien
+#     lo llamaba a mano, así que la lista quedaba congelada días.
+#
+#  2. BUG ENCONTRADO LEYENDO EL CÓDIGO: `_riesgo_desde_dwh()` excluye
+#     a quien "ya pidió cancelar" mirando SOLO `tag_name='Cancelaciones'`.
+#     Pero al medirlo: en 30 días hubo 2.584 conversaciones que mencionan
+#     cancelar y solo 518 llevan ese tag. **El 66% no se etiqueta.**
+#
+#     Consecuencia: la lista de riesgo alto contiene clientes que YA
+#     pidieron la baja, porque su conversación quedó en DEFAULT. Mandarles
+#     un push de retención es el peor error posible — le estamos pidiendo
+#     que se quede a alguien que ya se fue.
+#
+#     Acá se corrige detectando por CONTENIDO del mensaje además del tag.
+#
+#  Este bloque NO modifica ninguna línea existente. `/riesgo/calcular` y
+#  `/riesgo/lista` siguen intactos y funcionando igual. Lo nuevo vive en
+#  `/riesgo/lista-v2` y en el monitor.
+# ══════════════════════════════════════════════════════════════════
+
+RIESGO_MONITOR_ACTIVO = os.environ.get("RIESGO_MONITOR_ACTIVO", "true")
+RIESGO_MONITOR_HORA_UTC = int(os.environ.get("RIESGO_MONITOR_HORA_UTC", "9"))
+RIESGO_SLACK_WEBHOOK_URL = (
+    os.environ.get("RIESGO_SLACK_WEBHOOK_URL")
+    or os.environ.get("SALUD_SLACK_WEBHOOK_URL")
+    or os.environ.get("SLACK_WEBHOOK_URL")
+    or ""
+)
+
+# Palabras que aparecen cuando alguien pide la baja. Validadas contra el
+# DWH: encuentran 2.584 conversaciones en 30 días, contra 518 del tag.
+# Se comparan en minúsculas y sin exigir palabra completa, porque el
+# cliente escribe "cancelacion", "cancelarla", "cancelar mi plan".
+RIESGO_PALABRAS_BAJA = [
+    "cancelar", "cancelacion", "cancelación", "cancelo", "cancele",
+    "dar de baja", "darme de baja", "de baja",
+    "no quiero renovar", "no deseo renovar", "no renovar",
+    "suspender", "suspension", "suspensión",
+    "reembolso", "devolucion del dinero", "devolución del dinero",
+]
+
+for _m in ("riesgo_recalculos_automaticos",):
+    METRICAS.setdefault(_m, 0)
+
+
+def _evento_leer_status(event_type, external_id):
+    """
+    Igual que `_evento_ya_notificado` pero devuelve el status crudo en vez
+    de compararlo con "notified". Hace falta para guardar el conteo del
+    día anterior y poder informar el delta.
+    """
+    with _db_lock, sqlite3.connect(DB_PATH) as con:
+        row = con.execute(
+            "SELECT status FROM eventos WHERE event_type=? AND external_id=?",
+            (event_type, external_id),
+        ).fetchone()
+        return row[0] if row else None
+
+
+def _riesgo_en_gestion_por_texto(dias_atras=120):
+    """
+    Teléfonos que pidieron la baja, detectados por el CONTENIDO del
+    mensaje y no por el tag.
+
+    El tag `Cancelaciones` se pone a mano y se pone mal dos de cada tres
+    veces. Buscar en el texto recupera el 66% invisible. Se mira solo lo
+    que escribió el cliente (`sender='USER'`): si filtráramos también los
+    mensajes del agente, una respuesta del tipo "te ayudo a cancelar"
+    marcaría al cliente aunque él nunca lo haya pedido.
+    """
+    like = " OR ".join(
+        "lower(content) LIKE '%" + p.replace("'", "") + "%'"
+        for p in RIESGO_PALABRAS_BAJA
+    )
+    sql = f"""
+    SELECT DISTINCT c.contact_wa_id AS wa
+    FROM fact_agent_messages m
+    INNER JOIN fact_conversations c ON m.conversation_id = c.conversation_id
+    WHERE m.company_id = {int(SALUD_COMPANY_ID)}
+      AND c.company_id = {int(SALUD_COMPANY_ID)}
+      AND m.sender = 'USER'
+      AND m.created_at >= now() - INTERVAL {int(dias_atras)} DAY
+      AND ({like})
+      AND c.contact_wa_id != ''
+    """
+    try:
+        return {str(f.get("wa") or "") for f in _query_interna(sql) if f.get("wa")}
+    except Exception as e:
+        # Si esta consulta falla, NO se sigue de largo: sin ella la lista
+        # incluiría a gente que ya canceló. Se devuelve None para que el
+        # llamador sepa que el filtro no se pudo aplicar y avise.
+        log.error(f"[riesgo] no se pudo detectar cancelaciones por texto: {e}")
+        return None
+
+
+def _riesgo_recalcular_interno(escribir=True):
+    """
+    El cálculo del riesgo sin la capa HTTP, para que el monitor pueda
+    usarlo. Réplica deliberada de la lógica de `/riesgo/calcular`: se
+    duplica en vez de refactorizar el endpoint porque la regla del
+    bridge es que los bloques nuevos no tocan código que ya funciona.
+    """
+    _, faltan = _riesgo_props_existentes()
+    if faltan:
+        raise RuntimeError(f"Faltan propiedades en HubSpot: {faltan}")
+
+    hoy = datetime.now(timezone.utc).date()
+    filas = _riesgo_desde_dwh()
+
+    entradas, conteo = [], {"alto": 0, "medio": 0, "bajo": 0}
+    for f in filas:
+        hs = str(f.get("hubspot_id") or "").strip()
+        if not hs.isdigit():
+            continue
+        dias = int(f.get("dias") or 0)
+        nivel = _riesgo_nivel(dias)
+        if not nivel:
+            continue
+        conteo[nivel] += 1
+        entradas.append({"id": hs, "properties": {
+            PROP_RIESGO: nivel,
+            PROP_DIAS_SIN_SESION: dias,
+            PROP_RIESGO_FECHA: _dia_ms(hoy),
+        }})
+
+    res = {"evaluados": len(entradas), "por_nivel": conteo, "escritos": 0, "errores": []}
+    if escribir and entradas:
+        escritos, errores = _hs_batch_update("contacts", entradas)
+        METRICAS["riesgo_calculado"] += escritos
+        res["escritos"], res["errores"] = escritos, errores
+    return res
+
+
+def _riesgo_lista_pendientes(nivel="alto", excluir_por_texto=True):
+    """
+    La lista de trabajo real: riesgo `nivel` y que NO haya pedido la baja,
+    mirando tag Y contenido.
+
+    Devuelve `(clientes, filtro_texto_aplicado)`. El segundo valor importa:
+    si la detección por texto falló, quien consuma esto tiene que saber que
+    la lista puede contener gente que ya canceló.
+    """
+    filas = _riesgo_desde_dwh()
+    en_gestion = _riesgo_en_gestion_por_texto() if excluir_por_texto else set()
+    filtro_ok = en_gestion is not None
+    if not filtro_ok:
+        en_gestion = set()
+
+    pendientes = []
+    for f in filas:
+        if _riesgo_nivel(int(f.get("dias") or 0)) != nivel:
+            continue
+        if int(f.get("ya_pidio_cancelar") or 0):
+            continue                                    # excluido por tag
+        tid = str(f.get("tid") or "")
+        if tid and tid in en_gestion:
+            continue                                    # excluido por texto
+        if not str(f.get("hubspot_id") or "").isdigit():
+            continue
+        pendientes.append(f)
+
+    pendientes.sort(key=lambda f: int(f.get("dias") or 0), reverse=True)
+    return pendientes, filtro_ok
+
+
+@app.get("/riesgo/lista-v2")
+def riesgo_lista_v2(
+    x_api_key: str | None = Header(default=None),
+    nivel: str = "alto",
+    tope: int = 400,
+    solo_customer: str | None = None,
+):
+    """
+    Igual que `/riesgo/lista` pero excluyendo también a quien pidió la baja
+    por texto (el 66% que no lleva tag), y opcionalmente filtrando a
+    `lifecyclestage = customer` — la mejora pendiente #1 del doc de riesgo.
+    """
+    _chequear_clave(x_api_key)
+    if nivel not in [v for v, _ in RIESGO_NIVELES]:
+        raise HTTPException(400, f"nivel debe ser uno de {[v for v, _ in RIESGO_NIVELES]}")
+
+    pendientes, filtro_ok = _riesgo_lista_pendientes(nivel)
+
+    # Comparación honesta contra la lista vieja, para ver cuánta gente
+    # estaba entrando de más.
+    sin_filtro_texto, _ = _riesgo_lista_pendientes(nivel, excluir_por_texto=False)
+    rescatados = len(sin_filtro_texto) - len(pendientes)
+
+    filtrado_customer = None
+    if _a_bool(solo_customer, por_defecto=False):
+        ids = [str(f["hubspot_id"]) for f in pendientes[:min(int(tope), 1000)]]
+        vivos = _riesgo_solo_customers(ids)
+        if vivos is not None:
+            antes = len(pendientes)
+            pendientes = [f for f in pendientes if str(f["hubspot_id"]) in vivos]
+            filtrado_customer = {"descartados": antes - len(pendientes)}
+
+    salida = {
+        "generado": datetime.now(timezone.utc).isoformat(),
+        "nivel": nivel,
+        "total": len(pendientes),
+        "excluidos_por_pedir_la_baja_en_el_texto": rescatados,
+        "filtro_texto_aplicado": filtro_ok,
+        "clientes": [{
+            "hubspot_id": f["hubspot_id"],
+            "dias_sin_sesion": int(f["dias"]),
+            "ultima_sesion": str(f.get("ultima_sesion") or ""),
+            "telefono": _mask_phone(str(f.get("tid") or "")),
+        } for f in pendientes[:min(int(tope), 1000)]],
+    }
+    if filtrado_customer:
+        salida["filtro_customer"] = filtrado_customer
+    if not filtro_ok:
+        salida["aviso"] = ("No se pudo consultar el DWH para detectar cancelaciones por texto. "
+                           "La lista puede incluir clientes que ya pidieron la baja — no la uses "
+                           "para disparar retención hasta que esto se resuelva.")
+    return salida
+
+
+def _riesgo_solo_customers(ids):
+    """
+    De una lista de contact ids, cuáles siguen siendo `customer`.
+    Devuelve None si HubSpot falla, para no confundir "no pude verificar"
+    con "ninguno es cliente".
+    """
+    vivos = set()
+    try:
+        for i in range(0, len(ids), 100):
+            lote = ids[i:i + 100]
+            r = _hubspot_api("POST", "/crm/v3/objects/contacts/batch/read", {
+                "properties": ["lifecyclestage"],
+                "inputs": [{"id": x} for x in lote],
+            })
+            for res in (r.get("results") or []):
+                if (res.get("properties") or {}).get("lifecyclestage") == "customer":
+                    vivos.add(str(res.get("id")))
+        return vivos
+    except Exception as e:
+        log.error(f"[riesgo] no se pudo filtrar por lifecyclestage: {e}")
+        return None
+
+
+def _riesgo_texto_slack(res, pendientes, rescatados, filtro_ok, previo):
+    c = res["por_nivel"]
+    hoy_alto = c["alto"]
+    lineas = [
+        "*Riesgo de cancelación · recálculo diario*",
+        f"Clientes evaluados: *{res['evaluados']}*",
+        f"Riesgo alto: *{hoy_alto}*  ·  medio: {c['medio']}  ·  bajo: {c['bajo']}",
+    ]
+    if previo is not None:
+        d = hoy_alto - previo
+        signo = f"+{d}" if d > 0 else str(d)
+        lineas.append(f"Cambio contra ayer en riesgo alto: *{signo}*")
+    lineas.append(f"Lista de trabajo (alto, sin pedido de baja): *{pendientes}*")
+    if rescatados:
+        lineas.append(f"Excluidos por haber pedido la baja en el texto del chat: {rescatados}")
+    if not filtro_ok:
+        lineas.append(":warning: No se pudo aplicar el filtro por texto — la lista puede "
+                      "incluir a quien ya canceló. No dispares retención con esta corrida.")
+    if res.get("errores"):
+        lineas.append(f":warning: Errores al escribir en HubSpot: {len(res['errores'])}")
+    return "\n".join(lineas)
+
+
+def _riesgo_monitor_loop():
+    """
+    Una vez al día. Recalcula el riesgo, lo escribe en HubSpot y publica el
+    resultado con el delta contra el día anterior.
+
+    La deduplicación va contra la tabla de eventos, no contra memoria: si
+    Render levanta más de una instancia, cada una creería que le toca y el
+    canal recibiría el parte repetido — y peor, HubSpot recibiría la misma
+    escritura dos veces.
+    """
+    while True:
+        try:
+            ahora = datetime.now(timezone.utc)
+            if ahora.hour == RIESGO_MONITOR_HORA_UTC:
+                marca = str(ahora.date())
+                if not _evento_ya_notificado("riesgo_recalculo", marca):
+                    ayer = str((ahora - timedelta(days=1)).date())
+                    prev_raw = _evento_leer_status("riesgo_conteo_alto", ayer)
+                    try:
+                        previo = int(prev_raw) if prev_raw is not None else None
+                    except (TypeError, ValueError):
+                        previo = None
+
+                    res = _riesgo_recalcular_interno(escribir=True)
+                    pendientes, filtro_ok = _riesgo_lista_pendientes("alto")
+                    sin_filtro, _ = _riesgo_lista_pendientes("alto", excluir_por_texto=False)
+                    rescatados = len(sin_filtro) - len(pendientes)
+
+                    if RIESGO_SLACK_WEBHOOK_URL:
+                        _slack_enviar(
+                            RIESGO_SLACK_WEBHOOK_URL,
+                            _riesgo_texto_slack(res, len(pendientes), rescatados, filtro_ok, previo),
+                            nombre="riesgo_cancelacion",
+                        )
+                    _evento_marcar("riesgo_recalculo", marca, "notified", notified=True)
+                    _evento_marcar("riesgo_conteo_alto", marca, str(res["por_nivel"]["alto"]))
+                    METRICAS["riesgo_recalculos_automaticos"] += 1
+                    log.warning(f"[riesgo] recálculo automático · alto={res['por_nivel']['alto']} "
+                                f"lista={len(pendientes)} escritos={res['escritos']}")
+        except Exception as e:
+            log.error(f"[riesgo] fallo en el recálculo automático: {e}")
+        time.sleep(300)
+
+
+@app.get("/riesgo/monitor-estado")
+def riesgo_monitor_estado(x_api_key: str | None = Header(default=None)):
+    """Para saber si el monitor corrió hoy sin tener que mirar los logs."""
+    _chequear_clave(x_api_key)
+    hoy = str(datetime.now(timezone.utc).date())
+    historial = []
+    for d in range(7):
+        dia = str((datetime.now(timezone.utc) - timedelta(days=d)).date())
+        v = _evento_leer_status("riesgo_conteo_alto", dia)
+        if v is not None:
+            historial.append({"dia": dia, "riesgo_alto": v})
+    return {
+        "activo": _a_bool(RIESGO_MONITOR_ACTIVO, por_defecto=True),
+        "hora_utc": RIESGO_MONITOR_HORA_UTC,
+        "corrio_hoy": _evento_ya_notificado("riesgo_recalculo", hoy),
+        "recalculos_automaticos": METRICAS.get("riesgo_recalculos_automaticos", 0),
+        "historial_7_dias": historial,
+        "slack_configurado": bool(RIESGO_SLACK_WEBHOOK_URL),
+    }
+
+
+@app.on_event("startup")
+def arrancar_monitor_riesgo():
+    if not _a_bool(RIESGO_MONITOR_ACTIVO, por_defecto=True):
+        log.warning("[startup] monitor de riesgo desactivado por RIESGO_MONITOR_ACTIVO")
+        return
+    threading.Thread(target=_riesgo_monitor_loop, daemon=True).start()
+    log.warning(f"[startup] monitor de riesgo activo · recalcula a las {RIESGO_MONITOR_HORA_UTC}:00 UTC")
+
+
+# ══════════════════════════════════════════════════════════════════
+#  SEGMENTO DORMANT — LA VENTANA DONDE TODAVÍA HAY RETORNO
+#  Agregado 10/09/2026 (v1.4.5). BLOQUE PURAMENTE ADITIVO.
+#
+#  ── Por qué existe ────────────────────────────────────────────────
+#  El Framework de Retención de Opción Yo (Notion · Proyecto Health
+#  Score, 13/08/2026), validado contra el warehouse de producto, dice
+#  en su hallazgo 7, textual:
+#
+#    "Dormant (un solo mes en cero) es la alarma: la retención se
+#     desploma a ~28–35% y el 2º mes en cero ya no agrega daño →
+#     intervenir al PRIMER mes en cero; del At Risk (2+ meses) ~90%
+#     ya no vuelve."
+#
+#  Nuestro modelo de riesgo marca "alto" recién a los 60 días. Eso ya
+#  es At Risk. Medido el 10/09: 648 clientes en Dormant (31-60 días),
+#  a los que el sistema clasifica "riesgo medio" y con los que no se
+#  hace absolutamente nada, contra 739 en At Risk que se llevan toda
+#  la atención de retención.
+#
+#  ── Lo que este bloque NO hace, a propósito ───────────────────────
+#  NO cambia `RIESGO_DIAS_ALTO`. El umbral de 60 días se validó con un
+#  caso-control de 1.245 casos y 1.699 controles y dio 83,8% de
+#  precisión; moverlo sin revalidar sería romper algo medido por algo
+#  supuesto.
+#
+#  Se intentó revalidar con corte a 30 días usando el DWH de Treble y
+#  NO SE PUDO CONCLUIR: el único proxy de sesión disponible acá es el
+#  push de "sí asistió", y los controles quedan contaminados con
+#  clientes que ya se fueron en silencio (churn sin aviso), lo que
+#  invierte artificialmente la señal. El dato bueno —sesiones reales y
+#  renovaciones— vive en el warehouse de producto (marts), no acá.
+#
+#  Así que este bloque se limita a EXPONER el segmento, que hoy es
+#  invisible. Decidir el umbral es de negocio y necesita el otro dato.
+# ══════════════════════════════════════════════════════════════════
+
+RIESGO_DORMANT_DESDE = int(os.environ.get("RIESGO_DORMANT_DESDE", "31"))
+RIESGO_DORMANT_HASTA = int(os.environ.get("RIESGO_DORMANT_HASTA", "60"))
+
+
+@app.get("/riesgo/dormant")
+def riesgo_dormant(
+    x_api_key: str | None = Header(default=None),
+    tope: int = 400,
+    desde: int | None = None,
+    hasta: int | None = None,
+):
+    """
+    La lista de trabajo que el framework pide y que hoy no existe:
+    clientes con entre 31 y 60 días sin sesión, que TODAVÍA no pidieron
+    la baja.
+
+    Es el mismo filtro de `/riesgo/lista-v2` (tag + texto), porque el
+    error de mandarle retención a alguien que ya canceló es igual de
+    caro acá.
+
+    Ordena por días DESCENDENTE: el que está más cerca de cruzar a
+    At Risk es el más urgente, no el que recién entró.
+    """
+    _chequear_clave(x_api_key)
+    d0 = int(desde) if desde is not None else RIESGO_DORMANT_DESDE
+    d1 = int(hasta) if hasta is not None else RIESGO_DORMANT_HASTA
+    if d0 < 1 or d1 <= d0:
+        raise HTTPException(400, "Rango inválido: se espera 1 <= desde < hasta.")
+
+    filas = _riesgo_desde_dwh()
+    en_gestion = _riesgo_en_gestion_por_texto()
+    filtro_ok = en_gestion is not None
+    if not filtro_ok:
+        en_gestion = set()
+
+    dentro, ya_pidieron = [], 0
+    for f in filas:
+        dias = int(f.get("dias") or 0)
+        if not (d0 <= dias <= d1):
+            continue
+        if not str(f.get("hubspot_id") or "").isdigit():
+            continue
+        tid = str(f.get("tid") or "")
+        if int(f.get("ya_pidio_cancelar") or 0) or (tid and tid in en_gestion):
+            ya_pidieron += 1
+            continue
+        dentro.append(f)
+
+    dentro.sort(key=lambda f: int(f.get("dias") or 0), reverse=True)
+
+    # Cuántos cruzan a At Risk esta semana. Es la urgencia real: pasado
+    # ese punto, el framework dice que ~90% ya no vuelve.
+    cruzan_en_7 = sum(1 for f in dentro if int(f["dias"]) >= d1 - 7)
+
+    return {
+        "generado": datetime.now(timezone.utc).isoformat(),
+        "ventana_dias": {"desde": d0, "hasta": d1},
+        "total": len(dentro),
+        "cruzan_a_at_risk_en_7_dias": cruzan_en_7,
+        "excluidos_por_ya_pedir_la_baja": ya_pidieron,
+        "filtro_texto_aplicado": filtro_ok,
+        "clientes": [{
+            "hubspot_id": f["hubspot_id"],
+            "dias_sin_sesion": int(f["dias"]),
+            "dias_para_at_risk": max(0, d1 - int(f["dias"])),
+            "ultima_sesion": str(f.get("ultima_sesion") or ""),
+            "telefono": _mask_phone(str(f.get("tid") or "")),
+        } for f in dentro[:min(int(tope), 1000)]],
+        "fundamento": ("Framework de Retención · Proyecto Health Score (Notion, 13/08/2026), "
+                       "hallazgo 7: intervenir al primer mes en cero; del At Risk (2+ meses) "
+                       "~90% ya no vuelve."),
+        "aviso": None if filtro_ok else (
+            "No se pudo detectar cancelaciones por texto: la lista puede incluir a quien ya "
+            "pidió la baja. No la uses para disparar retención con esta corrida."),
+    }
+
+
+@app.get("/riesgo/embudo-retencion")
+def riesgo_embudo_retencion(x_api_key: str | None = Header(default=None)):
+    """
+    Foto de los cuatro estados del framework en una sola llamada, para
+    ver de un vistazo dónde está parada la base y cuánto pesa el
+    segmento que hoy no se atiende.
+    """
+    _chequear_clave(x_api_key)
+    filas = _riesgo_desde_dwh()
+    en_gestion = _riesgo_en_gestion_por_texto() or set()
+
+    est = {"activo": 0, "dormant": 0, "at_risk": 0, "perdido": 0}
+    sin_pedir = {"activo": 0, "dormant": 0, "at_risk": 0, "perdido": 0}
+    for f in filas:
+        if not str(f.get("hubspot_id") or "").isdigit():
+            continue
+        d = int(f.get("dias") or 0)
+        k = ("activo" if d <= 30 else "dormant" if d <= 60 else "at_risk" if d <= 90 else "perdido")
+        est[k] += 1
+        tid = str(f.get("tid") or "")
+        if not int(f.get("ya_pidio_cancelar") or 0) and not (tid and tid in en_gestion):
+            sin_pedir[k] += 1
+
+    return {
+        "generado": datetime.now(timezone.utc).isoformat(),
+        "estados": [
+            {"estado": "Activo", "rango_dias": "0-30", "clientes": est["activo"],
+             "sin_pedir_la_baja": sin_pedir["activo"], "accion": "ninguna"},
+            {"estado": "Dormant", "rango_dias": "31-60", "clientes": est["dormant"],
+             "sin_pedir_la_baja": sin_pedir["dormant"],
+             "accion": "INTERVENIR — es donde el framework dice que todavía hay retorno"},
+            {"estado": "At Risk", "rango_dias": "61-90", "clientes": est["at_risk"],
+             "sin_pedir_la_baja": sin_pedir["at_risk"],
+             "accion": "~90% ya no vuelve — intentar, pero no es acá donde se gana"},
+            {"estado": "Perdido", "rango_dias": ">90", "clientes": est["perdido"],
+             "sin_pedir_la_baja": sin_pedir["perdido"], "accion": "no invertir"},
+        ],
+        "nota": ("`sin_pedir_la_baja` ya excluye a quien mencionó cancelar, por tag o por el "
+                 "texto del chat. Es sobre ese número que se arma cualquier campaña."),
+    }
