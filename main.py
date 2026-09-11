@@ -2022,7 +2022,7 @@ def version_bloques(x_api_key: str | None = Header(default=None)):
     _chequear_clave(x_api_key)
     return {
         "base": "1.3.3",
-        "bloques": ["workflows_push (1.3.4)", "cohorte_renovaciones (1.3.5)", "reintento_pushes (1.3.5)", "contador_sesiones (1.3.6)", "workflows_crudo (1.3.7)", "riesgo_cancelacion (1.3.8)", "salud_mensajeria (1.3.9)", "correccion_veteranos (1.4.0)", "salud_detalle (1.4.1)", "arreglos_cruce_y_auditoria (1.4.2)", "reintento_automatico (1.4.2)", "cobertura_bifurcacion (1.4.2)", "sesiones_agendadas (1.4.3)", "monitor_riesgo (1.4.4)", "riesgo_lista_v2 (1.4.4)", "segmento_dormant (1.4.5)", "parte_operativo (1.4.6)", "reintento_por_nombre (1.4.7)", "caducidad_reintento (1.4.8)", "pedidos_v2 (1.4.9)", "webhook_propio_pedidos (1.5.0)", "sla_v2 (1.5.1)"],
+        "bloques": ["workflows_push (1.3.4)", "cohorte_renovaciones (1.3.5)", "reintento_pushes (1.3.5)", "contador_sesiones (1.3.6)", "workflows_crudo (1.3.7)", "riesgo_cancelacion (1.3.8)", "salud_mensajeria (1.3.9)", "correccion_veteranos (1.4.0)", "salud_detalle (1.4.1)", "arreglos_cruce_y_auditoria (1.4.2)", "reintento_automatico (1.4.2)", "cobertura_bifurcacion (1.4.2)", "sesiones_agendadas (1.4.3)", "monitor_riesgo (1.4.4)", "riesgo_lista_v2 (1.4.4)", "segmento_dormant (1.4.5)", "parte_operativo (1.4.6)", "reintento_por_nombre (1.4.7)", "caducidad_reintento (1.4.8)", "pedidos_v2 (1.4.9)", "webhook_propio_pedidos (1.5.0)", "sla_v2 (1.5.1)", "partes_sin_repetir (1.5.2)"],
         "endpoints_nuevos": [
             "POST /cohorte/setup", "POST /cohorte/procesar",
             "GET /cohorte/renovaciones", "GET /cohorte/kpis",
@@ -2036,7 +2036,7 @@ def version_bloques(x_api_key: str | None = Header(default=None)):
             "GET /sesiones/polls", "GET /auditoria/contactos",
             "GET /pushes/reintento-estado",
             "POST /sesiones/completar-nuevos", "GET /sesiones/cobertura",
-            "GET /sesiones/senal", "POST /sesiones/recalcular-agendadas", "GET /riesgo/lista-v2", "GET /riesgo/monitor-estado", "GET /riesgo/dormant", "GET /riesgo/embudo-retencion", "GET /operativo/parte", "POST /operativo/enviar", "GET /pushes/bloqueados-v2", "POST /pushes/reintentar-v2", "GET /pushes/caducidad", "POST /pedidos/setup", "GET /pedidos/pendientes", "GET /sla/resumen",
+            "GET /sesiones/senal", "POST /sesiones/recalcular-agendadas", "GET /riesgo/lista-v2", "GET /riesgo/monitor-estado", "GET /riesgo/dormant", "GET /riesgo/embudo-retencion", "GET /operativo/parte", "POST /operativo/enviar", "GET /pushes/bloqueados-v2", "POST /pushes/reintentar-v2", "GET /pushes/caducidad", "POST /pedidos/setup", "GET /pedidos/pendientes", "GET /sla/resumen", "GET /partes/estado",
         ],
     }
 
@@ -6072,3 +6072,256 @@ def arrancar_sla_v2():
     log.warning(f"[startup] sla v2 activo · alerta sobre {SLA_GRAVE_SEGUNDOS // 60} min dentro del "
                 f"turno {SLA_HORA_INICIO_UTC}-{SLA_HORA_FIN_UTC} UTC · resumen a las "
                 f"{SLA_RESUMEN_HORA_UTC}:00 UTC")
+
+
+
+# ══════════════════════════════════════════════════════════════════
+#  EL PARTE DEJA DE REPETIRSE Y DE MENTIR SOBRE EL REINTENTO
+#  Agregado 11/09/2026 (v1.5.2). BLOQUE PURAMENTE ADITIVO.
+#
+#  ── Lo que se vio hoy en #escalamiento-pushes ─────────────────────
+#  El parte de salud se publicó CUATRO veces: 09:03, 09:13, 09:25 y
+#  09:49. Y las cuatro decían:
+#
+#      "hay 225 pushes bloqueados esperando y ninguno es reenviable
+#       todavía — sus campañas no están dadas de alta en el sistema"
+#
+#  Las dos cosas están mal.
+#
+#  ── Bug 1 · el parte se repite en cada deploy ─────────────────────
+#  La dedup usa `_evento_ya_notificado("parte_salud", <fecha>)`, que es
+#  correcto, pero esa tabla vive en `/tmp/bridge_state.db` y Render la
+#  borra en cada redeploy. Al levantar, el hilo ve que es la hora del
+#  parte, no encuentra la marca, y lo manda de nuevo. Cuatro deploys
+#  dentro de la misma hora = cuatro partes.
+#
+#  LA SOLUCIÓN DE FONDO NO ES CÓDIGO: es darle disco a la base.
+#  En Render → el servicio → Disks → Add Disk (mount `/var/data`) y
+#  después la variable `BRIDGE_DB_PATH=/var/data/bridge_state.db`.
+#  Con eso la dedup es perfecta y esto deja de pasar para siempre,
+#  además de conservar el candado de reintentos entre deploys (hoy
+#  también se pierde, y por eso un push puede reintentarse de más).
+#
+#  Mientras tanto, este bloque hace lo mejor que se puede sin disco:
+#  al arrancar, si la hora del parte ya pasó —o ya estamos pasados de
+#  los primeros minutos de esa hora—, se marca como enviado. O salió
+#  antes del reinicio, o se perdió; en ningún caso queremos mandarlo
+#  repetido. Con el corte en el minuto 5, del caso de hoy habría
+#  salido solo el de las 09:03.
+#
+#  La siembra corre al IMPORTAR el módulo, no en un `startup`: para
+#  cuando corren los handlers de arranque los hilos ya están lanzados
+#  y habría una carrera.
+#
+#  ── Bug 2 · "ninguno es reenviable" es falso ──────────────────────
+#  `_salud_armar` (v1.4.2) trae así el dato:
+#
+#      r["reintento_recuperables"] = None      # ← clavado
+#      r["reintento_automatico"] = False       # ← clavado
+#
+#  Se escribió cuando el hilo de reintento no existía. Se creó ese
+#  mismo día y esto nunca se actualizó. Hoy `/pushes/bloqueados-v2`
+#  dice que de 303 bloqueados hay 106 reenviables — no cero.
+#
+#  Acá se calcula de verdad, con el cruce por nombre de v1.4.7 (el que
+#  ve los poll_id reasignados por Treble) y la caducidad de v1.4.8.
+# ══════════════════════════════════════════════════════════════════
+
+# Minuto de la hora del parte a partir del cual un arranque ya asume que
+# el parte salió. Antes de ese minuto se deja pasar, por si el deploy
+# ocurrió justo antes de que el hilo llegara a mandarlo.
+SIEMBRA_MINUTO_CORTE = int(os.environ.get("SIEMBRA_MINUTO_CORTE", "5"))
+
+# (evento, nombre humano, hora UTC configurada)
+def _partes_diarios():
+    return [
+        ("parte_salud", "Salud de mensajería", globals().get("SALUD_HORA_UTC")),
+        ("riesgo_recalculo", "Riesgo de cancelación", globals().get("RIESGO_MONITOR_HORA_UTC")),
+        ("parte_operativo", "Parte operativo", globals().get("OPERATIVO_HORA_UTC")),
+        ("pedidos_resumen", "Pedidos trabados", globals().get("PEDIDOS_RESUMEN_HORA_UTC")),
+        ("sla_v2_resumen", "SLA", globals().get("SLA_RESUMEN_HORA_UTC")),
+        ("escalamiento_diario", "Escalamiento diario", None),
+    ]
+
+
+def _siembra_corresponde(ahora, hora):
+    """True si, al arrancar a `ahora`, el parte de las `hora` ya debería haber salido."""
+    if hora is None:
+        return False
+    hora = int(hora)
+    if ahora.hour > hora:
+        return True
+    return ahora.hour == hora and ahora.minute >= SIEMBRA_MINUTO_CORTE
+
+
+def _sembrar_partes_del_dia():
+    """
+    Marca como enviados los partes diarios cuya hora ya pasó, para que un
+    redeploy no los republique. Devuelve la lista de lo sembrado (sirve
+    para el log y para los tests).
+    """
+    sembrados = []
+    try:
+        _init_db()   # idempotente: al importar puede no haber corrido todavía
+        ahora = datetime.now(timezone.utc)
+        hoy = str(ahora.date())
+        for evento, _nombre, hora in _partes_diarios():
+            if not _siembra_corresponde(ahora, hora):
+                continue
+            if _evento_ya_notificado(evento, hoy):
+                continue
+            _evento_marcar(evento, hoy, "notified", notified=True)
+            sembrados.append(evento)
+        if sembrados:
+            log.warning("[siembra] la hora de estos partes ya pasó; se marcan para no "
+                        f"repetirlos tras el redeploy: {', '.join(sembrados)}")
+        if str(DB_PATH).startswith("/tmp"):
+            log.warning("[siembra] la base de estado vive en /tmp y Render la borra en cada "
+                        "deploy. Para dedup real: montar un disco y poner "
+                        "BRIDGE_DB_PATH=/var/data/bridge_state.db")
+    except Exception as e:
+        log.error(f"[siembra] no se pudo sembrar: {e}")
+    return sembrados
+
+
+_SEMBRADOS_AL_ARRANCAR = _sembrar_partes_del_dia()
+
+
+@app.get("/partes/estado")
+def partes_estado(x_api_key: str | None = Header(default=None)):
+    """Qué partes ya salieron hoy, a qué hora sale cada uno y si la dedup es confiable."""
+    _chequear_clave(x_api_key)
+    ahora = datetime.now(timezone.utc)
+    hoy = str(ahora.date())
+    filas = []
+    for evento, nombre, hora in _partes_diarios():
+        filas.append({
+            "parte": nombre,
+            "evento": evento,
+            "hora_utc": hora,
+            "ya_salio_hoy": _evento_ya_notificado(evento, hoy),
+            "sembrado_al_arrancar": evento in (_SEMBRADOS_AL_ARRANCAR or []),
+        })
+    persistente = not str(DB_PATH).startswith("/tmp")
+    return {
+        "fecha": hoy,
+        "hora_utc_ahora": ahora.hour,
+        "partes": filas,
+        "base_estado": str(DB_PATH),
+        "dedup_persistente": persistente,
+        "aviso": (None if persistente else
+                  "La base de estado está en /tmp: Render la borra en cada deploy y la "
+                  "deduplicación sólo aguanta gracias a la siembra de arranque. Montá un "
+                  "disco en Render y poné BRIDGE_DB_PATH=/var/data/bridge_state.db."),
+    }
+
+
+# ── Bug 2 · el reintento, contado de verdad ───────────────────────
+
+_salud_armar_v142 = _salud_armar
+
+
+def _salud_armar():
+    """
+    Lo de v1.4.2 más el estado REAL de la cola de reintento: cuántos de
+    los bloqueados ya tienen el chat cerrado, cuántos de esos son
+    reenviables, cuántos caducaron y cuántos no tienen campaña dada de
+    alta. Antes esto venía clavado en None/False.
+    """
+    r = _salud_armar_v142()
+    if not r:
+        return r
+    # Lo que contaba v1.4.2 (todos los FAILURE_BY_HUMAN_HANDOVER de 72 h)
+    # se conserva con su propio nombre: son dos preguntas distintas.
+    r["reintento_bloqueados_72h"] = r.get("reintento_pendientes")
+    try:
+        filas = _bloqueados_pendientes(REINTENTO_HORAS_ATRAS) or []
+        mapa, _opciones, _ambiguos = _mapa_poll_a_push_registrado()
+        nombres = _nombre_de_poll()
+        recuperables = caducados = sin_alta = 0
+        for f in filas:
+            if str(f.get("pid")) not in (mapa or {}):
+                sin_alta += 1
+            elif _caducado(f, nombres):
+                caducados += 1
+            else:
+                recuperables += 1
+        r["reintento_en_cola"] = len(filas)
+        r["reintento_recuperables"] = recuperables
+        r["reintento_caducados"] = caducados
+        r["reintento_sin_alta"] = sin_alta
+        r["reintento_automatico"] = (
+            _a_bool(globals().get("REINTENTO_V2_AUTOMATICO"), por_defecto=False)
+            or _a_bool(globals().get("REINTENTO_AUTOMATICO"), por_defecto=True))
+    except Exception as e:
+        log.error(f"[salud] no se pudo contar la cola de reintento: {e}")
+    return r
+
+
+_salud_texto_v142 = _salud_texto
+
+
+def _salud_texto(r):
+    """
+    El texto anterior con el párrafo del reintento reescrito: decía que no
+    había nada reenviable cuando sí lo hay, y que el reenvío es a mano
+    cuando desde v1.4.2 corre solo.
+    """
+    texto = _salud_texto_v142(r)
+    try:
+        cola = r.get("reintento_en_cola")
+        if cola is None:
+            return texto
+
+        recup = r.get("reintento_recuperables") or 0
+        cad = r.get("reintento_caducados") or 0
+        sin_alta = r.get("reintento_sin_alta") or 0
+        bloq = r.get("reintento_bloqueados_72h")
+        auto = r.get("reintento_automatico")
+
+        cabeza = (f"*Reintento:* {bloq} pushes quedaron bloqueados en 72 h por chat abierto; "
+                  f"*{cola}* ya tienen la conversación cerrada."
+                  if bloq else
+                  f"*Reintento:* *{cola}* pushes bloqueados ya tienen la conversación cerrada.")
+
+        if cola == 0:
+            # Nada en cola no es un problema: es el estado sano. Una línea alcanza.
+            cabeza = (f"*Reintento:* {bloq} pushes quedaron bloqueados en 72 h por chat abierto, "
+                      f"pero ninguno tiene todavía la conversación cerrada: no hay nada que "
+                      f"reenviar ahora mismo." if bloq else
+                      "*Reintento:* no hay pushes esperando reenvío.")
+            detalle = []
+
+        elif recup > 0:
+            quien = ("El reintento automático los reenvía solo."
+                     if auto else "El reenvío NO está automático: hay que ejecutarlo.")
+            detalle = [f"  • *{recup}* reenviables. {quien}"]
+        else:
+            cabeza = ":warning: " + cabeza
+            detalle = ["  • Ninguno es reenviable ahora mismo."]
+
+        if cola and cad:
+            detalle.append(f"  • *{cad}* caducados — el mensaje nombraba un momento que ya "
+                           f"pasó; reenviarlo confundiría al cliente.")
+        if cola and sin_alta:
+            detalle.append(f"  • *{sin_alta}* sin campaña dada de alta en `enviar_push`. "
+                           f"Antes de darla de alta verificá en `/pushes/bloqueados-v2` que no "
+                           f"sea un id viejo de un push que ya existe: crear el workflow "
+                           f"duplicaría los envíos.")
+
+        nuevo = cabeza + ("\n" + "\n".join(detalle) if detalle else "")
+
+        # Se reemplaza el párrafo entero del reintento, sea cual sea el que
+        # haya armado la versión anterior, y se deja donde estaba.
+        bloques = texto.split("\n\n")
+        pos = next((i for i, b in enumerate(bloques) if "*Reintento:*" in b), None)
+        if pos is None:
+            pos = next((i for i, b in enumerate(bloques)
+                        if b.startswith("*Push más afectado")), len(bloques))
+            bloques.insert(pos, nuevo)
+        else:
+            bloques[pos] = nuevo
+        return "\n\n".join(bloques)
+    except Exception as e:
+        log.error(f"[salud] no se pudo reescribir el párrafo de reintento: {e}")
+        return texto
