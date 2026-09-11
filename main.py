@@ -2022,7 +2022,7 @@ def version_bloques(x_api_key: str | None = Header(default=None)):
     _chequear_clave(x_api_key)
     return {
         "base": "1.3.3",
-        "bloques": ["workflows_push (1.3.4)", "cohorte_renovaciones (1.3.5)", "reintento_pushes (1.3.5)", "contador_sesiones (1.3.6)", "workflows_crudo (1.3.7)", "riesgo_cancelacion (1.3.8)", "salud_mensajeria (1.3.9)", "correccion_veteranos (1.4.0)", "salud_detalle (1.4.1)", "arreglos_cruce_y_auditoria (1.4.2)", "reintento_automatico (1.4.2)", "cobertura_bifurcacion (1.4.2)", "sesiones_agendadas (1.4.3)", "monitor_riesgo (1.4.4)", "riesgo_lista_v2 (1.4.4)", "segmento_dormant (1.4.5)", "parte_operativo (1.4.6)", "reintento_por_nombre (1.4.7)"],
+        "bloques": ["workflows_push (1.3.4)", "cohorte_renovaciones (1.3.5)", "reintento_pushes (1.3.5)", "contador_sesiones (1.3.6)", "workflows_crudo (1.3.7)", "riesgo_cancelacion (1.3.8)", "salud_mensajeria (1.3.9)", "correccion_veteranos (1.4.0)", "salud_detalle (1.4.1)", "arreglos_cruce_y_auditoria (1.4.2)", "reintento_automatico (1.4.2)", "cobertura_bifurcacion (1.4.2)", "sesiones_agendadas (1.4.3)", "monitor_riesgo (1.4.4)", "riesgo_lista_v2 (1.4.4)", "segmento_dormant (1.4.5)", "parte_operativo (1.4.6)", "reintento_por_nombre (1.4.7)", "caducidad_reintento (1.4.8)"],
         "endpoints_nuevos": [
             "POST /cohorte/setup", "POST /cohorte/procesar",
             "GET /cohorte/renovaciones", "GET /cohorte/kpis",
@@ -2036,7 +2036,7 @@ def version_bloques(x_api_key: str | None = Header(default=None)):
             "GET /sesiones/polls", "GET /auditoria/contactos",
             "GET /pushes/reintento-estado",
             "POST /sesiones/completar-nuevos", "GET /sesiones/cobertura",
-            "GET /sesiones/senal", "POST /sesiones/recalcular-agendadas", "GET /riesgo/lista-v2", "GET /riesgo/monitor-estado", "GET /riesgo/dormant", "GET /riesgo/embudo-retencion", "GET /operativo/parte", "POST /operativo/enviar", "GET /pushes/bloqueados-v2", "POST /pushes/reintentar-v2",
+            "GET /sesiones/senal", "POST /sesiones/recalcular-agendadas", "GET /riesgo/lista-v2", "GET /riesgo/monitor-estado", "GET /riesgo/dormant", "GET /riesgo/embudo-retencion", "GET /operativo/parte", "POST /operativo/enviar", "GET /pushes/bloqueados-v2", "POST /pushes/reintentar-v2", "GET /pushes/caducidad",
         ],
     }
 
@@ -5260,3 +5260,252 @@ def pushes_reintentar_v2(
     log.warning(f"[reintento-v2] reenviados={enviados} reasignados="
                 f"{res['de_esos_por_id_reasignado']} errores={len(errores)}")
     return res
+
+
+# ══════════════════════════════════════════════════════════════════
+#  CADUCIDAD DEL REINTENTO + DOS TEXTOS QUE MENTÍAN
+#  Agregado 11/09/2026 (v1.4.8). BLOQUE PURAMENTE ADITIVO.
+#
+#  ── El problema, encontrado al revisar el parte del 11/09 ─────────
+#  El reintento reenvía cualquier push bloqueado dentro de 72 h sin
+#  preguntarse si el mensaje SIGUE TENIENDO SENTIDO. Medido hoy sobre
+#  los bloqueados de "Especialista confirmación 6 horas antes" —el que
+#  avisa que la sesión es HOY:
+#
+#      0-6 h atrás ....  7   ← reenviar sirve
+#      12 h ...........  3   ← la sesión ya pasó
+#      18 h ........... 22   ← ya pasó
+#      24 h ...........  7   ← ya pasó
+#      30 h y más .....  8   ← ya pasó
+#
+#  De 47, solo 7 estaban en una ventana donde el mensaje todavía es
+#  cierto. Los otros 40 le avisan al cliente de una sesión que ya
+#  ocurrió. Eso no es recuperar un envío: es mandar ruido, y encima
+#  gastando plantilla y cuota de Meta.
+#
+#  El reintento automático viene haciendo esto desde que se encendió.
+#
+#  ── La regla ──────────────────────────────────────────────────────
+#  Un push que nombra un momento ("hoy", "en 6 horas", "mañana")
+#  caduca. Uno que no lo nombra (saludos, seguimientos, NPS) no.
+#  La ventana va por push y se puede ajustar sin tocar código.
+#
+#  El hilo automático viejo NO se reemplaza solo: el nuevo se enciende
+#  con REINTENTO_V2_AUTOMATICO=true y el viejo se apaga con
+#  REINTENTO_AUTOMATICO=false. Nunca los dos a la vez — dos hilos
+#  reintentando en paralelo duplicarían los envíos.
+# ══════════════════════════════════════════════════════════════════
+
+# ── Texto 1: el parte decía que el reenvío es a mano. Ya no lo es ──
+# La corrección de v1.4.2 se escribió cuando el hilo NO existía. Se creó
+# ese mismo día y el texto quedó viejo. Iva lo marcó dos veces.
+CAUSAS["FAILURE_BY_HUMAN_HANDOVER"] = (
+    "el cliente tenía un chat abierto en Treble",
+    "el reintento automático reenvía los que están dados de alta y no caducaron",
+)
+
+# ── Caducidad por push ────────────────────────────────────────────
+# Se compara contra el nombre normalizado del push. Primer patrón que
+# coincide, gana. Las horas son desde el envío ORIGINAL que falló.
+REINTENTO_CADUCIDAD = [
+    ("6 horas antes", 6),
+    ("1 hora antes", 2),
+    ("3 hs antes", 4),
+    ("3 horas antes", 4),
+    ("30 minutos", 1),
+    ("28hs", 24),
+    ("28 hs", 24),
+    ("26 hs", 24),
+    ("3 dias antes", 48),
+    ("72h", 48),
+    ("sesion en 72", 48),
+    ("confirmacion de sesiones", 24),
+    ("recordatorio", 12),
+]
+# Los que no nombran un momento (saludos, seguimientos, NPS, inasistencias)
+# no caducan dentro de la ventana de reintento.
+REINTENTO_CADUCIDAD_DEFECTO = int(os.environ.get("REINTENTO_CADUCIDAD_DEFECTO", "72"))
+
+REINTENTO_V2_AUTOMATICO = os.environ.get("REINTENTO_V2_AUTOMATICO", "false")
+
+_CACHE_NOMBRE_POLL = {"datos": None, "ts": 0.0}
+
+
+def _nombre_de_poll(forzar=False):
+    """poll_id -> nombre normalizado del push, con cache de 15 min."""
+    ahora = time.time()
+    if not forzar and _CACHE_NOMBRE_POLL["datos"] and (ahora - _CACHE_NOMBRE_POLL["ts"]) < 900:
+        return _CACHE_NOMBRE_POLL["datos"]
+    salida = {}
+    try:
+        for f in _query_interna(f"""
+            SELECT toString(poll_id) pid, argMax(poll_name, timestamps_eta) nombre
+            FROM fact_deployment_status
+            WHERE company_id = {int(SALUD_COMPANY_ID)} AND poll_name != ''
+              AND timestamps_eta >= now() - INTERVAL 365 DAY
+            GROUP BY pid""") or []:
+            salida[str(f["pid"])] = _norm_push(f.get("nombre") or "")
+    except Exception as e:
+        log.error(f"[reintento] no se pudieron leer los nombres de push: {e}")
+        return {}
+    _CACHE_NOMBRE_POLL["datos"] = salida
+    _CACHE_NOMBRE_POLL["ts"] = ahora
+    return salida
+
+
+def _horas_utiles(nombre_normalizado):
+    """Cuántas horas después del envío original sigue teniendo sentido reenviar."""
+    n = nombre_normalizado or ""
+    for patron, horas in REINTENTO_CADUCIDAD:
+        if patron in n:
+            return horas
+    return REINTENTO_CADUCIDAD_DEFECTO
+
+
+def _caducado(fila, nombres):
+    """
+    True si el mensaje ya no es cierto. Ante la duda —sin nombre o sin
+    timestamp— devuelve False: preferimos reenviar de más que descartar
+    un envío legítimo por un dato que falta.
+    """
+    ts = fila.get("ts")
+    if not ts:
+        return False
+    nombre = nombres.get(str(fila.get("pid")), "")
+    if not nombre:
+        return False
+    try:
+        t = ts if isinstance(ts, datetime) else datetime.fromisoformat(str(ts))
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        horas = (datetime.now(timezone.utc) - t).total_seconds() / 3600
+    except Exception:
+        return False
+    return horas > _horas_utiles(nombre)
+
+
+@app.get("/pushes/caducidad")
+def pushes_caducidad(x_api_key: str | None = Header(default=None), horas: int | None = None):
+    """
+    Qué se reintentaría y qué está caducado, sin mandar nada. Sirve para
+    ver de una si la tabla de ventanas está bien calibrada.
+    """
+    _chequear_clave(x_api_key)
+    ventana = int(horas) if horas else REINTENTO_HORAS_ATRAS
+    filas = _bloqueados_pendientes(ventana)
+    mapa, opciones, _ = _mapa_poll_a_push_registrado()
+    nombres = _nombre_de_poll()
+
+    detalle = {}
+    for f in filas:
+        pid = str(f.get("pid"))
+        nom = nombres.get(pid, "") or f"conversación {pid}"
+        d = detalle.setdefault(nom, {"push": nom, "vigentes": 0, "caducados": 0,
+                                     "sin_alta": 0, "ventana_horas": _horas_utiles(nombres.get(pid, ""))})
+        if pid not in mapa:
+            d["sin_alta"] += 1
+        elif _caducado(f, nombres):
+            d["caducados"] += 1
+        else:
+            d["vigentes"] += 1
+
+    lista = sorted(detalle.values(), key=lambda x: -(x["caducados"] + x["vigentes"]))
+    return {
+        "ventana_horas": ventana,
+        "pendientes": len(filas),
+        "vigentes": sum(d["vigentes"] for d in lista),
+        "caducados": sum(d["caducados"] for d in lista),
+        "sin_alta": sum(d["sin_alta"] for d in lista),
+        "por_push": lista[:25],
+        "nota": ("Un push caducado nombra un momento que ya pasó — reenviar "
+                 "'tu sesión es en 6 horas' un día después confunde al cliente y "
+                 "gasta cuota de Meta. Las ventanas se ajustan en REINTENTO_CADUCIDAD."),
+    }
+
+
+def _reintento_corrida_v2(tope=None, escribir=True):
+    """
+    Una corrida con las dos correcciones: resuelve los ids reasignados y
+    descarta lo caducado. Devuelve el mismo shape que `_reintento_corrida`
+    para que el parte y las métricas no tengan que cambiar.
+    """
+    limite = min(int(tope), REINTENTO_MAX_POR_CORRIDA) if tope else REINTENTO_MAX_POR_CORRIDA
+    filas = _bloqueados_pendientes(REINTENTO_HORAS_ATRAS)
+    mapa, opciones, ambiguos = _mapa_poll_a_push_registrado()
+    nombres = _nombre_de_poll()
+
+    plan, om = [], {"sin_workflow": 0, "sin_contacto": 0, "ya_reintentado": 0, "caducado": 0}
+    for f in filas:
+        pid = str(f["pid"])
+        destino = mapa.get(pid)
+        if not destino:
+            om["sin_workflow"] += 1
+            continue
+        if _caducado(f, nombres):
+            om["caducado"] += 1
+            continue
+        hs_id = str(f.get("hubspot_id") or "").strip()
+        if not hs_id.isdigit():
+            om["sin_contacto"] += 1
+            continue
+        if _evento_ya_notificado("reintento_push", f["did"]):
+            om["ya_reintentado"] += 1
+            continue
+        plan.append((f["did"], hs_id, destino))
+        if len(plan) >= limite:
+            break
+
+    enviados, errores = 0, []
+    if escribir:
+        for did, hs_id, destino in plan:
+            try:
+                _hubspot_api("PATCH", f"/crm/v3/objects/contacts/{hs_id}",
+                             {"properties": {PROP_ENVIAR_PUSH: f"PUSH_{destino}"}})
+                _evento_marcar("reintento_push", did, "notified", notified=True)
+                enviados += 1
+            except Exception as e:
+                errores.append(str(e)[:150])
+    return {"reintentados": enviados if escribir else 0, "a_reintentar": len(plan),
+            "pendientes_totales": len(filas), "omitidos": om, "errores": errores}
+
+
+def _reintento_v2_monitor_loop():
+    """
+    Reemplazo del hilo viejo. NO arranca salvo REINTENTO_V2_AUTOMATICO=true,
+    y hay que apagar el viejo con REINTENTO_AUTOMATICO=false: dos hilos
+    reintentando a la vez duplicarían los envíos. Comparten la tabla de
+    eventos, así que el candado por deployment_id igual los protege, pero
+    no hay que depender de eso.
+    """
+    while True:
+        try:
+            ahora = datetime.now(timezone.utc)
+            if REINTENTO_HORA_DESDE <= ahora.hour <= REINTENTO_HORA_HASTA:
+                marca = f"{ahora.date()}-{ahora.hour}-v2"
+                if not _evento_ya_notificado("corrida_reintento", marca):
+                    _evento_marcar("corrida_reintento", marca, "notified", notified=True)
+                    r = _reintento_corrida_v2()
+                    om = r.get("omitidos") or {}
+                    METRICAS["corridas_reintento"] += 1
+                    METRICAS["reintentos_automaticos"] += int(r.get("reintentados") or 0)
+                    log.warning(
+                        f"[reintento-v2-auto] reenviados={r.get('reintentados')} "
+                        f"caducados={om.get('caducado')} sin_workflow={om.get('sin_workflow')} "
+                        f"ya_hechos={om.get('ya_reintentado')}")
+        except Exception as e:
+            log.error(f"[reintento-v2-auto] falló la corrida: {e}")
+        time.sleep(max(60, REINTENTO_CADA_MINUTOS * 60))
+
+
+@app.on_event("startup")
+def arrancar_reintento_v2():
+    if not _a_bool(REINTENTO_V2_AUTOMATICO, por_defecto=False):
+        return
+    if _a_bool(REINTENTO_AUTOMATICO, por_defecto=True):
+        log.error("[startup] REINTENTO_V2_AUTOMATICO está encendido pero el viejo TAMBIÉN "
+                  "(REINTENTO_AUTOMATICO). El v2 no arranca para no duplicar envíos. "
+                  "Apagá el viejo con REINTENTO_AUTOMATICO=false.")
+        return
+    threading.Thread(target=_reintento_v2_monitor_loop, daemon=True).start()
+    log.warning(f"[startup] reintento v2 activo · cada {REINTENTO_CADA_MINUTOS} min "
+                f"entre las {REINTENTO_HORA_DESDE} y las {REINTENTO_HORA_HASTA} UTC")
