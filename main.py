@@ -2022,7 +2022,7 @@ def version_bloques(x_api_key: str | None = Header(default=None)):
     _chequear_clave(x_api_key)
     return {
         "base": "1.3.3",
-        "bloques": ["workflows_push (1.3.4)", "cohorte_renovaciones (1.3.5)", "reintento_pushes (1.3.5)", "contador_sesiones (1.3.6)", "workflows_crudo (1.3.7)", "riesgo_cancelacion (1.3.8)", "salud_mensajeria (1.3.9)", "correccion_veteranos (1.4.0)", "salud_detalle (1.4.1)", "arreglos_cruce_y_auditoria (1.4.2)", "reintento_automatico (1.4.2)", "cobertura_bifurcacion (1.4.2)", "sesiones_agendadas (1.4.3)", "monitor_riesgo (1.4.4)", "riesgo_lista_v2 (1.4.4)", "segmento_dormant (1.4.5)", "parte_operativo (1.4.6)", "reintento_por_nombre (1.4.7)", "caducidad_reintento (1.4.8)", "pedidos_v2 (1.4.9)", "webhook_propio_pedidos (1.5.0)"],
+        "bloques": ["workflows_push (1.3.4)", "cohorte_renovaciones (1.3.5)", "reintento_pushes (1.3.5)", "contador_sesiones (1.3.6)", "workflows_crudo (1.3.7)", "riesgo_cancelacion (1.3.8)", "salud_mensajeria (1.3.9)", "correccion_veteranos (1.4.0)", "salud_detalle (1.4.1)", "arreglos_cruce_y_auditoria (1.4.2)", "reintento_automatico (1.4.2)", "cobertura_bifurcacion (1.4.2)", "sesiones_agendadas (1.4.3)", "monitor_riesgo (1.4.4)", "riesgo_lista_v2 (1.4.4)", "segmento_dormant (1.4.5)", "parte_operativo (1.4.6)", "reintento_por_nombre (1.4.7)", "caducidad_reintento (1.4.8)", "pedidos_v2 (1.4.9)", "webhook_propio_pedidos (1.5.0)", "sla_v2 (1.5.1)"],
         "endpoints_nuevos": [
             "POST /cohorte/setup", "POST /cohorte/procesar",
             "GET /cohorte/renovaciones", "GET /cohorte/kpis",
@@ -2036,7 +2036,7 @@ def version_bloques(x_api_key: str | None = Header(default=None)):
             "GET /sesiones/polls", "GET /auditoria/contactos",
             "GET /pushes/reintento-estado",
             "POST /sesiones/completar-nuevos", "GET /sesiones/cobertura",
-            "GET /sesiones/senal", "POST /sesiones/recalcular-agendadas", "GET /riesgo/lista-v2", "GET /riesgo/monitor-estado", "GET /riesgo/dormant", "GET /riesgo/embudo-retencion", "GET /operativo/parte", "POST /operativo/enviar", "GET /pushes/bloqueados-v2", "POST /pushes/reintentar-v2", "GET /pushes/caducidad", "POST /pedidos/setup", "GET /pedidos/pendientes",
+            "GET /sesiones/senal", "POST /sesiones/recalcular-agendadas", "GET /riesgo/lista-v2", "GET /riesgo/monitor-estado", "GET /riesgo/dormant", "GET /riesgo/embudo-retencion", "GET /operativo/parte", "POST /operativo/enviar", "GET /pushes/bloqueados-v2", "POST /pushes/reintentar-v2", "GET /pushes/caducidad", "POST /pedidos/setup", "GET /pedidos/pendientes", "GET /sla/resumen",
         ],
     }
 
@@ -5871,3 +5871,204 @@ def arrancar_pedidos_v2():
     threading.Thread(target=_pedidos_v2_loop, daemon=True).start()
     log.warning("[startup] pedidos v2 activo · dedup en HubSpot, ficha del cliente y "
                 f"resumen de trabados a las {PEDIDOS_RESUMEN_HORA_UTC}:00 UTC")
+
+
+# ══════════════════════════════════════════════════════════════════
+#  SLA — SEPARAR LA SEÑAL DEL RUIDO Y LA COLA NOCTURNA
+#  Agregado 11/09/2026 (v1.5.1). BLOQUE PURAMENTE ADITIVO.
+#
+#  ── Lo que estaba pasando ─────────────────────────────────────────
+#  #sla-incumplimientos recibe UN mensaje por cada conversación que
+#  pasa de 2 minutos. Son 472 en 7 días — el 20,8% del total, ~67 por
+#  día. Más las repeticiones, porque la deduplicación vive en la tabla
+#  de eventos de /tmp y Render la borra en cada redeploy (las mismas
+#  cuatro conversaciones salieron a las 09:40 y otra vez a las 09:44).
+#
+#  ── Lo que el dato dice, y el canal no dejaba ver ─────────────────
+#  Por agente, en 7 días:
+#
+#      Sofia Castro ...... 17,5% incumple · mediana 0,3 min · 45 graves
+#      Estefany Suárez ... 22,7% incumple · mediana 0,5 min · 42 graves
+#      Mary Cárdenas ..... 40,5% incumple · mediana 1,0 min · 60 graves
+#
+#  Responden en segundos casi siempre. El problema no es lentitud: es
+#  una cola de casos que queda olvidada horas.
+#
+#  Y por hora de asignación:
+#
+#      10 UTC ...  6 conversaciones · 100% incumple
+#      11 UTC .. 241 conversaciones · 74,7% incumple   ← 7am Colombia
+#      16-21 UTC ~700 conversaciones · 12-17%
+#
+#  Las 11 UTC son el arranque del turno. Lo que entra de madrugada se
+#  asigna y espera a que alguien se conecte. 180 de los 472 casos de la
+#  semana (38%) están en esa sola hora. **No es culpa del agente: es la
+#  cola nocturna.** Mezclarla con los casos de 2,2 minutos hace que
+#  nadie vea ninguno de los dos problemas.
+#
+#  ── Lo que hace este bloque ───────────────────────────────────────
+#  1. Alerta en vivo SOLO lo grave (>15 min por defecto). Un caso de
+#     2,2 minutos no es un incidente y no merece interrumpir a nadie.
+#  2. Marca aparte la cola nocturna, para no imputarle al agente lo que
+#     es un hueco de cobertura.
+#  3. Un resumen diario por agente en vez de 67 mensajes sueltos.
+#
+#  Se enciende con SLA_V2_ACTIVO=true. El monitor viejo se apaga
+#  dejando SLACK_WEBHOOK_URL sin definir, o poniendo el webhook nuevo
+#  en SLA_V2_WEBHOOK_URL y sacando el viejo del monitor de SLA.
+# ══════════════════════════════════════════════════════════════════
+
+SLA_V2_ACTIVO = os.environ.get("SLA_V2_ACTIVO", "false")
+SLA_V2_WEBHOOK_URL = (
+    os.environ.get("SLA_V2_WEBHOOK_URL") or SLACK_WEBHOOK_URL or "")
+
+# Por debajo de esto no se alerta en vivo. El umbral de 2 min sigue
+# contando para el resumen: lo que cambia es a quién se interrumpe.
+SLA_GRAVE_SEGUNDOS = int(os.environ.get("SLA_GRAVE_SEGUNDOS", "900"))
+
+# Franja en que el equipo está operando (UTC). Lo asignado fuera de
+# ella se cuenta como cola, no como demora del agente.
+SLA_HORA_INICIO_UTC = int(os.environ.get("SLA_HORA_INICIO_UTC", "11"))
+SLA_HORA_FIN_UTC = int(os.environ.get("SLA_HORA_FIN_UTC", "23"))
+SLA_RESUMEN_HORA_UTC = int(os.environ.get("SLA_RESUMEN_HORA_UTC", "23"))
+
+for _m in ("sla_v2_alertas", "sla_v2_resumenes"):
+    METRICAS.setdefault(_m, 0)
+
+
+def _sla_es_cola_nocturna(hora_utc):
+    """
+    True si la conversación se asignó fuera de la franja de operación.
+    Esos casos no miden al agente: miden el hueco de cobertura.
+    """
+    if SLA_HORA_INICIO_UTC <= SLA_HORA_FIN_UTC:
+        return not (SLA_HORA_INICIO_UTC <= hora_utc <= SLA_HORA_FIN_UTC)
+    return not (hora_utc >= SLA_HORA_INICIO_UTC or hora_utc <= SLA_HORA_FIN_UTC)
+
+
+def _sla_datos(horas=24):
+    """Incumplimientos de la ventana, con la hora de asignación."""
+    return _query_interna(f"""
+        SELECT toString(conversation_id) cid, agent_name, contact_wa_id,
+               first_response_sec seg, toHour(assigned_at) hora_utc,
+               toString(assigned_at) asignada
+        FROM fact_conversations
+        WHERE company_id = {int(SALUD_COMPANY_ID)}
+          AND assigned_at >= now() - INTERVAL {int(horas)} HOUR
+          AND first_response_sec IS NOT NULL
+          AND first_response_sec >= {SLA_THRESHOLD_SECONDS}
+        ORDER BY seg DESC""") or []
+
+
+def _sla_resumen(horas=24):
+    filas = _sla_datos(horas)
+    por_agente, cola, graves = {}, 0, []
+    for f in filas:
+        seg = int(f.get("seg") or 0)
+        nocturna = _sla_es_cola_nocturna(int(f.get("hora_utc") or 0))
+        if nocturna:
+            cola += 1
+        else:
+            a = f.get("agent_name") or "Sin agente"
+            d = por_agente.setdefault(a, {"agente": a, "casos": 0, "graves": 0, "peor_min": 0})
+            d["casos"] += 1
+            if seg >= SLA_GRAVE_SEGUNDOS:
+                d["graves"] += 1
+            d["peor_min"] = max(d["peor_min"], round(seg / 60, 1))
+        if seg >= SLA_GRAVE_SEGUNDOS:
+            graves.append({"conversacion": f.get("cid"), "agente": f.get("agent_name") or "Sin agente",
+                           "minutos": round(seg / 60, 1), "cola_nocturna": nocturna,
+                           "cliente": _mask_phone(str(f.get("contact_wa_id") or ""))})
+    lista = sorted(por_agente.values(), key=lambda x: -x["graves"])
+    return {"ventana_horas": horas, "incumplimientos": len(filas),
+            "cola_nocturna": cola, "imputables_al_turno": len(filas) - cola,
+            "graves": len(graves), "por_agente": lista, "peores": graves[:10]}
+
+
+def _sla_texto_resumen(r):
+    L = [f"*SLA · últimas {r['ventana_horas']} h*",
+         f"{r['incumplimientos']} conversaciones sobre {SLA_THRESHOLD_SECONDS // 60} min  ·  "
+         f"*{r['graves']}* pasaron de {SLA_GRAVE_SEGUNDOS // 60} min"]
+
+    if r["cola_nocturna"]:
+        pct = round(100 * r["cola_nocturna"] / r["incumplimientos"]) if r["incumplimientos"] else 0
+        L += ["", f":crescent_moon: *{r['cola_nocturna']} ({pct}%) son cola nocturna* — entraron fuera "
+                  f"de la franja {SLA_HORA_INICIO_UTC}-{SLA_HORA_FIN_UTC} UTC y esperaron al turno. "
+                  f"Eso es cobertura, no demora del agente."]
+
+    if r["por_agente"]:
+        L += ["", "*Dentro del turno, por agente:*"]
+        for a in r["por_agente"][:8]:
+            g = f" · {a['graves']} graves" if a["graves"] else ""
+            L.append(f"  · {a['agente']} — {a['casos']} casos{g} · peor {a['peor_min']} min")
+
+    dentro = [p for p in r["peores"] if not p["cola_nocturna"]]
+    if dentro:
+        L += ["", "*Los peores del turno:*"]
+        for p in dentro[:5]:
+            L.append(f"  · #{p['conversacion']} — {p['agente']} · *{p['minutos']} min* · {p['cliente']}")
+
+    L += ["", "_Los casos de 2 a 15 minutos entran en el conteo pero no generan alerta en vivo._"]
+    return "\n".join(L)
+
+
+@app.get("/sla/resumen")
+def sla_resumen(x_api_key: str | None = Header(default=None), horas: int = 24):
+    """El resumen sin publicarlo. Sirve para calibrar la franja horaria."""
+    _chequear_clave(x_api_key)
+    r = _sla_resumen(int(horas))
+    return {"generado": datetime.now(timezone.utc).isoformat(),
+            "datos": r, "texto_slack": _sla_texto_resumen(r)}
+
+
+def _sla_v2_loop():
+    """
+    Alerta en vivo lo grave dentro del turno; una vez al día publica el
+    resumen. La marca de "ya avisado" usa status 'notified' —el seed
+    baseline del monitor viejo grababa 'baseline', que el chequeo no
+    reconoce, y por eso republicaba todo en cada arranque.
+    """
+    while True:
+        try:
+            for f in _sla_datos(2):
+                seg = int(f.get("seg") or 0)
+                if seg < SLA_GRAVE_SEGUNDOS:
+                    continue
+                if _sla_es_cola_nocturna(int(f.get("hora_utc") or 0)):
+                    continue
+                cid = str(f.get("cid"))
+                if _evento_ya_notificado("sla_v2", cid):
+                    continue
+                texto = (f":rotating_light: *SLA grave — {round(seg/60,1)} min sin responder*\n"
+                         f"Conversación #{cid} de *{f.get('agent_name') or 'Sin agente'}*\n"
+                         f"Cliente: `{_mask_phone(str(f.get('contact_wa_id') or ''))}`")
+                if SLA_V2_WEBHOOK_URL:
+                    _slack_enviar(SLA_V2_WEBHOOK_URL, texto, nombre="sla_v2")
+                _evento_marcar("sla_v2", cid, "notified", notified=True)
+                METRICAS["sla_v2_alertas"] += 1
+
+            ahora = datetime.now(timezone.utc)
+            if ahora.hour == SLA_RESUMEN_HORA_UTC:
+                marca = str(ahora.date())
+                if not _evento_ya_notificado("sla_v2_resumen", marca):
+                    r = _sla_resumen(24)
+                    if r["incumplimientos"] and SLA_V2_WEBHOOK_URL:
+                        _slack_enviar(SLA_V2_WEBHOOK_URL, _sla_texto_resumen(r), nombre="sla_v2_resumen")
+                        METRICAS["sla_v2_resumenes"] += 1
+                    _evento_marcar("sla_v2_resumen", marca, "notified", notified=True)
+        except Exception as e:
+            log.error(f"[sla-v2] error en la revisión: {e}")
+        time.sleep(max(120, SLA_POLL_INTERVAL_SECONDS))
+
+
+@app.on_event("startup")
+def arrancar_sla_v2():
+    if not _a_bool(SLA_V2_ACTIVO, por_defecto=False):
+        return
+    if not SLA_V2_WEBHOOK_URL:
+        log.warning("[startup] sla v2 no arranca — falta SLA_V2_WEBHOOK_URL")
+        return
+    threading.Thread(target=_sla_v2_loop, daemon=True).start()
+    log.warning(f"[startup] sla v2 activo · alerta sobre {SLA_GRAVE_SEGUNDOS // 60} min dentro del "
+                f"turno {SLA_HORA_INICIO_UTC}-{SLA_HORA_FIN_UTC} UTC · resumen a las "
+                f"{SLA_RESUMEN_HORA_UTC}:00 UTC")
