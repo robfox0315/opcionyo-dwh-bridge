@@ -2022,7 +2022,7 @@ def version_bloques(x_api_key: str | None = Header(default=None)):
     _chequear_clave(x_api_key)
     return {
         "base": "1.3.3",
-        "bloques": ["workflows_push (1.3.4)", "cohorte_renovaciones (1.3.5)", "reintento_pushes (1.3.5)", "contador_sesiones (1.3.6)", "workflows_crudo (1.3.7)", "riesgo_cancelacion (1.3.8)", "salud_mensajeria (1.3.9)", "correccion_veteranos (1.4.0)", "salud_detalle (1.4.1)", "arreglos_cruce_y_auditoria (1.4.2)", "reintento_automatico (1.4.2)", "cobertura_bifurcacion (1.4.2)", "sesiones_agendadas (1.4.3)", "monitor_riesgo (1.4.4)", "riesgo_lista_v2 (1.4.4)", "segmento_dormant (1.4.5)", "parte_operativo (1.4.6)"],
+        "bloques": ["workflows_push (1.3.4)", "cohorte_renovaciones (1.3.5)", "reintento_pushes (1.3.5)", "contador_sesiones (1.3.6)", "workflows_crudo (1.3.7)", "riesgo_cancelacion (1.3.8)", "salud_mensajeria (1.3.9)", "correccion_veteranos (1.4.0)", "salud_detalle (1.4.1)", "arreglos_cruce_y_auditoria (1.4.2)", "reintento_automatico (1.4.2)", "cobertura_bifurcacion (1.4.2)", "sesiones_agendadas (1.4.3)", "monitor_riesgo (1.4.4)", "riesgo_lista_v2 (1.4.4)", "segmento_dormant (1.4.5)", "parte_operativo (1.4.6)", "reintento_por_nombre (1.4.7)"],
         "endpoints_nuevos": [
             "POST /cohorte/setup", "POST /cohorte/procesar",
             "GET /cohorte/renovaciones", "GET /cohorte/kpis",
@@ -2036,7 +2036,7 @@ def version_bloques(x_api_key: str | None = Header(default=None)):
             "GET /sesiones/polls", "GET /auditoria/contactos",
             "GET /pushes/reintento-estado",
             "POST /sesiones/completar-nuevos", "GET /sesiones/cobertura",
-            "GET /sesiones/senal", "POST /sesiones/recalcular-agendadas", "GET /riesgo/lista-v2", "GET /riesgo/monitor-estado", "GET /riesgo/dormant", "GET /riesgo/embudo-retencion", "GET /operativo/parte", "POST /operativo/enviar",
+            "GET /sesiones/senal", "POST /sesiones/recalcular-agendadas", "GET /riesgo/lista-v2", "GET /riesgo/monitor-estado", "GET /riesgo/dormant", "GET /riesgo/embudo-retencion", "GET /operativo/parte", "POST /operativo/enviar", "GET /pushes/bloqueados-v2", "POST /pushes/reintentar-v2",
         ],
     }
 
@@ -4959,7 +4959,12 @@ def _operativo_texto(d):
 
     if d["botones"]:
         L.append("")
-        L.append("*Botones:* " + " · ".join(f"{b['b']} {b['n']}" for b in d["botones"]))
+        # .get() y no corchetes en todo lo que sigue: este texto lo arma un
+        # monitor que corre solo una vez al día. Si una fila del DWH viene sin
+        # la clave esperada, el parte entero se cae y nadie se entera — el
+        # except del loop lo traga y el canal simplemente no recibe nada.
+        L.append("*Botones:* " + " · ".join(
+            f"{b.get('b', '?')} {b.get('n', 0)}" for b in d["botones"]))
     else:
         L.append("")
         L.append(":rotating_light: *Cero respuestas con botón en 24 h.* Si algún flujo se "
@@ -4970,14 +4975,16 @@ def _operativo_texto(d):
         L.append("")
         L.append(":warning: *Plantillas MARKETING con actividad* (rechazan ~56% contra 0% de "
                  "UTILITY): " + " · ".join(
-                     f"{m['plantilla']} ({m['respuestas']})" for m in d["plantillas_marketing_activas"]))
+                     f"{m.get('plantilla', '?')} ({m.get('respuestas', 0)})"
+                     for m in d["plantillas_marketing_activas"]))
 
     if d["peores"]:
         L.append("")
         L.append("*Peor entrega (con 10+ envíos):*")
         for p in d["peores"]:
-            extra = f" · {p['meta']} rechazos de Meta" if int(p.get("meta") or 0) else ""
-            L.append(f"  · {p['push'] or 'sin nombre'} — {p['pct']}% de {p['env']}{extra}")
+            extra = f" · {p.get('meta')} rechazos de Meta" if int(p.get("meta") or 0) else ""
+            L.append(f"  · {p.get('push') or 'sin nombre'} — "
+                     f"{p.get('pct', '?')}% de {p.get('env', '?')}{extra}")
 
     L.append("")
     L.append("_Publicado por el bridge. La tarea de Slack lee esto cuando no alcanza el DWH._")
@@ -5037,3 +5044,219 @@ def arrancar_monitor_operativo():
         return
     threading.Thread(target=_operativo_monitor_loop, daemon=True).start()
     log.warning(f"[startup] parte operativo activo · sale a las {OPERATIVO_HORA_UTC}:00 UTC")
+
+
+# ══════════════════════════════════════════════════════════════════
+#  REINTENTO QUE SOBREVIVE A LA REASIGNACIÓN DE IDS DE TREBLE
+#  Agregado 11/09/2026 (v1.4.7). BLOQUE PURAMENTE ADITIVO.
+#
+#  ── El bug ────────────────────────────────────────────────────────
+#  `/pushes/bloqueados` y `/pushes/reintentar` cruzan así:
+#
+#      recuperables = [f for f in filas if str(f["pid"]) in opciones]
+#
+#  `f["pid"]` es el **poll_id del DWH**, que Treble REASIGNA cada vez
+#  que alguien publica el flujo. `opciones` viene de `enviar_push`, que
+#  guarda el **conversation_id**, estable. Cuando un flujo se republica
+#  los dos dejan de coincidir y el push entero cae a
+#  "sin_workflow_asociado" aunque su workflow exista y funcione.
+#
+#  Medido el 11/09: 236 de 304 bloqueados (78%) figuraban sin workflow.
+#  Ninguno lo estaba. "Especialista confirmación 3 dias antes" tenía
+#  3.263 envíos bajo `1485179` hasta el 10/09 19:09 y 121 bajo
+#  `1466629` desde las 20:09 — la publicación de esa tarde devolvió el
+#  id viejo. `PUSH_1466629` siempre estuvo en `enviar_push`.
+#
+#  ── Por qué importa además del reintento ──────────────────────────
+#  El mensaje de ese diagnóstico invitaba a crear el workflow faltante.
+#  Hacerlo habría DUPLICADO el push de mayor volumen de la operación:
+#  cada cliente recibiendo el recordatorio de su sesión dos veces. La
+#  salvaguarda de `POST /workflows/push` lo frenó con un 409.
+#
+#  ── El arreglo ────────────────────────────────────────────────────
+#  Resolver por NOMBRE, que es lo único estable — el mismo patrón que
+#  `_polls_de_sesion()` ya usa para el contador de sesiones. Dos ids
+#  con el mismo `poll_name` son el mismo push.
+#
+#  Ambigüedad: si un nombre corresponde a DOS conversation_id distintos
+#  ya registrados (pasa de verdad: "Inasistencias Seg 1 Lau O" tiene la
+#  "versión anterior" y "el más usado", ambas en `enviar_push`), NO se
+#  resuelve. Elegir una al azar mandaría al cliente el push equivocado.
+#
+#  El hilo automático NO se toca: sigue usando el cruce viejo hasta que
+#  el v2 se valide en vivo. Hoy reenvía y funciona; romperlo para
+#  arreglarlo sería el peor negocio.
+# ══════════════════════════════════════════════════════════════════
+
+_CACHE_MAPA_POLL = {"datos": None, "ts": 0.0}
+
+
+def _mapa_poll_a_push_registrado(forzar=False):
+    """
+    poll_id del DWH -> conversation_id dado de alta en `enviar_push`.
+
+    Devuelve `(mapa, opciones, ambiguos)`:
+      · `mapa`    incluye el id propio cuando ya está registrado, y el id
+                  registrado equivalente cuando se resolvió por nombre.
+      · `ambiguos` son los nombres con más de un id registrado: quedan
+                  fuera a propósito y se informan para que un humano
+                  desempate.
+    """
+    ahora = time.time()
+    if not forzar and _CACHE_MAPA_POLL["datos"] and (ahora - _CACHE_MAPA_POLL["ts"]) < 900:
+        return _CACHE_MAPA_POLL["datos"]
+
+    opciones = _push_opciones_por_id()          # conversation_id -> label
+
+    nombre_de = {}
+    try:
+        for f in _query_interna(f"""
+            SELECT toString(poll_id) pid, argMax(poll_name, timestamps_eta) nombre
+            FROM fact_deployment_status
+            WHERE company_id = {int(SALUD_COMPANY_ID)} AND poll_name != ''
+              AND timestamps_eta >= now() - INTERVAL 365 DAY
+            GROUP BY pid""") or []:
+            n = _norm_push(f.get("nombre") or "")
+            if n:
+                nombre_de[str(f["pid"])] = n
+    except Exception as e:
+        # Sin el DWH no se puede resolver por nombre. Se devuelve el cruce
+        # viejo, que es conservador: sub-reporta recuperables, nunca manda
+        # un push equivocado.
+        log.error(f"[reintento] no se pudo armar el mapa por nombre: {e}")
+        return {k: k for k in opciones}, opciones, {}
+
+    # nombre -> ids registrados con ese nombre
+    por_nombre = {}
+    for pid_reg in opciones:
+        n = nombre_de.get(pid_reg)
+        if n:
+            por_nombre.setdefault(n, []).append(pid_reg)
+
+    ambiguos = {n: ids for n, ids in por_nombre.items() if len(ids) > 1}
+
+    mapa = {}
+    for pid, n in nombre_de.items():
+        if pid in opciones:
+            mapa[pid] = pid                              # ya estaba bien
+        elif n in por_nombre and len(por_nombre[n]) == 1:
+            mapa[pid] = por_nombre[n][0]                 # id reasignado
+    for pid_reg in opciones:
+        mapa.setdefault(pid_reg, pid_reg)
+
+    _CACHE_MAPA_POLL["datos"] = (mapa, opciones, ambiguos)
+    _CACHE_MAPA_POLL["ts"] = ahora
+    return mapa, opciones, ambiguos
+
+
+@app.get("/pushes/bloqueados-v2")
+def pushes_bloqueados_v2(x_api_key: str | None = Header(default=None), horas: int | None = None):
+    """
+    Igual que `/pushes/bloqueados` pero resolviendo los poll_id que Treble
+    reasignó. Informa aparte cuánto recupera respecto del cruce viejo.
+    """
+    _chequear_clave(x_api_key)
+    ventana = int(horas) if horas else REINTENTO_HORAS_ATRAS
+    filas = _bloqueados_pendientes(ventana)
+    mapa, opciones, ambiguos = _mapa_poll_a_push_registrado()
+
+    recuperables_v1 = sum(1 for f in filas if str(f["pid"]) in opciones)
+    recuperables_v2, sin_resolver = 0, {}
+    for f in filas:
+        pid = str(f["pid"])
+        if pid in mapa:
+            recuperables_v2 += 1
+        else:
+            sin_resolver[pid] = sin_resolver.get(pid, 0) + 1
+
+    return {
+        "ventana_horas": ventana,
+        "pendientes": len(filas),
+        "reintentables_cruce_viejo": recuperables_v1,
+        "reintentables_ahora": recuperables_v2,
+        "rescatados_por_nombre": recuperables_v2 - recuperables_v1,
+        "sin_resolver": sorted(
+            [{"poll_id": k, "casos": v} for k, v in sin_resolver.items()],
+            key=lambda x: -x["casos"])[:20],
+        "nombres_ambiguos": [
+            {"nombre": n, "ids_registrados": ids} for n, ids in ambiguos.items()],
+        "nota": ("Un poll_id 'sin resolver' es un push que nunca estuvo en `enviar_push`, "
+                 "o cuyo nombre no aparece en el DWH del último año. Antes de darle de alta "
+                 "un workflow, verificá que no sea un id viejo de un push que YA existe: "
+                 "crear el workflow duplicaría los envíos."),
+    }
+
+
+@app.post("/pushes/reintentar-v2")
+def pushes_reintentar_v2(
+    x_api_key: str | None = Header(default=None),
+    aplicar: str | None = None,
+    horas: int | None = None,
+    tope: int | None = None,
+):
+    """
+    Reintento con el mapa por nombre. DRY-RUN por defecto.
+
+    Comparte la tabla de eventos con `/pushes/reintentar` (`reintento_push`
+    + deployment_id), así que los dos no se pisan: lo que uno reenvió, el
+    otro lo saltea.
+    """
+    _chequear_clave(x_api_key)
+    escribir = _a_bool(aplicar, por_defecto=False)
+    ventana = int(horas) if horas else REINTENTO_HORAS_ATRAS
+    limite = min(int(tope), REINTENTO_MAX_POR_CORRIDA) if tope else REINTENTO_MAX_POR_CORRIDA
+
+    filas = _bloqueados_pendientes(ventana)
+    mapa, opciones, ambiguos = _mapa_poll_a_push_registrado()
+
+    plan, omitidos = [], {"sin_workflow": 0, "sin_contacto": 0, "ya_reintentado": 0}
+    for f in filas:
+        pid = str(f["pid"])
+        destino = mapa.get(pid)
+        if not destino:
+            omitidos["sin_workflow"] += 1
+            continue
+        hs_id = str(f.get("hubspot_id") or "").strip()
+        if not hs_id.isdigit():
+            omitidos["sin_contacto"] += 1
+            continue
+        if _evento_ya_notificado("reintento_push", f["did"]):
+            omitidos["ya_reintentado"] += 1
+            continue
+        plan.append({
+            "deployment_id": f["did"], "hubspot_id": hs_id,
+            "poll_id_original": pid, "conversation_id": destino,
+            "reasignado": destino != pid,
+            "push": opciones.get(destino, ""),
+            "telefono": _mask_phone(f"{f['cc']}{f['cel']}"),
+        })
+        if len(plan) >= limite:
+            break
+
+    res = {
+        "modo": "aplicado" if escribir else "simulacion",
+        "ventana_horas": ventana, "tope": limite,
+        "pendientes_totales": len(filas),
+        "a_reintentar": len(plan),
+        "de_esos_por_id_reasignado": sum(1 for p in plan if p["reasignado"]),
+        "omitidos": omitidos,
+        "nombres_ambiguos_excluidos": len(ambiguos),
+        "muestra": plan[:15],
+    }
+    if not escribir:
+        res["aviso"] = "Simulación. Para reintentar de verdad: POST /pushes/reintentar-v2?aplicar=true"
+        return res
+
+    enviados, errores = 0, []
+    for item in plan:
+        try:
+            _hubspot_api("PATCH", f"/crm/v3/objects/contacts/{item['hubspot_id']}",
+                         {"properties": {PROP_ENVIAR_PUSH: f"PUSH_{item['conversation_id']}"}})
+            _evento_marcar("reintento_push", item["deployment_id"], "notified", notified=True)
+            enviados += 1
+        except Exception as e:
+            errores.append({"hubspot_id": item["hubspot_id"], "error": str(e)[:200]})
+    res.update({"reenviados": enviados, "errores": errores})
+    log.warning(f"[reintento-v2] reenviados={enviados} reasignados="
+                f"{res['de_esos_por_id_reasignado']} errores={len(errores)}")
+    return res
