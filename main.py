@@ -2022,7 +2022,7 @@ def version_bloques(x_api_key: str | None = Header(default=None)):
     _chequear_clave(x_api_key)
     return {
         "base": "1.3.3",
-        "bloques": ["workflows_push (1.3.4)", "cohorte_renovaciones (1.3.5)", "reintento_pushes (1.3.5)", "contador_sesiones (1.3.6)", "workflows_crudo (1.3.7)", "riesgo_cancelacion (1.3.8)", "salud_mensajeria (1.3.9)", "correccion_veteranos (1.4.0)", "salud_detalle (1.4.1)", "arreglos_cruce_y_auditoria (1.4.2)", "reintento_automatico (1.4.2)", "cobertura_bifurcacion (1.4.2)", "sesiones_agendadas (1.4.3)", "monitor_riesgo (1.4.4)", "riesgo_lista_v2 (1.4.4)", "segmento_dormant (1.4.5)", "parte_operativo (1.4.6)", "reintento_por_nombre (1.4.7)", "caducidad_reintento (1.4.8)"],
+        "bloques": ["workflows_push (1.3.4)", "cohorte_renovaciones (1.3.5)", "reintento_pushes (1.3.5)", "contador_sesiones (1.3.6)", "workflows_crudo (1.3.7)", "riesgo_cancelacion (1.3.8)", "salud_mensajeria (1.3.9)", "correccion_veteranos (1.4.0)", "salud_detalle (1.4.1)", "arreglos_cruce_y_auditoria (1.4.2)", "reintento_automatico (1.4.2)", "cobertura_bifurcacion (1.4.2)", "sesiones_agendadas (1.4.3)", "monitor_riesgo (1.4.4)", "riesgo_lista_v2 (1.4.4)", "segmento_dormant (1.4.5)", "parte_operativo (1.4.6)", "reintento_por_nombre (1.4.7)", "caducidad_reintento (1.4.8)", "pedidos_v2 (1.4.9)"],
         "endpoints_nuevos": [
             "POST /cohorte/setup", "POST /cohorte/procesar",
             "GET /cohorte/renovaciones", "GET /cohorte/kpis",
@@ -2036,7 +2036,7 @@ def version_bloques(x_api_key: str | None = Header(default=None)):
             "GET /sesiones/polls", "GET /auditoria/contactos",
             "GET /pushes/reintento-estado",
             "POST /sesiones/completar-nuevos", "GET /sesiones/cobertura",
-            "GET /sesiones/senal", "POST /sesiones/recalcular-agendadas", "GET /riesgo/lista-v2", "GET /riesgo/monitor-estado", "GET /riesgo/dormant", "GET /riesgo/embudo-retencion", "GET /operativo/parte", "POST /operativo/enviar", "GET /pushes/bloqueados-v2", "POST /pushes/reintentar-v2", "GET /pushes/caducidad",
+            "GET /sesiones/senal", "POST /sesiones/recalcular-agendadas", "GET /riesgo/lista-v2", "GET /riesgo/monitor-estado", "GET /riesgo/dormant", "GET /riesgo/embudo-retencion", "GET /operativo/parte", "POST /operativo/enviar", "GET /pushes/bloqueados-v2", "POST /pushes/reintentar-v2", "GET /pushes/caducidad", "POST /pedidos/setup", "GET /pedidos/pendientes",
         ],
     }
 
@@ -5509,3 +5509,355 @@ def arrancar_reintento_v2():
     threading.Thread(target=_reintento_v2_monitor_loop, daemon=True).start()
     log.warning(f"[startup] reintento v2 activo · cada {REINTENTO_CADA_MINUTOS} min "
                 f"entre las {REINTENTO_HORA_DESDE} y las {REINTENTO_HORA_HASTA} UTC")
+
+
+# ══════════════════════════════════════════════════════════════════
+#  PEDIDOS DE ESPECIALISTA — QUE LLEGUEN UNA VEZ Y CON CONTEXTO
+#  Agregado 11/09/2026 (v1.4.9). BLOQUE PURAMENTE ADITIVO.
+#
+#  ── Qué estaba pasando ────────────────────────────────────────────
+#  El mismo pedido se publicó 10 veces en #pedidos-especialista. El de
+#  la clienta 43811 salió el 8/9 a las 10:03, 10:38, 10:46 y 13:35; el
+#  9/9; dos veces el 10/9; y tres veces el 11/9.
+#
+#  Son dos bugs encadenados:
+#
+#  1. `_pedidos_monitor_loop` arranca con `_evento_seed_baseline(...)`,
+#     que graba status `'baseline'`. Pero `_evento_ya_notificado()`
+#     devuelve True SOLO si el status es `'notified'`. La foto inicial
+#     no protege nada: en el primer ciclo los publica todos.
+#
+#  2. Esa tabla vive en `/tmp` de Render y se borra en cada redeploy.
+#     Cinco deploys en dos días = cinco rondas de republicación.
+#
+#  ── El arreglo ────────────────────────────────────────────────────
+#  La marca de "ya avisado" se guarda EN EL TICKET DE HUBSPOT, que es
+#  donde vive el dato. Sobrevive deploys, reinicios y borrados de /tmp.
+#
+#  Y de paso lo que hacía que el canal "no sirviera de mucho":
+#   · El mensaje traía solo "Cliente ID: 43811". Ahora trae la ficha
+#     —nombre, plan, pago, sesiones, riesgo— para resolver sin abrir
+#     HubSpot, y marca los datos rotos que encuentra.
+#   · El clasificador mandaba 5 de cada 6 a "Otro" porque buscaba
+#     frases literales de ejemplos viejos ("postergar" cuando la
+#     especialista escribe "paralizarse su pago").
+#   · Los pendientes se repetían en vez de recordarse. Ahora hay un
+#     resumen diario de lo que lleva días trabado — los de 14 días
+#     estaban invisibles entre las repeticiones.
+#
+#  Nada de esto reemplaza el monitor viejo: se enciende con
+#  PEDIDOS_V2_ACTIVO=true y el viejo se apaga con el suyo. Dos hilos
+#  publicando a la vez duplicarían los avisos.
+# ══════════════════════════════════════════════════════════════════
+
+PEDIDOS_V2_ACTIVO = os.environ.get("PEDIDOS_V2_ACTIVO", "false")
+PEDIDOS_PROP_AVISADO = os.environ.get("PEDIDOS_PROP_AVISADO", "pedido_avisado_slack")
+PEDIDOS_DIAS_PARA_RECORDAR = int(os.environ.get("PEDIDOS_DIAS_PARA_RECORDAR", "3"))
+PEDIDOS_RESUMEN_HORA_UTC = int(os.environ.get("PEDIDOS_RESUMEN_HORA_UTC", "12"))
+
+for _m in ("pedidos_v2_avisados", "pedidos_resumenes_enviados"):
+    METRICAS.setdefault(_m, 0)
+
+
+# ── 1 · La marca vive en HubSpot, no en /tmp ──────────────────────
+
+def _pedidos_prop_existe():
+    try:
+        _hubspot_api("GET", f"/crm/v3/properties/tickets/{PEDIDOS_PROP_AVISADO}")
+        return True
+    except Exception:
+        return False
+
+
+@app.post("/pedidos/setup")
+def pedidos_setup(x_api_key: str | None = Header(default=None)):
+    """Crea la propiedad del ticket si no existe. Idempotente."""
+    _chequear_clave(x_api_key)
+    if _pedidos_prop_existe():
+        return {"creada": False, "motivo": "ya existía", "propiedad": PEDIDOS_PROP_AVISADO}
+    _hubspot_api("POST", "/crm/v3/properties/tickets", {
+        "name": PEDIDOS_PROP_AVISADO,
+        "label": "Pedido avisado en Slack",
+        "description": ("Fecha en que el bridge publicó este pedido en #pedidos-especialista. "
+                        "Si está vacía, todavía no se avisó. Sirve para no repetir el aviso "
+                        "cuando Render reinicia y se borra la base local."),
+        "groupName": "ticketinformation",
+        "type": "string",
+        "fieldType": "text",
+    })
+    log.warning(f"[pedidos-v2] propiedad {PEDIDOS_PROP_AVISADO} creada")
+    return {"creada": True, "propiedad": PEDIDOS_PROP_AVISADO}
+
+
+def _pedidos_tickets_con_marca():
+    """Los pedidos de la bandeja, cada uno con su marca de avisado."""
+    body = {
+        "filterGroups": [{"filters": [
+            {"propertyName": "hs_pipeline", "operator": "EQ", "value": PIPELINE_ADMINISTRACION},
+            {"propertyName": "hs_pipeline_stage", "operator": "EQ", "value": STAGE_BANDEJA_ENTRADA},
+        ]}],
+        "properties": ["subject", "content", "createdate", PEDIDOS_PROP_AVISADO],
+        "limit": 100,
+    }
+    data = _hubspot_request("POST", "/crm/v3/objects/tickets/search", body)
+    salida = []
+    for r in (data.get("results") or []):
+        s = (r["properties"].get("subject") or "").strip().lower()
+        if s.startswith("pedido de especialista"):
+            salida.append(r)
+    return salida
+
+
+def _pedidos_marcar_avisado(ticket_id):
+    _hubspot_api("PATCH", f"/crm/v3/objects/tickets/{ticket_id}",
+                 {"properties": {PEDIDOS_PROP_AVISADO: datetime.now(timezone.utc).isoformat()}})
+
+
+# ── 2 · La ficha del cliente ──────────────────────────────────────
+
+PEDIDOS_PROPS_FICHA = [
+    "firstname", "lastname", "yopsi_id", "plan", "tipo_de_plan", "lifecyclestage",
+    "sesiones_asistidas", "dias_sin_sesion", "riesgo_cancelacion", "sesiones_etapa",
+    "fecha_ultimo_pago", "especialista_label", "hs_whatsapp_phone_number", "phone",
+]
+
+
+def _pedidos_ficha_cliente(id_cliente):
+    """
+    Todo lo que hace falta para resolver el pedido sin abrir HubSpot.
+    Devuelve None si no se encuentra — que ya es información: significa
+    que el ID que puso la especialista no existe en el CRM.
+    """
+    if not str(id_cliente).isdigit():
+        return None
+    try:
+        data = _hubspot_request("POST", "/crm/v3/objects/contacts/search", {
+            "filterGroups": [{"filters": [
+                {"propertyName": "yopsi_id", "operator": "EQ", "value": str(id_cliente)}]}],
+            "properties": PEDIDOS_PROPS_FICHA, "limit": 1,
+        })
+    except Exception as e:
+        log.error(f"[pedidos-v2] no se pudo buscar el contacto {id_cliente}: {e}")
+        return None
+    res = data.get("results") or []
+    if not res:
+        return None
+    p = res[0].get("properties") or {}
+    p["_hs_id"] = res[0].get("id")
+    return p
+
+
+def _pedidos_alertas_del_dato(p):
+    """
+    Datos rotos que conviene ver junto al pedido. Salieron de casos
+    reales: la clienta 43811 tiene `hs_whatsapp_phone_number` = "+1Sbiondo",
+    que no es un teléfono — si alguien le manda un push, nunca llega.
+    """
+    alertas = []
+    wa = str(p.get("hs_whatsapp_phone_number") or "")
+    if wa and not re.fullmatch(r"\+?\d{7,15}", wa.replace(" ", "")):
+        alertas.append(f"WhatsApp inválido en el CRM: `{wa}`")
+    if str(p.get("riesgo_cancelacion") or "") == "alto":
+        d = p.get("dias_sin_sesion")
+        alertas.append(f"riesgo de cancelación ALTO ({d} días sin sesión)" if d
+                       else "riesgo de cancelación ALTO")
+    fp = str(p.get("fecha_ultimo_pago") or "")
+    if fp:
+        try:
+            dias = (datetime.now(timezone.utc).date() - datetime.fromisoformat(fp[:10]).date()).days
+            if dias > 40:
+                alertas.append(f"último pago hace {dias} días ({fp[:10]})")
+        except Exception:
+            pass
+    if str(p.get("lifecyclestage") or "") not in ("customer", ""):
+        alertas.append(f"ya no figura como cliente activo (`{p.get('lifecyclestage')}`)")
+    return alertas
+
+
+def _pedidos_texto_ficha(id_cliente):
+    p = _pedidos_ficha_cliente(id_cliente)
+    if p is None:
+        return [f"_No se encontró ningún contacto con Yopsi ID {id_cliente} en HubSpot._"]
+
+    nombre = " ".join(x for x in [p.get("firstname"), p.get("lastname")] if x) or "sin nombre"
+    campos = []
+    if p.get("tipo_de_plan") or p.get("plan"):
+        campos.append(f"plan {p.get('tipo_de_plan') or p.get('plan')}")
+    if p.get("especialista_label"):
+        campos.append(f"especialista {p['especialista_label']}")
+    if p.get("sesiones_asistidas"):
+        campos.append(f"{p['sesiones_asistidas']} sesiones")
+    if p.get("dias_sin_sesion"):
+        campos.append(f"{p['dias_sin_sesion']} días sin sesión")
+    if p.get("fecha_ultimo_pago"):
+        campos.append(f"último pago {str(p['fecha_ultimo_pago'])[:10]}")
+
+    lineas = [f"*Cliente:* {nombre} · {' · '.join(campos) if campos else 'sin datos en el CRM'}"]
+    if p.get("_hs_id"):
+        lineas.append(f"<https://app.hubspot.com/contacts/{ACCOUNT_ID}/record/0-1/{p['_hs_id']}|Ver ficha del cliente>")
+    for a in _pedidos_alertas_del_dato(p):
+        lineas.append(f":warning: {a}")
+    return lineas
+
+
+# ── 3 · Clasificador con el vocabulario que usan de verdad ────────
+# Las keywords viejas venían de ejemplos de hace meses. Estas salieron
+# de leer los pedidos reales del canal. Orden = prioridad.
+PEDIDOS_REGLAS = [
+    ("🔴 SENSIBLE — requiere revisión humana, no automatizar", [
+        "hospitaliz", "salud", "grave", "riesgo", "hematocrito", "no volverá",
+        "no insistir", "delicad", "suicid", "crisis", "duelo", "emergencia"]),
+    ("Postergar pago", [
+        "postergar", "posterg", "paralizar", "paralizarse", "pausar el cobro",
+        "cobrarse", "cobrársele", "detener el pago", "aplazar", "congelar el pago",
+        "no se le cobre", "más adelante el cobro"]),
+    ("Pausar plan", ["pausar el plan", "pausa su plan", "pausa el plan", "congelar el plan"]),
+    ("Cambio de especialista", [
+        "cambio de especialista", "no es mi paciente", "no la he atendido",
+        "no lo he atendido", "no es mi cliente", "reasignar", "cambio de terapeuta"]),
+    ("Problema de plan o facturación", [
+        "renovó el plan", "cambió a plan", "plan básico", "plan premium",
+        "le cobraron", "cobro duplicado", "sesiones acumuladas", "próxima renovación",
+        "no corresponde el plan"]),
+    ("Reagendar sesión", [
+        "reagendar", "cambiar horario", "reprogramar", "próxima cita",
+        "no logre reagendar", "correr la sesión", "mover la sesión"]),
+    ("Seguimiento / contactar cliente", [
+        "comunicarse con la cliente", "comunicarse con el cliente", "contactar",
+        "no responde", "no lee sus mensajes", "no la veo", "no ha asistido",
+        "se pudieran comunicar", "no contesta", "hablar con la cliente"]),
+    ("Corrección de estado de sesión", [
+        "cambiar el estatus", "marcar completada", "corregir estado", "se fue la luz",
+        "desconect", "no logre marcar", "quedó como inasistencia", "marcar la sesión"]),
+    ("Soporte técnico / sistema", [
+        "app descargada", "no la tiene descargada", "no le permite", "no me aparece",
+        "no la encuentro", "no puedo agendar", "error", "no carga", "se dejó libre"]),
+]
+
+
+def _pedidos_clasificar_v2(subject, content):
+    t = _norm_push(f"{subject} {content}")
+    for categoria, claves in PEDIDOS_REGLAS:
+        if any(_norm_push(k) in t for k in claves):
+            return categoria
+    return "Otro — revisar manualmente"
+
+
+def _pedidos_publicar_v2(r):
+    p = r["properties"]
+    subject, content = p.get("subject") or "", p.get("content") or ""
+    cat = _pedidos_clasificar_v2(subject, content)
+    nombre = _pedidos_extraer_nombre(subject)
+    id_cliente = _pedidos_extraer_id(subject, content)
+    emoji = PEDIDOS_EMOJI.get(cat, "•")
+
+    partes = [f"{emoji} *Nuevo pedido de especialista*",
+              f"*Categoría:* {cat}",
+              f"*Especialista:* {nombre}"]
+    partes += _pedidos_texto_ficha(id_cliente)
+    partes += ["", "*Lo que pide:*", f"> {content}"]
+
+    draft = PEDIDOS_DRAFTS.get(cat)
+    if draft:
+        try:
+            partes += ["", "*:speech_balloon: Borrador de respuesta:*",
+                       f"> {draft.format(nombre=nombre, id_cliente=id_cliente)}"]
+        except Exception:
+            pass
+    partes += ["", f"<https://app.hubspot.com/contacts/{ACCOUNT_ID}/record/0-5/{r['id']}|Abrir ticket en HubSpot>"]
+    _slack_enviar(PEDIDOS_SLACK_WEBHOOK_URL, "\n".join(partes), nombre="pedidos_v2")
+
+
+# ── 4 · Recordatorio en vez de repetición ─────────────────────────
+# Los webhooks entrantes de Slack no devuelven el ts del mensaje, así que
+# no se puede responder dentro del hilo original. En su lugar va UN
+# resumen diario con todo lo trabado: los pedidos de 14 días estaban
+# invisibles justamente porque se perdían entre las repeticiones.
+
+def _pedidos_resumen_pendientes():
+    tickets = _pedidos_tickets_con_marca()
+    hoy = datetime.now(timezone.utc)
+    viejos = []
+    for r in tickets:
+        cd = str(r["properties"].get("createdate") or "")
+        if not cd:
+            continue
+        try:
+            dias = (hoy - datetime.fromisoformat(cd.replace("Z", "+00:00"))).days
+        except Exception:
+            continue
+        if dias >= PEDIDOS_DIAS_PARA_RECORDAR:
+            viejos.append((dias, r))
+    if not viejos:
+        return None
+    viejos.sort(key=lambda x: -x[0])
+
+    L = [f"*Pedidos de especialista trabados* — {len(viejos)} llevan "
+         f"{PEDIDOS_DIAS_PARA_RECORDAR} días o más en bandeja de entrada", ""]
+    for dias, r in viejos[:15]:
+        subject = r["properties"].get("subject") or ""
+        nombre = _pedidos_extraer_nombre(subject)
+        idc = _pedidos_extraer_id(subject, r["properties"].get("content") or "")
+        L.append(f"• *{dias} días* — {nombre} · cliente {idc} · "
+                 f"<https://app.hubspot.com/contacts/{ACCOUNT_ID}/record/0-5/{r['id']}|abrir>")
+    L += ["", "_Se cierran moviéndolos de etapa en HubSpot. Mientras sigan en "
+          "bandeja de entrada vuelven a aparecer acá._"]
+    return "\n".join(L)
+
+
+@app.get("/pedidos/pendientes")
+def pedidos_pendientes(x_api_key: str | None = Header(default=None)):
+    """Los pedidos trabados, sin publicar nada."""
+    _chequear_clave(x_api_key)
+    texto = _pedidos_resumen_pendientes()
+    return {"generado": datetime.now(timezone.utc).isoformat(),
+            "hay_pendientes": bool(texto), "texto_slack": texto}
+
+
+def _pedidos_v2_loop():
+    while True:
+        try:
+            tickets = _pedidos_tickets_con_marca()
+            nuevos = [r for r in tickets if not (r["properties"].get(PEDIDOS_PROP_AVISADO) or "").strip()]
+            for r in nuevos:
+                try:
+                    if PEDIDOS_SLACK_WEBHOOK_URL:
+                        _pedidos_publicar_v2(r)
+                    # La marca va DESPUÉS de publicar: si Slack falla, el
+                    # ticket queda sin marcar y se reintenta en el próximo
+                    # ciclo. Al revés se perdería el aviso para siempre.
+                    _pedidos_marcar_avisado(r["id"])
+                    METRICAS["pedidos_v2_avisados"] += 1
+                    log.warning(f"[pedidos-v2] avisado ticket {r['id']}")
+                except Exception as e:
+                    log.error(f"[pedidos-v2] fallo con el ticket {r['id']}: {e}")
+
+            ahora = datetime.now(timezone.utc)
+            if ahora.hour == PEDIDOS_RESUMEN_HORA_UTC:
+                marca = str(ahora.date())
+                if not _evento_ya_notificado("pedidos_resumen", marca):
+                    texto = _pedidos_resumen_pendientes()
+                    if texto and PEDIDOS_SLACK_WEBHOOK_URL:
+                        _slack_enviar(PEDIDOS_SLACK_WEBHOOK_URL, texto, nombre="pedidos_resumen")
+                        METRICAS["pedidos_resumenes_enviados"] += 1
+                    _evento_marcar("pedidos_resumen", marca, "notified", notified=True)
+        except Exception as e:
+            log.error(f"[pedidos-v2] error en la revisión: {e}")
+        time.sleep(max(60, PEDIDOS_POLL_INTERVAL_SECONDS))
+
+
+@app.on_event("startup")
+def arrancar_pedidos_v2():
+    if not _a_bool(PEDIDOS_V2_ACTIVO, por_defecto=False):
+        return
+    if not PEDIDOS_SLACK_WEBHOOK_URL:
+        log.warning("[startup] pedidos v2 no arranca — falta PEDIDOS_SLACK_WEBHOOK_URL")
+        return
+    if not _pedidos_prop_existe():
+        log.error(f"[startup] pedidos v2 NO arranca: falta la propiedad "
+                  f"{PEDIDOS_PROP_AVISADO}. Creala con POST /pedidos/setup. Sin ella no hay "
+                  f"forma de saber qué se avisó y se repetiría todo.")
+        return
+    threading.Thread(target=_pedidos_v2_loop, daemon=True).start()
+    log.warning("[startup] pedidos v2 activo · dedup en HubSpot, ficha del cliente y "
+                f"resumen de trabados a las {PEDIDOS_RESUMEN_HORA_UTC}:00 UTC")
