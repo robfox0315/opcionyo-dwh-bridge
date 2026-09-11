@@ -2022,7 +2022,7 @@ def version_bloques(x_api_key: str | None = Header(default=None)):
     _chequear_clave(x_api_key)
     return {
         "base": "1.3.3",
-        "bloques": ["workflows_push (1.3.4)", "cohorte_renovaciones (1.3.5)", "reintento_pushes (1.3.5)", "contador_sesiones (1.3.6)", "workflows_crudo (1.3.7)", "riesgo_cancelacion (1.3.8)", "salud_mensajeria (1.3.9)", "correccion_veteranos (1.4.0)", "salud_detalle (1.4.1)", "arreglos_cruce_y_auditoria (1.4.2)", "reintento_automatico (1.4.2)", "cobertura_bifurcacion (1.4.2)", "sesiones_agendadas (1.4.3)", "monitor_riesgo (1.4.4)", "riesgo_lista_v2 (1.4.4)", "segmento_dormant (1.4.5)", "parte_operativo (1.4.6)", "reintento_por_nombre (1.4.7)", "caducidad_reintento (1.4.8)", "pedidos_v2 (1.4.9)", "webhook_propio_pedidos (1.5.0)", "sla_v2 (1.5.1)", "partes_sin_repetir (1.5.2)"],
+        "bloques": ["workflows_push (1.3.4)", "cohorte_renovaciones (1.3.5)", "reintento_pushes (1.3.5)", "contador_sesiones (1.3.6)", "workflows_crudo (1.3.7)", "riesgo_cancelacion (1.3.8)", "salud_mensajeria (1.3.9)", "correccion_veteranos (1.4.0)", "salud_detalle (1.4.1)", "arreglos_cruce_y_auditoria (1.4.2)", "reintento_automatico (1.4.2)", "cobertura_bifurcacion (1.4.2)", "sesiones_agendadas (1.4.3)", "monitor_riesgo (1.4.4)", "riesgo_lista_v2 (1.4.4)", "segmento_dormant (1.4.5)", "parte_operativo (1.4.6)", "reintento_por_nombre (1.4.7)", "caducidad_reintento (1.4.8)", "pedidos_v2 (1.4.9)", "webhook_propio_pedidos (1.5.0)", "sla_v2 (1.5.1)", "partes_sin_repetir (1.5.2)", "alcance_cola_reintento (1.5.3)"],
         "endpoints_nuevos": [
             "POST /cohorte/setup", "POST /cohorte/procesar",
             "GET /cohorte/renovaciones", "GET /cohorte/kpis",
@@ -6218,6 +6218,35 @@ def partes_estado(x_api_key: str | None = Header(default=None)):
 
 # ── Bug 2 · el reintento, contado de verdad ───────────────────────
 
+_CACHE_POLLS_ATC = {"datos": None, "ts": 0.0}
+
+
+def _polls_de_atc(forzar=False):
+    """
+    Padrón de poll_id de la cuenta de ATC. `_nombre_de_poll` no sirve para
+    esto: descarta los que tienen `poll_name` vacío, y un push nuestro sin
+    nombre terminaría contado como de captación. Cache de 1 h.
+    """
+    ahora = time.time()
+    if not forzar and _CACHE_POLLS_ATC["datos"] is not None and (ahora - _CACHE_POLLS_ATC["ts"]) < 3600:
+        return _CACHE_POLLS_ATC["datos"]
+    try:
+        filas = _query_interna(f"""
+            SELECT DISTINCT toString(poll_id) pid
+            FROM fact_deployment_status
+            WHERE company_id = {int(SALUD_COMPANY_ID)}
+              AND timestamps_eta >= now() - INTERVAL 365 DAY""") or []
+        salida = {str(f["pid"]) for f in filas if f.get("pid")}
+    except Exception as e:
+        # Sin padrón no se filtra: sub-reportar el alcance es peor que
+        # informar de más, pero inventar una separación falsa es lo peor.
+        log.error(f"[reintento] no se pudo armar el padrón de polls de ATC: {e}")
+        return None
+    _CACHE_POLLS_ATC["datos"] = salida
+    _CACHE_POLLS_ATC["ts"] = ahora
+    return salida
+
+
 _salud_armar_v142 = _salud_armar
 
 
@@ -6238,18 +6267,34 @@ def _salud_armar():
         filas = _bloqueados_pendientes(REINTENTO_HORAS_ATRAS) or []
         mapa, _opciones, _ambiguos = _mapa_poll_a_push_registrado()
         nombres = _nombre_de_poll()
-        recuperables = caducados = sin_alta = 0
+        # `_bloqueados_pendientes` filtra por origin pero NO por cuenta: trae
+        # también los de captación (25468), que no son nuestro alcance. Por eso
+        # daba 287 sobre 231 — un "subconjunto" mayor que el total.
+        # Si el padrón no se pudo armar viene None: ahí no se filtra nada
+        # (informar de más es preferible a inventar una separación falsa) y se
+        # deja constancia en el parte.
+        padron = _polls_de_atc()
+        solo_atc = padron is not None
+        recuperables = caducados = sin_alta = otra_cuenta = 0
+        en_cola = 0
         for f in filas:
-            if str(f.get("pid")) not in (mapa or {}):
+            pid = str(f.get("pid"))
+            if solo_atc and pid not in padron:
+                otra_cuenta += 1
+                continue
+            en_cola += 1
+            if pid not in (mapa or {}):
                 sin_alta += 1
             elif _caducado(f, nombres):
                 caducados += 1
             else:
                 recuperables += 1
-        r["reintento_en_cola"] = len(filas)
+        r["reintento_en_cola"] = en_cola
         r["reintento_recuperables"] = recuperables
         r["reintento_caducados"] = caducados
         r["reintento_sin_alta"] = sin_alta
+        r["reintento_otra_cuenta"] = otra_cuenta
+        r["reintento_alcance_atc"] = solo_atc
         r["reintento_automatico"] = (
             _a_bool(globals().get("REINTENTO_V2_AUTOMATICO"), por_defecto=False)
             or _a_bool(globals().get("REINTENTO_AUTOMATICO"), por_defecto=True))
@@ -6279,16 +6324,21 @@ def _salud_texto(r):
         bloq = r.get("reintento_bloqueados_72h")
         auto = r.get("reintento_automatico")
 
-        cabeza = (f"*Reintento:* {bloq} pushes quedaron bloqueados en 72 h por chat abierto; "
-                  f"*{cola}* ya tienen la conversación cerrada."
-                  if bloq else
-                  f"*Reintento:* *{cola}* pushes bloqueados ya tienen la conversación cerrada.")
+        # OJO con mezclar: `bloq` cuenta los bloqueados de ATC de las últimas
+        # 72 h; `cola` cuenta los que ya tienen el chat cerrado y por lo tanto
+        # se pueden volver a intentar, que incluye envíos anteriores a esa
+        # ventana. No son total y subconjunto: son dos preguntas distintas, y
+        # presentarlas como una sola fue el error de la v1.5.2.
+        cabeza = (f"*Reintento:* {bloq} pushes se bloquearon en las últimas 72 h por chat "
+                  f"abierto. En la cola de reenvío hay *{cola}* que ya tienen la conversación "
+                  f"cerrada." if bloq else
+                  f"*Reintento:* hay *{cola}* pushes bloqueados con la conversación ya cerrada.")
 
         if cola == 0:
             # Nada en cola no es un problema: es el estado sano. Una línea alcanza.
-            cabeza = (f"*Reintento:* {bloq} pushes quedaron bloqueados en 72 h por chat abierto, "
-                      f"pero ninguno tiene todavía la conversación cerrada: no hay nada que "
-                      f"reenviar ahora mismo." if bloq else
+            cabeza = (f"*Reintento:* {bloq} pushes se bloquearon en las últimas 72 h por chat "
+                      f"abierto, pero ninguno tiene todavía la conversación cerrada: no hay "
+                      f"nada que reenviar ahora mismo." if bloq else
                       "*Reintento:* no hay pushes esperando reenvío.")
             detalle = []
 
@@ -6308,6 +6358,15 @@ def _salud_texto(r):
                            f"Antes de darla de alta verificá en `/pushes/bloqueados-v2` que no "
                            f"sea un id viejo de un push que ya existe: crear el workflow "
                            f"duplicaría los envíos.")
+
+        otra = r.get("reintento_otra_cuenta") or 0
+        if otra:
+            detalle.append(f"  • _(Aparte hay {otra} bloqueados de la cuenta de captación. "
+                           f"No son nuestro alcance y el reintento no los toca.)_")
+        if r.get("reintento_alcance_atc") is False:
+            detalle.append("  • :warning: _El DWH no devolvió los nombres de push, así que no se "
+                           "pudo separar la cuenta de ATC de la de captación: los números de "
+                           "arriba pueden estar inflados._")
 
         nuevo = cabeza + ("\n" + "\n".join(detalle) if detalle else "")
 
