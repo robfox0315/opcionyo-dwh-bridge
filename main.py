@@ -2022,7 +2022,7 @@ def version_bloques(x_api_key: str | None = Header(default=None)):
     _chequear_clave(x_api_key)
     return {
         "base": "1.3.3",
-        "bloques": ["workflows_push (1.3.4)", "cohorte_renovaciones (1.3.5)", "reintento_pushes (1.3.5)", "contador_sesiones (1.3.6)", "workflows_crudo (1.3.7)", "riesgo_cancelacion (1.3.8)", "salud_mensajeria (1.3.9)", "correccion_veteranos (1.4.0)", "salud_detalle (1.4.1)", "arreglos_cruce_y_auditoria (1.4.2)", "reintento_automatico (1.4.2)", "cobertura_bifurcacion (1.4.2)", "sesiones_agendadas (1.4.3)", "monitor_riesgo (1.4.4)", "riesgo_lista_v2 (1.4.4)", "segmento_dormant (1.4.5)"],
+        "bloques": ["workflows_push (1.3.4)", "cohorte_renovaciones (1.3.5)", "reintento_pushes (1.3.5)", "contador_sesiones (1.3.6)", "workflows_crudo (1.3.7)", "riesgo_cancelacion (1.3.8)", "salud_mensajeria (1.3.9)", "correccion_veteranos (1.4.0)", "salud_detalle (1.4.1)", "arreglos_cruce_y_auditoria (1.4.2)", "reintento_automatico (1.4.2)", "cobertura_bifurcacion (1.4.2)", "sesiones_agendadas (1.4.3)", "monitor_riesgo (1.4.4)", "riesgo_lista_v2 (1.4.4)", "segmento_dormant (1.4.5)", "parte_operativo (1.4.6)"],
         "endpoints_nuevos": [
             "POST /cohorte/setup", "POST /cohorte/procesar",
             "GET /cohorte/renovaciones", "GET /cohorte/kpis",
@@ -2036,7 +2036,7 @@ def version_bloques(x_api_key: str | None = Header(default=None)):
             "GET /sesiones/polls", "GET /auditoria/contactos",
             "GET /pushes/reintento-estado",
             "POST /sesiones/completar-nuevos", "GET /sesiones/cobertura",
-            "GET /sesiones/senal", "POST /sesiones/recalcular-agendadas", "GET /riesgo/lista-v2", "GET /riesgo/monitor-estado", "GET /riesgo/dormant", "GET /riesgo/embudo-retencion",
+            "GET /sesiones/senal", "POST /sesiones/recalcular-agendadas", "GET /riesgo/lista-v2", "GET /riesgo/monitor-estado", "GET /riesgo/dormant", "GET /riesgo/embudo-retencion", "GET /operativo/parte", "POST /operativo/enviar",
         ],
     }
 
@@ -4838,3 +4838,202 @@ def riesgo_embudo_retencion(x_api_key: str | None = Header(default=None)):
         "nota": ("`sin_pedir_la_baja` ya excluye a quien mencionó cancelar, por tag o por el "
                  "texto del chat. Es sobre ese número que se arma cualquier campaña."),
     }
+
+
+# ══════════════════════════════════════════════════════════════════
+#  PARTE OPERATIVO A SLACK — INVERTIR EL SENTIDO DEL DATO
+#  Agregado 11/09/2026 (v1.4.6). BLOQUE PURAMENTE ADITIVO.
+#
+#  ── El problema que resuelve ──────────────────────────────────────
+#  La tarea programada que revisa Slack tres veces al día corre en un
+#  sandbox cuya política de red BLOQUEA este bridge y ClickHouse (403
+#  en el CONNECT del proxy). El 10/09 eso dejó sin responder tres de
+#  las cuatro preguntas de Iva, porque todas necesitaban el DWH.
+#
+#  El bloqueo no se puede levantar desde acá y no hay que buscarle la
+#  vuelta. Pero se puede invertir el sentido del dato:
+#
+#      ANTES:  sandbox  ──(bloqueado)──>  bridge  ──>  DWH
+#      AHORA:  bridge   ──(salida libre)──>  Slack  <──  sandbox
+#
+#  El bridge corre en Render y sí tiene salida. Si publica el estado
+#  operativo en Slack, la tarea lo lee con el MCP de Slack —que sí
+#  funciona— y puede responder con números reales aunque no alcance
+#  el DWH.
+#
+#  Sale a las 11:00 UTC por defecto, antes de la primera corrida de la
+#  tarea (13:00 UTC / 8:00 Colombia), para que siempre tenga el parte
+#  del día fresco.
+# ══════════════════════════════════════════════════════════════════
+
+OPERATIVO_ACTIVO = os.environ.get("OPERATIVO_ACTIVO", "true")
+OPERATIVO_HORA_UTC = int(os.environ.get("OPERATIVO_HORA_UTC", "11"))
+OPERATIVO_SLACK_WEBHOOK_URL = (
+    os.environ.get("OPERATIVO_SLACK_WEBHOOK_URL")
+    or os.environ.get("SALUD_SLACK_WEBHOOK_URL")
+    or os.environ.get("SLACK_WEBHOOK_URL")
+    or ""
+)
+
+# Botones cuya desaparición significa que un flujo perdió sus ramas.
+# El 03/09 se migró el recordatorio de 28hs y la plantilla nueva salió
+# sin botones: pasamos de ~1.300 confirmaciones semanales a 5, y nadie
+# lo notó durante una semana. Esto es la alarma para que no se repita.
+OPERATIVO_BOTONES_VIGILADOS = [
+    "Confirmar sesión", "Reagendar", "Confirmar",
+    "Todo estuvo bien", "Quiero que me escribas",
+]
+
+for _m in ("partes_operativos_enviados",):
+    METRICAS.setdefault(_m, 0)
+
+
+def _operativo_datos(dias=1):
+    """
+    Todo lo que la tarea programada no puede consultar por su cuenta,
+    en una sola pasada al DWH.
+    """
+    cia = int(SALUD_COMPANY_ID)
+    desde = f"now() - INTERVAL {int(dias)} DAY"
+
+    lag = _query_interna(
+        f"SELECT dateDiff('minute', max(timestamps_eta), now()) lag "
+        f"FROM fact_deployment_status WHERE company_id={cia}") or [{}]
+
+    total = _query_interna(f"""
+        SELECT count() env,
+               countIf(status IN ('DELIVERED','SUCCESS')) ent,
+               countIf(status='FAILURE_BY_META_CHOSE_NOT_DELIVER') meta,
+               countIf(status='FAILURE_BY_HUMAN_HANDOVER') chat,
+               countIf(status='FAILURE_BY_UNABLE_TO_CONTACT') muerto,
+               countIf(status='MISSING_PARAMETER') config
+        FROM fact_deployment_status
+        WHERE company_id={cia} AND timestamps_eta >= {desde}""") or [{}]
+
+    peores = _query_interna(f"""
+        SELECT argMax(poll_name, timestamps_eta) push, count() env,
+               round(100*countIf(status IN ('DELIVERED','SUCCESS'))/count(),1) pct,
+               countIf(status='FAILURE_BY_META_CHOSE_NOT_DELIVER') meta
+        FROM fact_deployment_status
+        WHERE company_id={cia} AND timestamps_eta >= {desde} AND poll_name != ''
+        GROUP BY poll_id HAVING env >= 10 ORDER BY pct ASC LIMIT 5""") or []
+
+    lista = ",".join("'" + b.replace("'", "") + "'" for b in OPERATIVO_BOTONES_VIGILADOS)
+    botones = _query_interna(f"""
+        SELECT answer_text b, count() n FROM fact_hsm_responses
+        WHERE company_id={cia} AND response_date >= {desde} AND answer_text IN ({lista})
+        GROUP BY b ORDER BY n DESC""") or []
+
+    # Una plantilla MARKETING con envíos es una bomba: rechaza el 56%.
+    marketing = _query_interna(f"""
+        SELECT d.name plantilla, count() respuestas
+        FROM fact_hsm_responses r
+        INNER JOIN dim_hsm d ON r.hsm_id = d.id AND d.company_id={cia}
+        WHERE r.company_id={cia} AND r.response_date >= {desde} AND d.category='MARKETING'
+        GROUP BY plantilla ORDER BY respuestas DESC LIMIT 5""") or []
+
+    return {
+        "lag_min": (lag[0] or {}).get("lag"),
+        "total": total[0] or {},
+        "peores": peores,
+        "botones": botones,
+        "plantillas_marketing_activas": marketing,
+    }
+
+
+def _operativo_texto(d):
+    t = d["total"] or {}
+    env = int(t.get("env") or 0)
+    ent = int(t.get("ent") or 0)
+    pct = round(100 * ent / env, 1) if env else 0.0
+
+    L = ["*Parte operativo de mensajería · últimas 24 h*",
+         f"Lag del DWH al generarlo: {d.get('lag_min')} min",
+         "",
+         f"*Envíos:* {env}  ·  *Entregados:* {ent} ({pct}%)"]
+
+    causas = [("Meta rechazó", t.get("meta")), ("chat abierto", t.get("chat")),
+              ("número muerto", t.get("muerto")), ("config nuestra", t.get("config"))]
+    hay = [f"{n}: {int(v)}" for n, v in causas if int(v or 0) > 0]
+    L.append("*No entregados:* " + (" · ".join(hay) if hay else "ninguno"))
+
+    if d["botones"]:
+        L.append("")
+        L.append("*Botones:* " + " · ".join(f"{b['b']} {b['n']}" for b in d["botones"]))
+    else:
+        L.append("")
+        L.append(":rotating_light: *Cero respuestas con botón en 24 h.* Si algún flujo se "
+                 "republicó, revisá que la plantilla nueva conserve sus botones — sin ellos "
+                 "las ramas quedan sueltas y no da error.")
+
+    if d["plantillas_marketing_activas"]:
+        L.append("")
+        L.append(":warning: *Plantillas MARKETING con actividad* (rechazan ~56% contra 0% de "
+                 "UTILITY): " + " · ".join(
+                     f"{m['plantilla']} ({m['respuestas']})" for m in d["plantillas_marketing_activas"]))
+
+    if d["peores"]:
+        L.append("")
+        L.append("*Peor entrega (con 10+ envíos):*")
+        for p in d["peores"]:
+            extra = f" · {p['meta']} rechazos de Meta" if int(p.get("meta") or 0) else ""
+            L.append(f"  · {p['push'] or 'sin nombre'} — {p['pct']}% de {p['env']}{extra}")
+
+    L.append("")
+    L.append("_Publicado por el bridge. La tarea de Slack lee esto cuando no alcanza el DWH._")
+    return "\n".join(L)
+
+
+@app.get("/operativo/parte")
+def operativo_parte(x_api_key: str | None = Header(default=None), dias: int = 1):
+    """El parte sin publicarlo, para revisarlo o pedirlo a demanda."""
+    _chequear_clave(x_api_key)
+    d = _operativo_datos(dias)
+    return {"generado": datetime.now(timezone.utc).isoformat(),
+            "ventana_dias": dias, "datos": d, "texto_slack": _operativo_texto(d)}
+
+
+@app.post("/operativo/enviar")
+def operativo_enviar(x_api_key: str | None = Header(default=None), dias: int = 1):
+    """Publica el parte ahora, sin esperar al horario."""
+    _chequear_clave(x_api_key)
+    if not OPERATIVO_SLACK_WEBHOOK_URL:
+        raise HTTPException(409, "Falta OPERATIVO_SLACK_WEBHOOK_URL (o SALUD_/SLACK_WEBHOOK_URL).")
+    texto = _operativo_texto(_operativo_datos(dias))
+    _slack_enviar(OPERATIVO_SLACK_WEBHOOK_URL, texto, nombre="parte_operativo")
+    METRICAS["partes_operativos_enviados"] += 1
+    return {"enviado": True, "caracteres": len(texto)}
+
+
+def _operativo_monitor_loop():
+    """
+    Una vez al día, antes de que corra la tarea programada de Slack.
+    Dedup contra la tabla de eventos, no contra memoria: si Render
+    levanta dos instancias, el canal recibiría el parte repetido.
+    """
+    while True:
+        try:
+            ahora = datetime.now(timezone.utc)
+            if ahora.hour == OPERATIVO_HORA_UTC:
+                marca = str(ahora.date())
+                if not _evento_ya_notificado("parte_operativo", marca):
+                    texto = _operativo_texto(_operativo_datos(1))
+                    _slack_enviar(OPERATIVO_SLACK_WEBHOOK_URL, texto, nombre="parte_operativo")
+                    _evento_marcar("parte_operativo", marca, "notified", notified=True)
+                    METRICAS["partes_operativos_enviados"] += 1
+                    log.warning(f"[operativo] parte publicado · {marca}")
+        except Exception as e:
+            log.error(f"[operativo] fallo armando el parte: {e}")
+        time.sleep(300)
+
+
+@app.on_event("startup")
+def arrancar_monitor_operativo():
+    if not _a_bool(OPERATIVO_ACTIVO, por_defecto=True):
+        log.warning("[startup] parte operativo desactivado por OPERATIVO_ACTIVO")
+        return
+    if not OPERATIVO_SLACK_WEBHOOK_URL:
+        log.warning("[startup] parte operativo no arranca — falta webhook de Slack")
+        return
+    threading.Thread(target=_operativo_monitor_loop, daemon=True).start()
+    log.warning(f"[startup] parte operativo activo · sale a las {OPERATIVO_HORA_UTC}:00 UTC")
