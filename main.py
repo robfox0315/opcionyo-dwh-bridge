@@ -2022,7 +2022,7 @@ def version_bloques(x_api_key: str | None = Header(default=None)):
     _chequear_clave(x_api_key)
     return {
         "base": "1.3.3",
-        "bloques": ["workflows_push (1.3.4)", "cohorte_renovaciones (1.3.5)", "reintento_pushes (1.3.5)", "contador_sesiones (1.3.6)", "workflows_crudo (1.3.7)", "riesgo_cancelacion (1.3.8)", "salud_mensajeria (1.3.9)", "correccion_veteranos (1.4.0)", "salud_detalle (1.4.1)", "arreglos_cruce_y_auditoria (1.4.2)", "reintento_automatico (1.4.2)", "cobertura_bifurcacion (1.4.2)", "sesiones_agendadas (1.4.3)", "monitor_riesgo (1.4.4)", "riesgo_lista_v2 (1.4.4)", "segmento_dormant (1.4.5)", "parte_operativo (1.4.6)", "reintento_por_nombre (1.4.7)", "caducidad_reintento (1.4.8)", "pedidos_v2 (1.4.9)"],
+        "bloques": ["workflows_push (1.3.4)", "cohorte_renovaciones (1.3.5)", "reintento_pushes (1.3.5)", "contador_sesiones (1.3.6)", "workflows_crudo (1.3.7)", "riesgo_cancelacion (1.3.8)", "salud_mensajeria (1.3.9)", "correccion_veteranos (1.4.0)", "salud_detalle (1.4.1)", "arreglos_cruce_y_auditoria (1.4.2)", "reintento_automatico (1.4.2)", "cobertura_bifurcacion (1.4.2)", "sesiones_agendadas (1.4.3)", "monitor_riesgo (1.4.4)", "riesgo_lista_v2 (1.4.4)", "segmento_dormant (1.4.5)", "parte_operativo (1.4.6)", "reintento_por_nombre (1.4.7)", "caducidad_reintento (1.4.8)", "pedidos_v2 (1.4.9)", "webhook_propio_pedidos (1.5.0)"],
         "endpoints_nuevos": [
             "POST /cohorte/setup", "POST /cohorte/procesar",
             "GET /cohorte/renovaciones", "GET /cohorte/kpis",
@@ -5551,6 +5551,16 @@ def arrancar_reintento_v2():
 # ══════════════════════════════════════════════════════════════════
 
 PEDIDOS_V2_ACTIVO = os.environ.get("PEDIDOS_V2_ACTIVO", "false")
+
+# Webhook propio del v2. Existe para poder APAGAR el monitor viejo sin apagar
+# el nuevo: el viejo solo sabe leer PEDIDOS_SLACK_WEBHOOK_URL, así que dejando
+# esa vacía y poniendo el webhook acá, publica únicamente el v2. Si no se
+# define, cae a la de siempre (útil mientras se migra).
+PEDIDOS_V2_WEBHOOK_URL = (
+    os.environ.get("PEDIDOS_V2_WEBHOOK_URL")
+    or PEDIDOS_SLACK_WEBHOOK_URL
+    or ""
+)
 PEDIDOS_PROP_AVISADO = os.environ.get("PEDIDOS_PROP_AVISADO", "pedido_avisado_slack")
 PEDIDOS_DIAS_PARA_RECORDAR = int(os.environ.get("PEDIDOS_DIAS_PARA_RECORDAR", "3"))
 PEDIDOS_RESUMEN_HORA_UTC = int(os.environ.get("PEDIDOS_RESUMEN_HORA_UTC", "12"))
@@ -5765,7 +5775,7 @@ def _pedidos_publicar_v2(r):
         except Exception:
             pass
     partes += ["", f"<https://app.hubspot.com/contacts/{ACCOUNT_ID}/record/0-5/{r['id']}|Abrir ticket en HubSpot>"]
-    _slack_enviar(PEDIDOS_SLACK_WEBHOOK_URL, "\n".join(partes), nombre="pedidos_v2")
+    _slack_enviar(PEDIDOS_V2_WEBHOOK_URL, "\n".join(partes), nombre="pedidos_v2")
 
 
 # ── 4 · Recordatorio en vez de repetición ─────────────────────────
@@ -5821,7 +5831,7 @@ def _pedidos_v2_loop():
             nuevos = [r for r in tickets if not (r["properties"].get(PEDIDOS_PROP_AVISADO) or "").strip()]
             for r in nuevos:
                 try:
-                    if PEDIDOS_SLACK_WEBHOOK_URL:
+                    if PEDIDOS_V2_WEBHOOK_URL:
                         _pedidos_publicar_v2(r)
                     # La marca va DESPUÉS de publicar: si Slack falla, el
                     # ticket queda sin marcar y se reintenta en el próximo
@@ -5837,8 +5847,8 @@ def _pedidos_v2_loop():
                 marca = str(ahora.date())
                 if not _evento_ya_notificado("pedidos_resumen", marca):
                     texto = _pedidos_resumen_pendientes()
-                    if texto and PEDIDOS_SLACK_WEBHOOK_URL:
-                        _slack_enviar(PEDIDOS_SLACK_WEBHOOK_URL, texto, nombre="pedidos_resumen")
+                    if texto and PEDIDOS_V2_WEBHOOK_URL:
+                        _slack_enviar(PEDIDOS_V2_WEBHOOK_URL, texto, nombre="pedidos_resumen")
                         METRICAS["pedidos_resumenes_enviados"] += 1
                     _evento_marcar("pedidos_resumen", marca, "notified", notified=True)
         except Exception as e:
@@ -5850,8 +5860,8 @@ def _pedidos_v2_loop():
 def arrancar_pedidos_v2():
     if not _a_bool(PEDIDOS_V2_ACTIVO, por_defecto=False):
         return
-    if not PEDIDOS_SLACK_WEBHOOK_URL:
-        log.warning("[startup] pedidos v2 no arranca — falta PEDIDOS_SLACK_WEBHOOK_URL")
+    if not PEDIDOS_V2_WEBHOOK_URL:
+        log.warning("[startup] pedidos v2 no arranca — falta PEDIDOS_V2_WEBHOOK_URL (o PEDIDOS_SLACK_WEBHOOK_URL)")
         return
     if not _pedidos_prop_existe():
         log.error(f"[startup] pedidos v2 NO arranca: falta la propiedad "
