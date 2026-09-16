@@ -2022,7 +2022,7 @@ def version_bloques(x_api_key: str | None = Header(default=None)):
     _chequear_clave(x_api_key)
     return {
         "base": "1.3.3",
-        "bloques": ["workflows_push (1.3.4)", "cohorte_renovaciones (1.3.5)", "reintento_pushes (1.3.5)", "contador_sesiones (1.3.6)", "workflows_crudo (1.3.7)", "riesgo_cancelacion (1.3.8)", "salud_mensajeria (1.3.9)", "correccion_veteranos (1.4.0)", "salud_detalle (1.4.1)", "arreglos_cruce_y_auditoria (1.4.2)", "reintento_automatico (1.4.2)", "cobertura_bifurcacion (1.4.2)", "sesiones_agendadas (1.4.3)", "monitor_riesgo (1.4.4)", "riesgo_lista_v2 (1.4.4)", "segmento_dormant (1.4.5)", "parte_operativo (1.4.6)", "reintento_por_nombre (1.4.7)", "caducidad_reintento (1.4.8)", "pedidos_v2 (1.4.9)", "webhook_propio_pedidos (1.5.0)", "sla_v2 (1.5.1)", "partes_sin_repetir (1.5.2)", "alcance_cola_reintento (1.5.3)", "cliente_esperando (1.5.4)", "disputas_stripe (1.5.5)"],
+        "bloques": ["workflows_push (1.3.4)", "cohorte_renovaciones (1.3.5)", "reintento_pushes (1.3.5)", "contador_sesiones (1.3.6)", "workflows_crudo (1.3.7)", "riesgo_cancelacion (1.3.8)", "salud_mensajeria (1.3.9)", "correccion_veteranos (1.4.0)", "salud_detalle (1.4.1)", "arreglos_cruce_y_auditoria (1.4.2)", "reintento_automatico (1.4.2)", "cobertura_bifurcacion (1.4.2)", "sesiones_agendadas (1.4.3)", "monitor_riesgo (1.4.4)", "riesgo_lista_v2 (1.4.4)", "segmento_dormant (1.4.5)", "parte_operativo (1.4.6)", "reintento_por_nombre (1.4.7)", "caducidad_reintento (1.4.8)", "pedidos_v2 (1.4.9)", "webhook_propio_pedidos (1.5.0)", "sla_v2 (1.5.1)", "partes_sin_repetir (1.5.2)", "alcance_cola_reintento (1.5.3)", "cliente_esperando (1.5.4)", "disputas_stripe (1.5.5)", "adopcion_campanas (1.5.6)"],
         "endpoints_nuevos": [
             "POST /cohorte/setup", "POST /cohorte/procesar",
             "GET /cohorte/renovaciones", "GET /cohorte/kpis",
@@ -7885,3 +7885,272 @@ def arrancar_disputas():
 
 
 arrancar_disputas()
+
+
+# ══════════════════════════════════════════════════════════════════
+#  ADOPCIÓN DE CAMPAÑAS BLOQUEADAS  ·  v1.5.6
+#  Agregado 16/09/2026. BLOQUE PURAMENTE ADITIVO: no toca ni una
+#  línea de lo anterior. Todo lo nuevo vive acá abajo.
+#
+#  ── Por qué existe ────────────────────────────────────────────────
+#  El 16/09 medimos la cola real del reintento sobre 168 h:
+#
+#      bloqueados totales ....... 500
+#      se pueden reintentar ..... 102   (20 %)
+#      omitidos "sin_workflow" .. 398   (80 %)
+#
+#  Los 398 no son un error del reintento: son campañas de Treble que
+#  nunca se dieron de alta como opción PUSH_<id> en la propiedad
+#  `enviar_push`. El reintento las ve fallar y no puede re-inscribir
+#  al contacto, porque no existe el valor que dispara el workflow.
+#  Hoy hay 105 workflows "PUSH - ..." en el portal fuera del esquema
+#  gestionado; esos son los que generan esta cola muerta.
+#
+#  Darlas de alta a mano son dos pasos por campaña (agregar la opción
+#  en HubSpot + crear el workflow) y hay 14 campañas que concentran
+#  378 de los 398 casos. Esto lo hace en una llamada, con las mismas
+#  salvaguardas que ya usa /workflows/push.
+#
+#  ── Salvaguardas ──────────────────────────────────────────────────
+#  · DRY-RUN por defecto. Sin ?aplicar=true simula y devuelve qué
+#    haría, sin escribir nada en HubSpot.
+#  · La propiedad `enviar_push` se modifica SOLO agregando opciones al
+#    final. Las existentes se reenvían tal cual vinieron, con su
+#    label, value, displayOrder y hidden intactos. Nunca se borra ni
+#    se reordena: esa propiedad dispara todos los pushes del portal.
+#  · Si una opción PUSH_<id> ya existe, esa campaña se omite.
+#  · El workflow se crea con el mismo camino de /workflows/push, que
+#    ya se niega a crear duplicados y aborta si el cruce de workflows
+#    no es confiable (un duplicado = el cliente recibe dos WhatsApps).
+#  · Tope por corrida, para que un error no dé de alta medio portal.
+#  · Los workflows nacen DESACTIVADOS salvo ?activar=true. Dar de alta
+#    la opción no dispara nada por sí solo; activar el workflow sí.
+# ══════════════════════════════════════════════════════════════════
+
+ADOPTAR_MAX_POR_CORRIDA = int(os.environ.get("ADOPTAR_MAX_POR_CORRIDA", "20"))
+ADOPTAR_HORAS_ATRAS = int(os.environ.get("ADOPTAR_HORAS_ATRAS", "168"))
+
+METRICAS.setdefault("campanas_adoptadas", 0)
+
+
+def _adoptar_candidatas(horas=None, tope_filas=500):
+    """
+    Campañas que aparecen bloqueadas y no tienen opción en `enviar_push`.
+    Devuelve [{conversation_id, casos, nombre, tiene_opcion}] ordenado por
+    casos descendente. Es solo lectura.
+    """
+    ventana = int(horas) if horas else ADOPTAR_HORAS_ATRAS
+    filas = _bloqueados_pendientes(ventana, tope_filas)
+    opciones = _push_opciones_por_id()
+    try:
+        nombres = _salud_nombres_push()
+    except Exception:
+        nombres = {}
+
+    conteo = {}
+    for f in filas:
+        pid = str(f["pid"])
+        conteo[pid] = conteo.get(pid, 0) + 1
+
+    salida = []
+    for pid, casos in conteo.items():
+        if pid in opciones:
+            continue
+        salida.append({
+            "conversation_id": pid,
+            "casos": casos,
+            "nombre": nombres.get(pid) or "",
+            "label_sugerido": nombres.get(pid) or f"Campaña {pid}",
+        })
+    salida.sort(key=lambda d: -d["casos"])
+    return salida, len(filas), len(opciones)
+
+
+@app.get("/pushes/adoptables")
+def pushes_adoptables(x_api_key: str | None = Header(default=None),
+                      horas: int | None = None):
+    """
+    Diagnóstico: qué campañas están generando cola muerta en el reintento
+    por no estar dadas de alta en `enviar_push`. No escribe nada.
+    """
+    _chequear_clave(x_api_key)
+    try:
+        candidatas, total_bloqueados, total_opciones = _adoptar_candidatas(horas)
+    except Exception as e:
+        raise HTTPException(502, f"No se pudieron calcular las candidatas: {e}")
+
+    recuperables = sum(c["casos"] for c in candidatas)
+    cobertura_hoy = round(100 * (total_bloqueados - recuperables) / total_bloqueados, 1) if total_bloqueados else 100.0
+    return {
+        "ventana_horas": int(horas) if horas else ADOPTAR_HORAS_ATRAS,
+        "bloqueados_en_la_ventana": total_bloqueados,
+        "opciones_dadas_de_alta_hoy": total_opciones,
+        "campanas_sin_alta": len(candidatas),
+        "casos_que_desbloquearia": recuperables,
+        "cobertura_actual_pct": cobertura_hoy,
+        "cobertura_si_se_adoptan_pct": 100.0 if total_bloqueados else 100.0,
+        "candidatas": candidatas,
+        "nota": ("Las campañas sin nombre son las que Treble nunca reportó en la ventana "
+                 "de salud; el label sugerido usa el id. Conviene renombrarlas a mano "
+                 "antes de adoptarlas para que el workflow se entienda en HubSpot."),
+    }
+
+
+def _adoptar_agregar_opciones(nuevas):
+    """
+    Agrega opciones PUSH_<id> a `enviar_push` preservando exactamente las
+    existentes. Devuelve (agregadas, total_final).
+
+    Se hace con un PATCH que reenvía la lista completa porque la API de
+    propiedades de HubSpot reemplaza `options` entera: mandar solo las
+    nuevas borraría todos los pushes del portal.
+    """
+    prop = _hubspot_api("GET", f"/crm/v3/properties/contacts/{PROP_ENVIAR_PUSH}")
+    actuales = list(prop.get("options") or [])
+    existentes = {str(o.get("value", "")) for o in actuales}
+
+    orden = max([int(o.get("displayOrder") or 0) for o in actuales] or [0])
+    agregadas = []
+    for cid, label in nuevas:
+        valor = f"PUSH_{cid}"
+        if valor in existentes:
+            continue
+        orden += 1
+        actuales.append({
+            "label": label[:180],
+            "value": valor,
+            "displayOrder": orden,
+            "hidden": False,
+        })
+        existentes.add(valor)
+        agregadas.append(valor)
+
+    if not agregadas:
+        return [], len(actuales)
+
+    # Salvaguarda final: nunca mandar menos opciones de las que había.
+    if len(actuales) < len(prop.get("options") or []):
+        raise HTTPException(500, "Cálculo de opciones inconsistente: se iban a enviar menos "
+                                 "opciones de las existentes. No se escribe nada.")
+
+    _hubspot_api("PATCH", f"/crm/v3/properties/contacts/{PROP_ENVIAR_PUSH}",
+                 {"options": actuales})
+    return agregadas, len(actuales)
+
+
+@app.post("/pushes/adoptar")
+def pushes_adoptar(body: dict | None = None,
+                   x_api_key: str | None = Header(default=None),
+                   aplicar: bool = False,
+                   activar: bool = False,
+                   horas: int | None = None,
+                   tope: int | None = None):
+    """
+    Da de alta las campañas bloqueadas que no están en `enviar_push`:
+    agrega la opción PUSH_<id> y crea su workflow.
+
+    Body opcional:
+      {"campanas": [{"conversation_id": "1060614", "label": "Nombre lindo"}, ...]}
+
+    Sin body toma las candidatas automáticas ordenadas por casos.
+
+    Query:
+      ?aplicar=true   escribe de verdad (por defecto simula)
+      ?activar=true   deja el workflow encendido (por defecto nace apagado)
+      ?tope=N         cuántas campañas como máximo en esta corrida
+    """
+    _chequear_clave(x_api_key)
+    body = body or {}
+    limite = min(int(tope), ADOPTAR_MAX_POR_CORRIDA) if tope else ADOPTAR_MAX_POR_CORRIDA
+
+    pedidas = body.get("campanas")
+    if pedidas:
+        if not isinstance(pedidas, list):
+            raise HTTPException(400, "'campanas' debe ser una lista.")
+        plan = []
+        for c in pedidas[:limite]:
+            cid = _validar_id_numerico((c or {}).get("conversation_id"), "conversation_id")
+            label = ((c or {}).get("label") or f"Campaña {cid}").strip()
+            if len(label) > 180:
+                raise HTTPException(400, f"Label demasiado largo para {cid} (máx. 180).")
+            plan.append({"conversation_id": cid, "label": label, "casos": None})
+    else:
+        try:
+            candidatas, _, _ = _adoptar_candidatas(horas)
+        except Exception as e:
+            raise HTTPException(502, f"No se pudieron calcular las candidatas: {e}")
+        plan = [{"conversation_id": c["conversation_id"],
+                 "label": c["label_sugerido"],
+                 "casos": c["casos"]} for c in candidatas[:limite]]
+
+    if not plan:
+        return {"modo": "sin_trabajo", "adoptadas": 0,
+                "nota": "No hay campañas bloqueadas sin alta en esta ventana."}
+
+    # Filtrar las que ya tienen opción (por si el body las trae igual).
+    try:
+        ya = _push_opciones_por_id()
+    except Exception as e:
+        raise HTTPException(502, f"No se pudieron leer las opciones de {PROP_ENVIAR_PUSH}: {e}")
+    omitidas_con_opcion = [p["conversation_id"] for p in plan if p["conversation_id"] in ya]
+    plan = [p for p in plan if p["conversation_id"] not in ya]
+
+    if not aplicar:
+        return {
+            "modo": "simulacion",
+            "activar_workflows": bool(activar),
+            "tope": limite,
+            "a_adoptar": len(plan),
+            "omitidas_porque_ya_tenian_opcion": omitidas_con_opcion,
+            "plan": plan,
+            "aviso": ("Simulación. Para aplicarlo de verdad: "
+                      "POST /pushes/adoptar?aplicar=true "
+                      "(agregá &activar=true solo si querés que el workflow quede encendido)."),
+        }
+
+    if not plan:
+        return {"modo": "sin_trabajo", "adoptadas": 0,
+                "omitidas_porque_ya_tenian_opcion": omitidas_con_opcion}
+
+    # Paso 1: las opciones. Una sola escritura para todas.
+    try:
+        agregadas, total_final = _adoptar_agregar_opciones(
+            [(p["conversation_id"], p["label"]) for p in plan])
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"No se pudo actualizar {PROP_ENVIAR_PUSH}: {e}")
+
+    # Paso 2: los workflows, uno por campaña, reusando el camino ya probado.
+    creados, errores = [], []
+    for p in plan:
+        try:
+            r = crear_workflow_push(
+                {"label": p["label"], "conversation_id": p["conversation_id"],
+                 "activar": bool(activar), "forzar": False},
+                x_api_key=x_api_key)
+            creados.append({"conversation_id": p["conversation_id"],
+                            "label": p["label"],
+                            "flow_id": (r or {}).get("flow_id"),
+                            "activo": bool(activar)})
+        except HTTPException as e:
+            errores.append({"conversation_id": p["conversation_id"],
+                            "label": p["label"], "error": e.detail})
+        except Exception as e:
+            errores.append({"conversation_id": p["conversation_id"],
+                            "label": p["label"], "error": str(e)})
+
+    METRICAS["campanas_adoptadas"] += len(creados)
+    return {
+        "modo": "aplicado",
+        "opciones_agregadas": agregadas,
+        "opciones_totales_ahora": total_final,
+        "workflows_creados": len(creados),
+        "workflows": creados,
+        "errores": errores,
+        "omitidas_porque_ya_tenian_opcion": omitidas_con_opcion,
+        "nota": ("Las opciones quedaron dadas de alta aunque algún workflow haya fallado: "
+                 "se pueden crear después con POST /workflows/push sin volver a tocar la "
+                 "propiedad. Si los workflows nacieron apagados, el reintento todavía no "
+                 "los usa: hay que activarlos."),
+    }
