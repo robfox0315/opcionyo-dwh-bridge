@@ -283,7 +283,7 @@ def _chequear_clave(x_api_key):
 
 @app.get("/")
 def home():
-    return {"servicio": "Opción Yo DWH Bridge", "version": "1.3.3", "estado": "activo"}
+    return {"servicio": "Opción Yo DWH Bridge", "version": "1.5.5", "estado": "activo"}
 
 
 @app.get("/health")
@@ -2022,7 +2022,7 @@ def version_bloques(x_api_key: str | None = Header(default=None)):
     _chequear_clave(x_api_key)
     return {
         "base": "1.3.3",
-        "bloques": ["workflows_push (1.3.4)", "cohorte_renovaciones (1.3.5)", "reintento_pushes (1.3.5)", "contador_sesiones (1.3.6)", "workflows_crudo (1.3.7)", "riesgo_cancelacion (1.3.8)", "salud_mensajeria (1.3.9)", "correccion_veteranos (1.4.0)", "salud_detalle (1.4.1)", "arreglos_cruce_y_auditoria (1.4.2)", "reintento_automatico (1.4.2)", "cobertura_bifurcacion (1.4.2)", "sesiones_agendadas (1.4.3)", "monitor_riesgo (1.4.4)", "riesgo_lista_v2 (1.4.4)", "segmento_dormant (1.4.5)", "parte_operativo (1.4.6)", "reintento_por_nombre (1.4.7)", "caducidad_reintento (1.4.8)", "pedidos_v2 (1.4.9)", "webhook_propio_pedidos (1.5.0)", "sla_v2 (1.5.1)", "partes_sin_repetir (1.5.2)", "alcance_cola_reintento (1.5.3)"],
+        "bloques": ["workflows_push (1.3.4)", "cohorte_renovaciones (1.3.5)", "reintento_pushes (1.3.5)", "contador_sesiones (1.3.6)", "workflows_crudo (1.3.7)", "riesgo_cancelacion (1.3.8)", "salud_mensajeria (1.3.9)", "correccion_veteranos (1.4.0)", "salud_detalle (1.4.1)", "arreglos_cruce_y_auditoria (1.4.2)", "reintento_automatico (1.4.2)", "cobertura_bifurcacion (1.4.2)", "sesiones_agendadas (1.4.3)", "monitor_riesgo (1.4.4)", "riesgo_lista_v2 (1.4.4)", "segmento_dormant (1.4.5)", "parte_operativo (1.4.6)", "reintento_por_nombre (1.4.7)", "caducidad_reintento (1.4.8)", "pedidos_v2 (1.4.9)", "webhook_propio_pedidos (1.5.0)", "sla_v2 (1.5.1)", "partes_sin_repetir (1.5.2)", "alcance_cola_reintento (1.5.3)", "cliente_esperando (1.5.4)", "disputas_stripe (1.5.5)"],
         "endpoints_nuevos": [
             "POST /cohorte/setup", "POST /cohorte/procesar",
             "GET /cohorte/renovaciones", "GET /cohorte/kpis",
@@ -2036,7 +2036,7 @@ def version_bloques(x_api_key: str | None = Header(default=None)):
             "GET /sesiones/polls", "GET /auditoria/contactos",
             "GET /pushes/reintento-estado",
             "POST /sesiones/completar-nuevos", "GET /sesiones/cobertura",
-            "GET /sesiones/senal", "POST /sesiones/recalcular-agendadas", "GET /riesgo/lista-v2", "GET /riesgo/monitor-estado", "GET /riesgo/dormant", "GET /riesgo/embudo-retencion", "GET /operativo/parte", "POST /operativo/enviar", "GET /pushes/bloqueados-v2", "POST /pushes/reintentar-v2", "GET /pushes/caducidad", "POST /pedidos/setup", "GET /pedidos/pendientes", "GET /sla/resumen", "GET /partes/estado",
+            "GET /sesiones/senal", "POST /sesiones/recalcular-agendadas", "GET /riesgo/lista-v2", "GET /riesgo/monitor-estado", "GET /riesgo/dormant", "GET /riesgo/embudo-retencion", "GET /operativo/parte", "POST /operativo/enviar", "GET /pushes/bloqueados-v2", "POST /pushes/reintentar-v2", "GET /pushes/caducidad", "POST /pedidos/setup", "GET /pedidos/pendientes", "GET /sla/resumen", "GET /partes/estado", "GET /espera/lista", "GET /auditoria/estado",
         ],
     }
 
@@ -6384,3 +6384,1504 @@ def _salud_texto(r):
     except Exception as e:
         log.error(f"[salud] no se pudo reescribir el párrafo de reintento: {e}")
         return texto
+
+
+
+# ══════════════════════════════════════════════════════════════════
+#  EL CLIENTE QUE ESPERA + TRES AGUJEROS QUE LA AUDITORÍA DESTAPÓ
+#  Agregado 11/09/2026 (v1.5.4). BLOQUE PURAMENTE ADITIVO.
+#
+#  Todo lo de acá salió de auditar el archivo entero y de la caída de
+#  Treble de hoy. Va ordenado por daño real, no por prolijidad.
+#
+#  ── A · El reintento viejo está reenviando mensajes vencidos ──────
+#  Medido hoy en la instancia: `REINTENTO_AUTOMATICO` está en true y el
+#  hilo viejo lleva 77 reenvíos. Ese hilo NO tiene el control de
+#  caducidad que se escribió en v1.4.8 — ese control vive en el v2, que
+#  está apagado. Ahora mismo `/pushes/caducidad` dice:
+#
+#      caducados 47, de los cuales 43 son
+#      "especialista confirmacion 6 horas antes"
+#
+#  O sea: le estamos avisando a 43 clientes que su sesión es en 6 horas
+#  cuando ya pasó. Gasta plantilla, gasta cuota de Meta y confunde.
+#
+#  La corrección obvia sería pedir que se cambien dos variables en
+#  Render. No alcanza: mientras eso no pase el daño sigue. Acá se
+#  redirige la corrida vieja a la lógica del v2, así queda protegida
+#  con cualquier combinación de variables. Es una sola línea porque
+#  `_reintento_corrida_v2` ya devuelve la misma forma.
+#
+#  ── B · Nadie vigila al cliente que YA fue saludado ───────────────
+#  El agujero más grande, y lo encontró la caída de Treble de hoy.
+#  El monitor de SLA mide `first_response_sec`: el tiempo hasta el
+#  PRIMER mensaje del agente. Una vez que esa conversación tuvo su
+#  primer "hola", deja de mirarla para siempre.
+#
+#  Medido hoy: 6 conversaciones abiertas donde el último mensaje es del
+#  cliente. La peor esperaba 6 h 54 min. Ninguna generó una sola alerta,
+#  porque todas ya tenían su primera respuesta hace rato.
+#
+#  Este monitor no mira ningún campo calculado por Treble —hoy quedó
+#  claro que no son confiables— sino los mensajes crudos: si el último
+#  lo escribió el cliente y la conversación sigue abierta, alguien está
+#  esperando. Avisa por tramos (30 / 60 / 120 / 240 min) para escalar
+#  sin repetir.
+#
+#  ── C · El SLA descarta en silencio lo que no puede medir ─────────
+#  `first_response_sec` llega negativo cuando Treble no graba la marca
+#  de primera respuesta: hoy 10 de 75 conversaciones, con el valor
+#  -1.789.137.000 (la resta contra el 1/1/1970). El filtro del monitor
+#  es `>= 120`, así que un negativo NO dispara alerta y NO aparece en
+#  ningún lado. Se cuentan y se informan aparte.
+#
+#  ── D · Un parte que falla no avisa que falló ─────────────────────
+#  Los 11 hilos atrapan `Exception` y siguen — está bien, no se mueren.
+#  Pero si `_salud_armar` levanta un KeyError porque el DWH cambió una
+#  columna, el parte no sale y el error queda en un log que nadie lee.
+#  El vigilante convierte eso en un mensaje de Slack.
+#
+#  ── E · La documentación de la API es pública ─────────────────────
+#  `/docs`, `/redoc` y `/openapi.json` no piden clave: cualquiera con
+#  la URL ve los 52 endpoints. No expone datos ni credenciales, pero
+#  es un mapa regalado. Se puede cerrar sin tocar nada más.
+# ══════════════════════════════════════════════════════════════════
+
+# ── A · el reintento viejo pasa a usar la lógica con caducidad ────
+
+_reintento_corrida_v142 = _reintento_corrida
+
+
+def _reintento_corrida():
+    """
+    El hilo viejo llama a esta función por nombre global, así que
+    redefinirla acá alcanza para que quede protegido sin cambiar una
+    sola variable de entorno. Devuelve la misma forma de siempre.
+    """
+    return _reintento_corrida_v2()
+
+
+# ── B · el monitor del cliente que espera ─────────────────────────
+
+ESPERA_WEBHOOK_URL = os.environ.get("ESPERA_WEBHOOK_URL", "")
+ESPERA_MINUTOS = int(os.environ.get("ESPERA_MINUTOS", "30"))
+ESPERA_VENTANA_HORAS = int(os.environ.get("ESPERA_VENTANA_HORAS", "24"))
+ESPERA_POLL_SEGUNDOS = int(os.environ.get("ESPERA_POLL_SEGUNDOS", "300"))
+# Tramos de escalamiento en minutos. Se avisa una vez por tramo y por
+# conversación: así una espera larga escala en vez de repetir el mismo
+# mensaje cada cinco minutos.
+ESPERA_TRAMOS = [int(x) for x in os.environ.get("ESPERA_TRAMOS", "30,60,120,240").split(",") if x.strip()]
+
+for _m in ("espera_alertas", "espera_resumenes"):
+    METRICAS.setdefault(_m, 0)
+
+
+def _espera_datos(minimo_minutos=None, horas=None):
+    """
+    Conversaciones abiertas donde el ÚLTIMO mensaje lo escribió el
+    cliente. No usa ningún campo calculado por Treble: sólo los mensajes.
+    """
+    minimo = int(minimo_minutos if minimo_minutos is not None else ESPERA_MINUTOS)
+    ventana = int(horas if horas is not None else ESPERA_VENTANA_HORAS)
+    sql = f"""
+        SELECT toString(c.conversation_id) cid,
+               c.agent_name agente,
+               c.contact_wa_id wa,
+               toString(m.ultimo) ultimo,
+               dateDiff('minute', m.ultimo, now()) minutos
+        FROM fact_conversations c
+        INNER JOIN (
+            SELECT conversation_id,
+                   max(created_at) ultimo,
+                   argMax(sender, created_at) quien
+            FROM fact_agent_messages
+            WHERE company_id = {int(SALUD_COMPANY_ID)}
+              AND created_at >= now() - INTERVAL {ventana + 6} HOUR
+            GROUP BY conversation_id
+        ) m ON c.conversation_id = m.conversation_id
+        WHERE c.company_id = {int(SALUD_COMPANY_ID)}
+          AND c.status = 'assigned'
+          AND m.quien = 'USER'
+          AND m.ultimo >= now() - INTERVAL {ventana} HOUR
+          AND dateDiff('minute', m.ultimo, now()) >= {minimo}
+        ORDER BY minutos DESC
+        LIMIT 100
+    """
+    return _query_interna(sql) or []
+
+
+def _espera_tramo(minutos):
+    """El tramo más alto que ya superó. None si todavía no llegó al primero."""
+    alcanzado = None
+    for t in sorted(ESPERA_TRAMOS):
+        if minutos >= t:
+            alcanzado = t
+    return alcanzado
+
+
+def _espera_texto(fila):
+    mins = int(fila.get("minutos") or 0)
+    horas = mins // 60
+    cuanto = f"{horas} h {mins % 60} min" if horas else f"{mins} min"
+    icono = ":rotating_light:" if mins >= 120 else ":hourglass_flowing_sand:"
+    return (f"{icono} *Cliente esperando {cuanto}*\n"
+            f"Conversación #{fila.get('cid')} · *{fila.get('agente') or 'sin agente'}*\n"
+            f"Cliente: `{_mask_phone(str(fila.get('wa') or ''))}`\n"
+            f"_El último mensaje es del cliente y la conversación sigue abierta._")
+
+
+def _espera_resumen_texto(filas):
+    if not filas:
+        return None
+    L = [f":hourglass: *Clientes esperando respuesta — {len(filas)}*"]
+    por_agente = {}
+    for f in filas:
+        a = f.get("agente") or "sin agente"
+        por_agente.setdefault(a, []).append(int(f.get("minutos") or 0))
+    L.append("")
+    for a, ms in sorted(por_agente.items(), key=lambda x: -max(x[1])):
+        peor = max(ms)
+        L.append(f"  · {a} — {len(ms)} esperando · la peor {peor // 60} h {peor % 60} min")
+    L += ["", "*Las más urgentes:*"]
+    for f in filas[:5]:
+        m = int(f.get("minutos") or 0)
+        L.append(f"  · #{f.get('cid')} — {f.get('agente') or 'sin agente'} · "
+                 f"*{m // 60} h {m % 60} min* · `{_mask_phone(str(f.get('wa') or ''))}`")
+    L += ["", "_Se mide por el último mensaje real, no por campos de Treble._"]
+    return "\n".join(L)
+
+
+@app.get("/espera/lista")
+def espera_lista(x_api_key: str | None = Header(default=None),
+                 minutos: int | None = None, horas: int | None = None):
+    """Quién está esperando ahora mismo, sin publicar nada."""
+    _chequear_clave(x_api_key)
+    filas = _espera_datos(minutos, horas)
+    return {
+        "generado": datetime.now(timezone.utc).isoformat(),
+        "umbral_minutos": int(minutos if minutos is not None else ESPERA_MINUTOS),
+        "esperando": len(filas),
+        "casos": [{"conversacion": f.get("cid"), "agente": f.get("agente"),
+                   "minutos": int(f.get("minutos") or 0),
+                   "cliente": _mask_phone(str(f.get("wa") or "")),
+                   "ultimo_mensaje": f.get("ultimo")} for f in filas],
+        "texto_slack": _espera_resumen_texto(filas),
+        "nota": ("El DWH viene con retraso (ver /health/deep). Una respuesta de los "
+                 "últimos minutos puede no verse todavía."),
+    }
+
+
+def _espera_loop():
+    while True:
+        try:
+            ahora = datetime.now(timezone.utc)
+            en_turno = not _sla_es_cola_nocturna(ahora.hour)
+            filas = _espera_datos()
+            if en_turno:
+                for f in filas:
+                    tramo = _espera_tramo(int(f.get("minutos") or 0))
+                    if tramo is None:
+                        continue
+                    clave = f"{f.get('cid')}:{tramo}"
+                    if _evento_ya_notificado("espera", clave):
+                        continue
+                    if ESPERA_WEBHOOK_URL:
+                        _slack_enviar(ESPERA_WEBHOOK_URL, _espera_texto(f), nombre="espera")
+                    _evento_marcar("espera", clave, "notified", notified=True)
+                    METRICAS["espera_alertas"] += 1
+            else:
+                # Fuera de turno no se interrumpe a nadie: al abrir el turno
+                # sale un resumen con lo que quedó de la noche.
+                marca = f"{ahora.date()}-apertura"
+                if ahora.hour == SLA_HORA_INICIO_UTC and not _evento_ya_notificado("espera_apertura", marca):
+                    texto = _espera_resumen_texto(filas)
+                    if texto and ESPERA_WEBHOOK_URL:
+                        _slack_enviar(ESPERA_WEBHOOK_URL,
+                                      ":sunrise: *Quedó gente esperando de la noche*\n\n" + texto,
+                                      nombre="espera_apertura")
+                        METRICAS["espera_resumenes"] += 1
+                    _evento_marcar("espera_apertura", marca, "notified", notified=True)
+        except Exception as e:
+            log.error(f"[espera] falló la revisión: {e}")
+        time.sleep(max(60, ESPERA_POLL_SEGUNDOS))
+
+
+@app.on_event("startup")
+def arrancar_espera():
+    if not ESPERA_WEBHOOK_URL:
+        log.warning("[startup] monitor de espera NO arranca — falta ESPERA_WEBHOOK_URL. "
+                    "Es la alerta que avisa que un cliente lleva rato sin respuesta.")
+        return
+    threading.Thread(target=_espera_loop, daemon=True).start()
+    log.warning(f"[startup] monitor de espera activo · avisa a los {ESPERA_TRAMOS} min "
+                f"dentro del turno {SLA_HORA_INICIO_UTC}-{SLA_HORA_FIN_UTC} UTC")
+
+
+# ── C · lo que el SLA no puede medir, se cuenta aparte ────────────
+
+def _sla_metrica_rota(horas=24):
+    """
+    Conversaciones cuyo `first_response_sec` es imposible (negativo o
+    absurdo). Treble no grabó la marca de primera respuesta: el monitor
+    las descarta por el filtro `>= 120` y quedan invisibles.
+    """
+    try:
+        filas = _query_interna(f"""
+            SELECT toString(conversation_id) cid, agent_name agente,
+                   first_response_sec seg, toString(assigned_at) asignada
+            FROM fact_conversations
+            WHERE company_id = {int(SALUD_COMPANY_ID)}
+              AND assigned_at >= now() - INTERVAL {int(horas)} HOUR
+              AND first_response_sec IS NOT NULL
+              AND (first_response_sec < 0 OR first_response_sec > 604800)
+            ORDER BY assigned_at DESC LIMIT 50""") or []
+    except Exception as e:
+        log.error(f"[sla] no se pudo contar la métrica rota: {e}")
+        return []
+    return filas
+
+
+_sla_resumen_v151 = _sla_resumen
+
+
+def _sla_resumen(horas=24):
+    r = _sla_resumen_v151(horas)
+    try:
+        rotas = _sla_metrica_rota(horas)
+        r["metrica_rota"] = len(rotas)
+        r["metrica_rota_casos"] = [c.get("cid") for c in rotas[:10]]
+    except Exception as e:
+        log.error(f"[sla] no se pudo sumar la métrica rota: {e}")
+    return r
+
+
+_sla_texto_resumen_v151 = _sla_texto_resumen
+
+
+def _sla_texto_resumen(r):
+    texto = _sla_texto_resumen_v151(r)
+    rotas = (r or {}).get("metrica_rota") or 0
+    if rotas:
+        texto += (f"\n\n:warning: *{rotas} conversaciones sin métrica válida* — Treble no grabó "
+                  f"la marca de primera respuesta, así que no entran en ningún conteo de arriba. "
+                  f"No significa que no se respondieron: hay que mirarlas en `/espera/lista`, "
+                  f"que se calcula con los mensajes reales.")
+    return texto
+
+
+# ── D · vigilante: un parte que no salió deja de ser invisible ────
+
+VIGILANTE_WEBHOOK_URL = (os.environ.get("VIGILANTE_WEBHOOK_URL")
+                         or globals().get("SALUD_SLACK_WEBHOOK_URL") or "")
+# Cuántas horas después de su hora se considera que un parte falló.
+VIGILANTE_GRACIA_HORAS = int(os.environ.get("VIGILANTE_GRACIA_HORAS", "2"))
+
+
+def _vigilante_faltantes(ahora=None):
+    """Partes cuya hora pasó hace rato y que no salieron ni fueron sembrados."""
+    ahora = ahora or datetime.now(timezone.utc)
+    hoy = str(ahora.date())
+    faltan = []
+    for evento, nombre, hora in _partes_diarios():
+        if hora is None:
+            continue
+        if ahora.hour < int(hora) + VIGILANTE_GRACIA_HORAS:
+            continue
+        if _evento_ya_notificado(evento, hoy):
+            continue
+        faltan.append({"parte": nombre, "evento": evento, "hora_utc": int(hora)})
+    return faltan
+
+
+def _vigilante_loop():
+    while True:
+        try:
+            ahora = datetime.now(timezone.utc)
+            faltan = _vigilante_faltantes(ahora)
+            for f in faltan:
+                marca = f"{ahora.date()}-{f['evento']}"
+                if _evento_ya_notificado("vigilante", marca):
+                    continue
+                texto = (f":warning: *El parte «{f['parte']}» no salió hoy*\n"
+                         f"Estaba previsto para las {f['hora_utc']}:00 UTC y ya pasaron "
+                         f"más de {VIGILANTE_GRACIA_HORAS} h.\n"
+                         f"Suele ser un error armando el parte: revisar los logs de Render "
+                         f"buscando la etiqueta del monitor. Estado en `/partes/estado`.")
+                if VIGILANTE_WEBHOOK_URL:
+                    _slack_enviar(VIGILANTE_WEBHOOK_URL, texto, nombre="vigilante")
+                _evento_marcar("vigilante", marca, "notified", notified=True)
+                log.error(f"[vigilante] el parte {f['evento']} no salió hoy")
+        except Exception as e:
+            log.error(f"[vigilante] falló la revisión: {e}")
+        time.sleep(1800)
+
+
+@app.on_event("startup")
+def arrancar_vigilante():
+    if not VIGILANTE_WEBHOOK_URL:
+        log.warning("[startup] vigilante de partes NO arranca — sin webhook")
+        return
+    threading.Thread(target=_vigilante_loop, daemon=True).start()
+    log.warning(f"[startup] vigilante de partes activo · gracia {VIGILANTE_GRACIA_HORAS} h")
+
+
+# ── E · la documentación deja de ser pública si se quiere ─────────
+# Por defecto NO cambia nada, para no romperle la vista a nadie.
+# Con DOCS_PUBLICAS=false, /docs /redoc y /openapi.json piden la clave.
+DOCS_PUBLICAS = os.environ.get("DOCS_PUBLICAS", "true")
+
+if not _a_bool(DOCS_PUBLICAS, por_defecto=True):
+    @app.middleware("http")
+    async def _tapar_docs(request, call_next):
+        if request.url.path in ("/docs", "/redoc", "/openapi.json", "/docs/oauth2-redirect"):
+            if request.headers.get("x-api-key") != API_KEY:
+                from fastapi.responses import JSONResponse
+                return JSONResponse({"detail": "Documentación cerrada."}, status_code=401)
+        return await call_next(request)
+
+
+@app.get("/auditoria/estado")
+def auditoria_estado(x_api_key: str | None = Header(default=None)):
+    """
+    Un solo lugar para ver si todo lo que debería estar andando, anda.
+    Pensado para mirarlo después de cada deploy.
+    """
+    _chequear_clave(x_api_key)
+    ahora = datetime.now(timezone.utc)
+    monitores = [
+        ("parte de salud", bool(globals().get("SALUD_SLACK_WEBHOOK_URL")), "SALUD_SLACK_WEBHOOK_URL"),
+        ("parte operativo", bool(globals().get("OPERATIVO_SLACK_WEBHOOK_URL"))
+         and _a_bool(globals().get("OPERATIVO_ACTIVO"), True), "OPERATIVO_SLACK_WEBHOOK_URL"),
+        ("riesgo de cancelación", _a_bool(globals().get("RIESGO_MONITOR_ACTIVO"), True), "RIESGO_MONITOR_ACTIVO"),
+        ("pedidos v1", bool(globals().get("PEDIDOS_SLACK_WEBHOOK_URL")), "PEDIDOS_SLACK_WEBHOOK_URL"),
+        ("pedidos v2", _a_bool(globals().get("PEDIDOS_V2_ACTIVO"), False)
+         and bool(globals().get("PEDIDOS_V2_WEBHOOK_URL")), "PEDIDOS_V2_ACTIVO + PEDIDOS_V2_WEBHOOK_URL"),
+        ("sla v1", bool(globals().get("SLACK_WEBHOOK_URL")), "SLACK_WEBHOOK_URL"),
+        ("sla v2", _a_bool(globals().get("SLA_V2_ACTIVO"), False)
+         and bool(globals().get("SLA_V2_WEBHOOK_URL")), "SLA_V2_ACTIVO + SLA_V2_WEBHOOK_URL"),
+        ("cliente esperando", bool(ESPERA_WEBHOOK_URL), "ESPERA_WEBHOOK_URL"),
+        ("vigilante de partes", bool(VIGILANTE_WEBHOOK_URL), "VIGILANTE_WEBHOOK_URL"),
+        ("escalamiento", bool(globals().get("ESCALAMIENTO_SLACK_WEBHOOK_URL")), "ESCALAMIENTO_SLACK_WEBHOOK_URL"),
+        ("onboarding", bool(globals().get("ONBOARDING_SLACK_WEBHOOK_URL")), "ONBOARDING_SLACK_WEBHOOK_URL"),
+    ]
+    viejo = _a_bool(globals().get("REINTENTO_AUTOMATICO"), True)
+    nuevo = _a_bool(globals().get("REINTENTO_V2_AUTOMATICO"), False)
+    return {
+        "hora_utc": ahora.isoformat(),
+        "monitores": [{"monitor": n, "encendido": e, "variable": v} for n, e, v in monitores],
+        "apagados": [n for n, e, _v in monitores if not e],
+        "reintento": {
+            "hilo_viejo": viejo, "hilo_v2": nuevo,
+            "caducidad_aplicada": True,
+            "nota": ("Desde v1.5.4 la corrida vieja usa la lógica del v2, así que el control "
+                     "de caducidad corre con cualquier combinación de variables."),
+        },
+        "dedup_persistente": not str(DB_PATH).startswith("/tmp"),
+        "docs_publicas": _a_bool(DOCS_PUBLICAS, por_defecto=True),
+        "partes_hoy": _vigilante_faltantes(ahora),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════
+#  DISPUTAS DE STRIPE · expediente automático
+#  Agregado 15/09/2026 (v1.5.5). BLOQUE PURAMENTE ADITIVO.
+#
+#  ── El problema ───────────────────────────────────────────────────
+#  Julio 2026: 36 disputas, $5,429.67 + $540 de fee.
+#  Agosto 2026: 34 disputas, $5,125.00 + $510 de fee.
+#  ~35 por mes. El fee de disputa recibida son $15 que Stripe NO
+#  devuelve ni cuando ganás: ~$6,300 al año de penalidad pura.
+#
+#  Hoy cada defensa se arma a mano. El caso de Rosa Ramos (ID 55905)
+#  es el retrato: el agente busca la llamada en HubSpot, busca la
+#  conversación en Treble, escribe un relato en prosa y lo manda por
+#  DM. Tarda horas, depende de que alguien se acuerde, y no queda
+#  registrado en ningún lado. Nadie mide si sirvió.
+#
+#  ── Lo que hace este bloque ───────────────────────────────────────
+#  1. Escucha el webhook de Stripe. Cuando entra una disputa la
+#     guarda con su fecha límite REAL (`evidence_details.due_by`),
+#     no una estimada.
+#  2. Arma el expediente solo: cruza el cargo con el contacto de
+#     HubSpot (por email y por yopsi_id) y con la conversación de
+#     WhatsApp en el DWH. De ahí salen las sesiones asistidas, el
+#     plan, la fecha del último pago y si el cliente nos escribió
+#     antes de ir al banco.
+#  3. Redacta el descargo en inglés, que es lo que lee el emisor,
+#     con la plantilla de la categoría que corresponda.
+#  4. Avisa a Slack con los días que quedan y el link al panel.
+#  5. Un humano revisa en `/disputas/{id}/panel`, corrige y envía.
+#     El envío NUNCA es automático: lo dispara una persona.
+#  6. Cuando cierra, guarda el resultado. Eso alimenta la tasa de
+#     éxito por categoría, que es lo que dice qué vale la pena
+#     pelear el mes que viene.
+#
+#  ── Lo primero que hay que correr ─────────────────────────────────
+#      POST /disputas/sincronizar?dias=180
+#  Trae las disputas de los últimos 6 meses con categoría y
+#  resultado. Sin ese número estamos diseñando a ciegas.
+#
+#  ── Reglas de Stripe que cambian la estrategia ────────────────────
+#  · Desde junio 2025 hay DOS fees: el de disputa recibida (nunca
+#    vuelve) y el de disputa respondida (se devuelve si ganás).
+#    Responder una disputa chica que se va a perder cuesta dos veces.
+#  · Las inquiries (`warning_needs_response`) se responden SIEMPRE y
+#    el mismo día: resolverlas evita el fee de disputa por completo,
+#    y no contestarlas escala a un contracargo casi imposible de
+#    ganar. México doméstico usa inquiries en todas las marcas.
+#  · El plazo real de respuesta es 7-21 días según la red.
+#  · Mientras la disputa está abierta no se puede reembolsar por
+#    fuera. El módulo de reembolsos del admin ya lo contempla.
+#
+#  ── Puesta en marcha ──────────────────────────────────────────────
+#  Sólo hacen falta DOS variables de entorno:
+#    STRIPE_API_KEY         sk_live_... (o sk_test_ para probar)
+#    STRIPE_WEBHOOK_SECRET  whsec_...  (lo da Stripe al crear el webhook)
+#
+#  Las demás se arreglan solas: el aviso de Slack cae al canal de
+#  escalamiento que ya está configurado, y la URL pública se aprende
+#  del primer pedido que entra.
+#
+#  Después, abrir  /disputas/instalar?clave=<BRIDGE_API_KEY>
+#  Esa pantalla dice qué falta, muestra la URL exacta para pegar en
+#  Stripe y tiene los botones para traer el histórico y ver la tasa
+#  de éxito. No hace falta saber de consolas.
+#
+#  Opcionales: DISPUTAS_SLACK_WEBHOOK_URL (canal propio),
+#  DISPUTA_FEE_USD (15), DISPUTAS_ACTIVO (true), BRIDGE_URL_PUBLICA.
+# ══════════════════════════════════════════════════════════════════
+
+import hmac
+import hashlib
+import urllib.parse
+from fastapi import Request
+from fastapi.responses import HTMLResponse
+
+STRIPE_API_KEY = os.environ.get("STRIPE_API_KEY", "").strip()
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "").strip()
+# Si no se configura una propia, usa el canal de escalamiento que ya
+# existe. Una variable menos que cargar a mano.
+DISPUTAS_SLACK_WEBHOOK_URL = (os.environ.get("DISPUTAS_SLACK_WEBHOOK_URL", "").strip()
+                              or ESCALAMIENTO_SLACK_WEBHOOK_URL
+                              or SLACK_WEBHOOK_URL)
+DISPUTAS_ACTIVO = os.environ.get("DISPUTAS_ACTIVO", "true").strip()
+# La URL pública no hace falta configurarla: se aprende del primer
+# pedido que entra y se guarda. Una variable menos.
+BRIDGE_URL_PUBLICA = os.environ.get("BRIDGE_URL_PUBLICA", "").strip().rstrip("/")
+
+
+def _disputas_aprender_url(request):
+    global BRIDGE_URL_PUBLICA
+    if BRIDGE_URL_PUBLICA:
+        return
+    try:
+        host = request.headers.get("x-forwarded-host") or request.headers.get("host")
+        proto = request.headers.get("x-forwarded-proto") or "https"
+        if host and "localhost" not in host:
+            BRIDGE_URL_PUBLICA = f"{proto}://{host}".rstrip("/")
+            log.warning(f"[disputas] URL pública aprendida sola: {BRIDGE_URL_PUBLICA}")
+    except Exception:
+        pass
+
+# Fee de disputa recibida en USD. No se recupera: sirve para decidir
+# si conviene pelear un monto chico.
+DISPUTA_FEE_USD = float(os.environ.get("DISPUTA_FEE_USD", "15"))
+
+# Categorías que sabemos defender bien porque tenemos la evidencia.
+DISPUTA_CATEGORIAS_FUERTES = ("subscription_canceled", "credit_not_processed",
+                              "product_unacceptable", "product_not_received")
+
+
+def _disputas_init_db():
+    with _db_lock, sqlite3.connect(DB_PATH) as con:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS disputas (
+                id TEXT PRIMARY KEY,
+                charge_id TEXT,
+                payment_intent TEXT,
+                monto REAL,
+                moneda TEXT,
+                categoria TEXT,
+                codigo_red TEXT,
+                estado TEXT,
+                vence_en TEXT,
+                creada_en TEXT,
+                cliente_email TEXT,
+                cliente_nombre TEXT,
+                yopsi_id TEXT,
+                expediente TEXT,
+                borrador TEXT,
+                enviada_en TEXT,
+                enviada_por TEXT,
+                resultado TEXT,
+                cerrada_en TEXT,
+                avisos TEXT DEFAULT ''
+            )
+        """)
+        con.commit()
+
+
+_disputas_init_db()
+
+
+# ── Cliente de Stripe. Mismo estilo que _hubspot_request ──────────
+
+def _stripe_api(method, path, form=None, params=None):
+    if not STRIPE_API_KEY:
+        raise HTTPException(500, "STRIPE_API_KEY no configurada.")
+    url = f"https://api.stripe.com{path}"
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    data = urllib.parse.urlencode(form, doseq=True).encode() if form is not None else None
+    req = urllib.request.Request(
+        url, data=data, method=method,
+        headers={"Authorization": f"Bearer {STRIPE_API_KEY}",
+                 "Content-Type": "application/x-www-form-urlencoded",
+                 "Stripe-Version": "2024-06-20"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        cuerpo = e.read().decode()[:600]
+        raise HTTPException(e.code, f"Stripe respondió {e.code}: {cuerpo}")
+    except Exception as e:
+        raise HTTPException(502, f"No se pudo hablar con Stripe: {e}")
+
+
+def _stripe_verificar_firma(cuerpo_crudo, cabecera, tolerancia=300):
+    """
+    Verificación de la firma del webhook, igual que la librería oficial.
+    Sin esto cualquiera que conozca la URL puede inventar disputas.
+    """
+    if not STRIPE_WEBHOOK_SECRET:
+        raise HTTPException(500, "STRIPE_WEBHOOK_SECRET no configurada.")
+    if not cabecera:
+        raise HTTPException(400, "Falta la cabecera Stripe-Signature.")
+    partes = dict(p.split("=", 1) for p in cabecera.split(",") if "=" in p)
+    ts = partes.get("t")
+    firmas = [v for k, v in (p.split("=", 1) for p in cabecera.split(",") if "=" in p)
+              if k == "v1"]
+    if not ts or not firmas:
+        raise HTTPException(400, "Cabecera Stripe-Signature mal formada.")
+    try:
+        if abs(time.time() - int(ts)) > tolerancia:
+            raise HTTPException(400, "Webhook fuera de la ventana de tiempo.")
+    except ValueError:
+        raise HTTPException(400, "Timestamp inválido en la firma.")
+    esperado = hmac.new(STRIPE_WEBHOOK_SECRET.encode(),
+                        f"{ts}.".encode() + cuerpo_crudo, hashlib.sha256).hexdigest()
+    if not any(hmac.compare_digest(esperado, f) for f in firmas):
+        raise HTTPException(400, "Firma del webhook inválida.")
+    return True
+
+
+# ── El expediente ─────────────────────────────────────────────────
+
+def _disputa_dias_restantes(vence_en):
+    if not vence_en:
+        return None
+    try:
+        d = datetime.fromisoformat(vence_en).replace(tzinfo=timezone.utc)
+        return round((d - datetime.now(timezone.utc)).total_seconds() / 86400, 1)
+    except Exception:
+        return None
+
+
+def _disputa_contacto_hubspot(email, nombre=None):
+    """Busca al cliente por email. Si no aparece, prueba por nombre."""
+    props = PEDIDOS_PROPS_FICHA + ["email", "createdate", "fecha_primera_sesion"]
+    try:
+        if email:
+            r = _hubspot_request("POST", "/crm/v3/objects/contacts/search", {
+                "filterGroups": [{"filters": [
+                    {"propertyName": "email", "operator": "EQ", "value": email}]}],
+                "properties": props, "limit": 1,
+            })
+            res = r.get("results") or []
+            if res:
+                p = res[0].get("properties") or {}
+                p["_hs_id"] = res[0].get("id")
+                return p
+    except Exception as e:
+        log.error(f"[disputas] búsqueda en HubSpot por email falló: {e}")
+    return None
+
+
+def _disputa_conversacion_dwh(hs_id=None, telefono=None):
+    """
+    ¿El cliente nos escribió antes de ir al banco? Es de los argumentos
+    más fuertes que hay, en los dos sentidos: si nos escribió y le
+    contestamos, hubo intento de resolver; si nunca escribió, eso se
+    declara y pesa.
+
+    Se cruza por `helpdesk_contact_id`, que es el id de HubSpot que
+    Treble guarda en la conversación. El teléfono es el plan B: en el
+    DWH vive como `contact_wa_id` y no siempre trae el mismo prefijo.
+    """
+    cond = []
+    if hs_id and str(hs_id).isdigit():
+        cond.append(f"c.helpdesk_contact_id = '{hs_id}'")
+    solo = re.sub(r"\D", "", str(telefono or ""))
+    if len(solo) >= 10:
+        cond.append(f"c.contact_wa_id LIKE '%{solo[-10:]}%'")
+    if not cond:
+        return None
+    try:
+        filas = _query_interna(f"""
+            SELECT countIf(m.sender = 'USER') mensajes_cliente,
+                   countIf(m.sender != 'USER') mensajes_equipo,
+                   min(m.created_at) primero,
+                   max(m.created_at) ultimo
+            FROM fact_agent_messages m
+            INNER JOIN fact_conversations c ON m.conversation_id = c.conversation_id
+            WHERE m.company_id = {int(SALUD_COMPANY_ID)}
+              AND c.company_id = {int(SALUD_COMPANY_ID)}
+              AND ({' OR '.join(cond)})
+            LIMIT 1
+        """)
+        f = filas[0] if filas else None
+        if not f or not (f.get("mensajes_cliente") or f.get("mensajes_equipo")):
+            return None
+        return f
+    except Exception as e:
+        log.error(f"[disputas] no se pudo leer la conversación en el DWH: {e}")
+        return None
+
+
+def _disputa_expediente(d):
+    """
+    Junta todo lo que ya tenemos, sin que nadie lo pida.
+    `d` es el objeto dispute tal como lo manda Stripe.
+    """
+    exp = {"armado_en": datetime.now(timezone.utc).isoformat()}
+    cargo = {}
+    charge_id = d.get("charge")
+    if charge_id:
+        try:
+            cargo = _stripe_api("GET", f"/v1/charges/{charge_id}")
+        except Exception as e:
+            log.error(f"[disputas] no se pudo traer el cargo {charge_id}: {e}")
+
+    bd = cargo.get("billing_details") or {}
+    exp["stripe"] = {
+        "cargo": charge_id,
+        "payment_intent": cargo.get("payment_intent"),
+        "monto": (d.get("amount") or 0) / 100,
+        "moneda": (d.get("currency") or "usd").upper(),
+        "categoria": d.get("reason"),
+        "codigo_red": ((d.get("payment_method_details") or {}).get("card") or {}).get("network_reason_code"),
+        "fecha_cobro": (datetime.fromtimestamp(cargo["created"], timezone.utc).date().isoformat()
+                        if cargo.get("created") else None),
+        "email": cargo.get("receipt_email") or bd.get("email"),
+        "nombre": bd.get("name"),
+        "ip": (cargo.get("payment_method_details") or {}).get("card", {}).get("network_transaction_id"),
+        "descripcion": cargo.get("description"),
+        "reembolsado": (cargo.get("amount_refunded") or 0) / 100,
+        "direccion": bd.get("address"),
+    }
+
+    p = _disputa_contacto_hubspot(exp["stripe"]["email"], exp["stripe"]["nombre"])
+    if p:
+        exp["cliente"] = {
+            "hs_id": p.get("_hs_id"),
+            "yopsi_id": p.get("yopsi_id"),
+            "nombre": " ".join(x for x in [p.get("firstname"), p.get("lastname")] if x),
+            "plan": p.get("tipo_de_plan") or p.get("plan"),
+            "sesiones_asistidas": p.get("sesiones_asistidas"),
+            "dias_sin_sesion": p.get("dias_sin_sesion"),
+            "fecha_ultimo_pago": str(p.get("fecha_ultimo_pago") or "")[:10],
+            "especialista": p.get("especialista_label"),
+            "etapa": p.get("sesiones_etapa"),
+            "telefono": p.get("hs_whatsapp_phone_number") or p.get("phone"),
+            "ficha": (f"https://app.hubspot.com/contacts/{ACCOUNT_ID}/record/0-1/{p.get('_hs_id')}"
+                      if p.get("_hs_id") else None),
+            "admin": (f"https://admin.opcionyo.com/admin/clientes/users?paciente_id={p.get('yopsi_id')}"
+                      if p.get("yopsi_id") else None),
+        }
+        conv = _disputa_conversacion_dwh(p.get("_hs_id"), exp["cliente"]["telefono"])
+        if conv:
+            exp["conversacion"] = {
+                "mensajes_del_cliente": conv.get("mensajes_cliente"),
+                "mensajes_del_equipo": conv.get("mensajes_equipo"),
+                "primer_contacto": str(conv.get("primero") or "")[:19],
+                "ultimo_contacto": str(conv.get("ultimo") or "")[:19],
+            }
+    else:
+        exp["cliente"] = None
+        exp["_alerta"] = ("No se encontró al cliente en HubSpot por el email del cargo. "
+                          "Hay que buscarlo a mano antes de responder.")
+
+    exp["faltantes"] = _disputa_faltantes(exp)
+    return exp
+
+
+def _disputa_faltantes(exp):
+    """Lo que el expediente no pudo llenar solo y un humano tiene que completar."""
+    faltan = []
+    c = exp.get("cliente") or {}
+    if not c:
+        faltan.append("identificar al cliente en el CRM")
+        return faltan
+    if not c.get("sesiones_asistidas"):
+        faltan.append("sesiones asistidas en el período cobrado")
+    if not exp.get("conversacion"):
+        faltan.append("la conversación de WhatsApp donde acepta el cobro")
+    faltan.append("fecha y hora en que aceptó los TyC")
+    faltan.append("enlace a la llamada grabada, si existe")
+    return faltan
+
+
+# ── El descargo ───────────────────────────────────────────────────
+
+def _disputa_borrador(exp):
+    """
+    Redacta en inglés, que es lo que lee el banco emisor.
+    Lo que no se pudo verificar queda entre llaves: si un dato entre
+    llaves llega a Stripe, el descargo afirma algo que la evidencia no
+    respalda y eso debilita el expediente entero.
+    """
+    s = exp.get("stripe") or {}
+    c = exp.get("cliente") or {}
+    conv = exp.get("conversacion") or {}
+    cat = s.get("categoria") or "general"
+    monto = f"{s.get('monto')} {s.get('moneda')}"
+    fecha = s.get("fecha_cobro") or "{fecha_cobro}"
+    sesiones = c.get("sesiones_asistidas") or "{n_sesiones}"
+    plan = c.get("plan") or "{plan}"
+
+    if conv.get("mensajes_del_cliente"):
+        contacto = (f"The customer had an open support channel with us. They sent "
+                    f"{conv['mensajes_del_cliente']} messages and our team replied "
+                    f"{conv.get('mensajes_del_equipo', 0)} times, between "
+                    f"{conv.get('primer_contacto','')[:10]} and "
+                    f"{conv.get('ultimo_contacto','')[:10]}. The issue raised in this dispute "
+                    f"was never brought to us through that channel.")
+    else:
+        contacto = "The customer did not contact us before filing this dispute."
+
+    base = (f"The customer purchased the {plan} plan, which renews automatically until "
+            f"cancelled, as stated in the Terms of Service accepted at checkout on "
+            f"{{fecha_aceptacion_tyc}}.\n\n"
+            f"The charge of {monto} on {fecha} is the scheduled renewal of an active plan. "
+            f"Our records show {sesiones} live sessions attended with licensed practitioners, "
+            f"each scheduled by the customer from their own account.\n\n{contacto}")
+
+    if cat == "subscription_canceled":
+        rebuttal = (base + "\n\nThe subscription was active on the charge date and no "
+                    "cancellation request was ever submitted through the channels disclosed "
+                    "at purchase.")
+        campos = {
+            "cancellation_policy": "{texto_literal_tyc_renovacion}",
+            "cancellation_policy_disclosure":
+                "The policy is shown on the checkout page and must be accepted before payment. "
+                "The customer accepted it on {fecha_aceptacion_tyc}.",
+            "cancellation_rebuttal": rebuttal,
+        }
+    elif cat == "credit_not_processed":
+        campos = {
+            "refund_policy": "{texto_literal_tyc_reembolsos}",
+            "refund_policy_disclosure":
+                "The policy is shown on the checkout page and must be accepted before payment. "
+                "The customer accepted it on {fecha_aceptacion_tyc}.",
+            "refund_refusal_explanation": (base + "\n\nThe sessions included in the disputed "
+                                           "period remain available and transferable under the "
+                                           "terms accepted at purchase."),
+        }
+    elif cat in ("product_unacceptable", "product_not_received"):
+        campos = {
+            "product_description":
+                f"{plan}: recurring online therapy plan. The customer books live video sessions "
+                f"with licensed practitioners from their account at opcionyo.com.",
+            "cancellation_rebuttal": base,
+        }
+    elif cat in ("fraudulent", "unrecognized"):
+        campos = {
+            "uncategorized_text": (base + "\n\nThe account was created and used by the "
+                                   "cardholder, who attended sessions in person by video."),
+        }
+    else:
+        campos = {"uncategorized_text": base}
+
+    campos["product_description"] = campos.get("product_description") or (
+        f"{plan}: recurring online therapy plan billed on a recurring basis. Includes live "
+        f"video sessions with licensed practitioners.")
+    campos["access_activity_log"] = (
+        f"{sesiones} sessions attended. Practitioner: {c.get('especialista') or '{especialista}'}. "
+        f"Last payment on record: {c.get('fecha_ultimo_pago') or '{fecha_ultimo_pago}'}. "
+        f"Detail: {{detalle_sesiones_con_fecha}}")
+    if c.get("nombre"):
+        campos["customer_name"] = c["nombre"]
+    if s.get("email"):
+        campos["customer_email_address"] = s["email"]
+    campos["customer_communication"] = "{pegar_conversacion_de_treble_o_llamada_de_hubspot}"
+    return campos
+
+
+def _disputa_recomendacion(exp):
+    """
+    Pelear o aceptar. El fee de respuesta se devuelve si ganás, pero
+    se cobra igual al presentarla: en montos chicos con evidencia
+    floja, pelear destruye valor.
+    """
+    s = exp.get("stripe") or {}
+    c = exp.get("cliente") or {}
+    cat = s.get("categoria")
+    monto = s.get("monto") or 0
+    if cat in ("fraudulent", "unrecognized") and not c.get("sesiones_asistidas"):
+        return ("aceptar", "Fraude sin uso del servicio: no se gana y suma el segundo fee.")
+    if monto <= DISPUTA_FEE_USD:
+        return ("aceptar", f"El monto (${monto}) no supera el fee de disputa "
+                           f"(${DISPUTA_FEE_USD}). Pelearla cuesta más de lo que recupera.")
+    if cat in DISPUTA_CATEGORIAS_FUERTES and (c.get("sesiones_asistidas") or 0):
+        return ("pelear", f"Categoría defendible y {c.get('sesiones_asistidas')} sesiones "
+                          f"asistidas: el consumo del servicio invalida el reclamo.")
+    if not c:
+        return ("revisar", "No se identificó al cliente en el CRM. Sin eso no hay expediente.")
+    return ("revisar", "Ni claramente ganable ni claramente perdida. Decide una persona.")
+
+
+# ── Guardado ──────────────────────────────────────────────────────
+
+def _disputa_guardar(d, expediente=None, borrador=None):
+    ed = d.get("evidence_details") or {}
+    vence = (datetime.fromtimestamp(ed["due_by"], timezone.utc).isoformat()
+             if ed.get("due_by") else None)
+    creada = (datetime.fromtimestamp(d["created"], timezone.utc).isoformat()
+              if d.get("created") else None)
+    exp = expediente or {}
+    s = exp.get("stripe") or {}
+    c = exp.get("cliente") or {}
+    with _db_lock, sqlite3.connect(DB_PATH) as con:
+        con.execute("""
+            INSERT INTO disputas (id, charge_id, payment_intent, monto, moneda, categoria,
+                codigo_red, estado, vence_en, creada_en, cliente_email, cliente_nombre,
+                yopsi_id, expediente, borrador)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(id) DO UPDATE SET
+                estado=excluded.estado, vence_en=excluded.vence_en,
+                expediente=COALESCE(excluded.expediente, disputas.expediente),
+                borrador=COALESCE(excluded.borrador, disputas.borrador)
+        """, (
+            d.get("id"), d.get("charge"), s.get("payment_intent"),
+            (d.get("amount") or 0) / 100, (d.get("currency") or "usd").upper(),
+            d.get("reason"), s.get("codigo_red"), d.get("status"), vence, creada,
+            s.get("email"), c.get("nombre"), c.get("yopsi_id"),
+            json.dumps(exp, ensure_ascii=False, default=str) if expediente else None,
+            json.dumps(borrador, ensure_ascii=False) if borrador else None,
+        ))
+        con.commit()
+
+
+def _disputa_leer(disputa_id):
+    with _db_lock, sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        row = con.execute("SELECT * FROM disputas WHERE id=?", (disputa_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def _disputa_marcar_aviso(disputa_id, etiqueta):
+    with _db_lock, sqlite3.connect(DB_PATH) as con:
+        prev = con.execute("SELECT avisos FROM disputas WHERE id=?", (disputa_id,)).fetchone()
+        avisos = set(filter(None, (prev[0] if prev else "").split(",")))
+        if etiqueta in avisos:
+            return False
+        avisos.add(etiqueta)
+        con.execute("UPDATE disputas SET avisos=? WHERE id=?", (",".join(sorted(avisos)), disputa_id))
+        con.commit()
+        return True
+
+
+# ── Aviso a Slack ─────────────────────────────────────────────────
+
+def _disputa_texto_slack(fila, exp, urgencia=None):
+    dias = _disputa_dias_restantes(fila.get("vence_en"))
+    accion, motivo = _disputa_recomendacion(exp)
+    c = (exp.get("cliente") or {})
+    cabeza = {"mitad": ":hourglass_flowing_sand: *Sigue sin revisar*",
+              "urgente": ":rotating_light: *Vence en menos de 48 horas*"}.get(
+                  urgencia, ":warning: *Disputa nueva*")
+    quien = c.get("nombre") or fila.get("cliente_email") or "cliente sin identificar"
+    if c.get("yopsi_id"):
+        quien += f" (ID {c['yopsi_id']})"
+    lineas = [
+        f"{cabeza} · {quien}",
+        f"*{fila['monto']:.2f} {fila['moneda']}* · motivo `{fila.get('categoria')}`"
+        + (f" · código de red `{fila['codigo_red']}`" if fila.get("codigo_red") else ""),
+        f"*Quedan {dias} días* para responder." if dias is not None else
+        "_Stripe no informó fecha límite._",
+        f"*Sugerencia:* {accion.upper()} — {motivo}",
+    ]
+    if c.get("sesiones_asistidas"):
+        lineas.append(f"El cliente asistió a *{c['sesiones_asistidas']}* sesiones"
+                      + (f", plan {c['plan']}" if c.get("plan") else "") + ".")
+    cv = exp.get("conversacion") or {}
+    if cv.get("mensajes_del_cliente"):
+        lineas.append(f"Nos escribió antes de disputar: *{cv['mensajes_del_cliente']}* mensajes "
+                      f"suyos y *{cv.get('mensajes_del_equipo', 0)}* del equipo, "
+                      f"hasta el {cv.get('ultimo_contacto','')[:10]}.")
+    else:
+        lineas.append("_No hay conversación registrada antes de la disputa._")
+    if exp.get("faltantes"):
+        lineas.append("*Falta completar:* " + " · ".join(exp["faltantes"]))
+    enlaces = [f"<{BRIDGE_URL_PUBLICA}/disputas/{fila['id']}/panel|Abrir el expediente>"] if BRIDGE_URL_PUBLICA else []
+    if c.get("ficha"):
+        enlaces.append(f"<{c['ficha']}|HubSpot>")
+    if c.get("admin"):
+        enlaces.append(f"<{c['admin']}|Admin>")
+    if enlaces:
+        lineas.append(" · ".join(enlaces))
+    return "\n".join(lineas)
+
+
+def _disputa_avisar(fila, exp, urgencia=None):
+    if not DISPUTAS_SLACK_WEBHOOK_URL:
+        log.warning("[disputas] sin DISPUTAS_SLACK_WEBHOOK_URL, no se avisa a nadie")
+        return
+    _slack_enviar(DISPUTAS_SLACK_WEBHOOK_URL,
+                  _disputa_texto_slack(fila, exp, urgencia), nombre="disputas")
+
+
+# ── Procesar una disputa que llega ────────────────────────────────
+
+def _disputa_procesar(d, avisar=True):
+    exp = _disputa_expediente(d)
+    borrador = _disputa_borrador(exp)
+    _disputa_guardar(d, exp, borrador)
+    fila = _disputa_leer(d.get("id"))
+    if avisar and fila and _disputa_marcar_aviso(d["id"], "nueva"):
+        _disputa_avisar(fila, exp)
+    return exp
+
+
+# ── Webhook ───────────────────────────────────────────────────────
+
+@app.post("/stripe/webhook")
+async def stripe_webhook(request: Request):
+    """
+    Público a propósito: lo llama Stripe, no nosotros. La autenticación
+    es la firma, que se verifica antes de mirar el contenido.
+    """
+    _disputas_aprender_url(request)
+    crudo = await request.body()
+    _stripe_verificar_firma(crudo, request.headers.get("stripe-signature"))
+    evento = json.loads(crudo.decode())
+    tipo = evento.get("type", "")
+    obj = (evento.get("data") or {}).get("object") or {}
+
+    try:
+        if tipo in ("charge.dispute.created", "charge.dispute.updated"):
+            _disputa_procesar(obj)
+        elif tipo == "charge.dispute.closed":
+            with _db_lock, sqlite3.connect(DB_PATH) as con:
+                con.execute("UPDATE disputas SET estado=?, resultado=?, cerrada_en=? WHERE id=?",
+                            (obj.get("status"), obj.get("status"),
+                             datetime.now(timezone.utc).isoformat(), obj.get("id")))
+                con.commit()
+            if DISPUTAS_SLACK_WEBHOOK_URL:
+                ganada = obj.get("status") == "won"
+                icono = ":white_check_mark:" if ganada else ":x:"
+                _slack_enviar(DISPUTAS_SLACK_WEBHOOK_URL,
+                              f"{icono} Disputa `{obj.get('id')}` cerrada: *"
+                              f"{'GANADA' if ganada else 'perdida'}* · "
+                              f"{(obj.get('amount') or 0)/100:.2f} "
+                              f"{(obj.get('currency') or 'usd').upper()}",
+                              nombre="disputas")
+        elif tipo == "radar.early_fraud_warning.created":
+            monto = None
+            try:
+                cargo = _stripe_api("GET", f"/v1/charges/{obj.get('charge')}")
+                monto = (cargo.get("amount") or 0) / 100
+            except Exception:
+                pass
+            if DISPUTAS_SLACK_WEBHOOK_URL:
+                sug = ("reembolsar sin discutir" if monto and monto <= DISPUTA_FEE_USD
+                       else "llamar al cliente hoy")
+                _slack_enviar(
+                    DISPUTAS_SLACK_WEBHOOK_URL,
+                    f":large_orange_diamond: *Alerta temprana de fraude* · cargo "
+                    f"`{obj.get('charge')}`" + (f" · {monto:.2f} USD" if monto else "") +
+                    f"\nAlrededor del 40% terminan en disputa. Sugerencia: {sug}.",
+                    nombre="disputas")
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"[disputas] error procesando {tipo}: {e}")
+        return {"recibido": True, "procesado": False, "error": str(e)}
+    return {"recibido": True, "procesado": True, "tipo": tipo}
+
+
+# ── Consulta ──────────────────────────────────────────────────────
+
+@app.get("/disputas")
+def disputas_lista(abiertas: bool = True, x_api_key: str | None = Header(default=None)):
+    _chequear_clave(x_api_key)
+    sql = "SELECT * FROM disputas"
+    if abiertas:
+        sql += " WHERE resultado IS NULL"
+    sql += " ORDER BY vence_en IS NULL, vence_en ASC"
+    with _db_lock, sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        filas = [dict(r) for r in con.execute(sql).fetchall()]
+    for f in filas:
+        f["dias_restantes"] = _disputa_dias_restantes(f.get("vence_en"))
+        f.pop("expediente", None)
+        f.pop("borrador", None)
+    return {"total": len(filas), "disputas": filas}
+
+
+@app.get("/disputas/kpis")
+def disputas_kpis(x_api_key: str | None = Header(default=None)):
+    """Tasa de éxito por categoría: el número que dice qué vale la pena pelear."""
+    _chequear_clave(x_api_key)
+    with _db_lock, sqlite3.connect(DB_PATH) as con:
+        filas = con.execute("""
+            SELECT categoria,
+                   count() total,
+                   sum(CASE WHEN resultado='won' THEN 1 ELSE 0 END) ganadas,
+                   sum(CASE WHEN resultado='lost' THEN 1 ELSE 0 END) perdidas,
+                   sum(CASE WHEN resultado IS NULL THEN 1 ELSE 0 END) abiertas,
+                   round(sum(monto), 2) monto
+            FROM disputas GROUP BY categoria ORDER BY monto DESC
+        """).fetchall()
+        vencidas = con.execute(
+            "SELECT count() FROM disputas WHERE resultado IS NULL AND enviada_en IS NULL "
+            "AND vence_en IS NOT NULL AND vence_en < ?",
+            (datetime.now(timezone.utc).isoformat(),)).fetchone()[0]
+    cats = []
+    for c, total, g, p, a, monto in filas:
+        cerradas = (g or 0) + (p or 0)
+        cats.append({"categoria": c, "total": total, "ganadas": g, "perdidas": p,
+                     "abiertas": a, "monto": monto,
+                     "tasa_exito": round(100 * g / cerradas, 1) if cerradas else None})
+    total = sum(c["total"] for c in cats)
+    return {
+        "categorias": cats,
+        "total_disputas": total,
+        "vencidas_sin_responder": vencidas,
+        "fee_pagado_estimado": round(total * DISPUTA_FEE_USD, 2),
+        "nota": ("El fee de disputa recibida no se recupera ni ganando. "
+                 "La forma de bajarlo es que no lleguen a disputa."),
+    }
+
+
+# ── Pantalla de puesta en marcha ──────────────────────────────────
+
+@app.get("/disputas/instalar", response_class=HTMLResponse)
+def disputas_instalar(request: Request, clave: str = ""):
+    """
+    Todo lo que hay que hacer para dejar esto andando, en una pantalla
+    con botones. Dice qué falta, da la URL exacta para pegar en Stripe
+    y corre la sincronización del histórico sin tocar una consola.
+    """
+    _chequear_clave(clave)
+    _disputas_aprender_url(request)
+    base = BRIDGE_URL_PUBLICA or ""
+
+    stripe_ok, stripe_msg = False, "Falta cargar STRIPE_API_KEY en Render."
+    if STRIPE_API_KEY:
+        try:
+            _stripe_api("GET", "/v1/disputes", params={"limit": 1})
+            stripe_ok, stripe_msg = True, "Conectado y respondiendo."
+        except HTTPException as e:
+            stripe_msg = f"La clave está cargada pero Stripe la rechazó: {e.detail[:160]}"
+        except Exception as e:
+            stripe_msg = f"No se pudo conectar: {e}"
+
+    with _db_lock, sqlite3.connect(DB_PATH) as con:
+        guardadas = con.execute("SELECT count() FROM disputas").fetchone()[0]
+
+    pasos = [
+        ("Clave de Stripe", stripe_ok, stripe_msg,
+         "En Render → tu servicio → Environment → Add Environment Variable. "
+         "Nombre <code>STRIPE_API_KEY</code>, valor la clave secreta que sale en "
+         "Stripe → Developers → API keys."),
+        ("Firma del webhook", bool(STRIPE_WEBHOOK_SECRET),
+         "Configurada." if STRIPE_WEBHOOK_SECRET else
+         "Falta. Sin esto el webhook rechaza todo lo que llega.",
+         "En Stripe → Developers → Webhooks → Add endpoint, pegá la URL de abajo y elegí los "
+         "cuatro eventos. Stripe te muestra un <code>whsec_...</code>: cargalo en Render como "
+         "<code>STRIPE_WEBHOOK_SECRET</code>."),
+        ("Aviso a Slack", bool(DISPUTAS_SLACK_WEBHOOK_URL),
+         "Activo." if DISPUTAS_SLACK_WEBHOOK_URL else
+         "Sin webhook de Slack: las disputas se guardan igual, pero nadie se entera.",
+         "Se usa el canal de escalamiento que ya estaba. Para uno propio, cargá "
+         "<code>DISPUTAS_SLACK_WEBHOOK_URL</code>."),
+        ("Histórico de Stripe", guardadas > 0,
+         f"{guardadas} disputas guardadas." if guardadas else
+         "Todavía no se trajo. Es el número que falta para saber qué conviene pelear.",
+         "Se trae con el botón de acá abajo. Tarda unos segundos."),
+    ]
+    listo = all(p[1] for p in pasos[:2])
+
+    filas = "".join(
+        f"<li class='{'ok' if hecho else 'no'}'><div class=t>"
+        f"<span class=ic>{'✓' if hecho else '!'}</span><b>{titulo}</b></div>"
+        f"<p>{msg}</p>{'' if hecho else f'<p class=como>{como}</p>'}</li>"
+        for titulo, hecho, msg, como in pasos)
+
+    url_webhook = f"{base}/stripe/webhook" if base else "(se completa sola al primer pedido)"
+
+    return f"""<!doctype html><html lang=es><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Disputas · puesta en marcha</title>
+<style>
+ :root{{color-scheme:light dark;--l:#d8dfe0;--m:#6d8086;--a:#0f6b62;--r:#9c2338;--w:#9a5b12}}
+ body{{font:15px/1.6 system-ui,sans-serif;max-width:760px;margin:0 auto;padding:26px 18px 60px}}
+ h1{{font-size:1.35rem;margin:0 0 4px}} .sub{{color:var(--m);margin:0 0 22px}}
+ ol{{list-style:none;padding:0;margin:0 0 24px}}
+ li{{border:1px solid var(--l);border-left-width:3px;border-radius:6px;padding:12px 15px;margin-bottom:10px}}
+ li.ok{{border-left-color:var(--a)}} li.no{{border-left-color:var(--w)}}
+ .t{{display:flex;align-items:center;gap:9px}}
+ .ic{{width:22px;height:22px;border-radius:50%;display:grid;place-items:center;
+     font-weight:700;font-size:.8rem;color:#fff;background:var(--w);flex:none}}
+ li.ok .ic{{background:var(--a)}}
+ li p{{margin:5px 0 0 31px;color:var(--m);font-size:.94rem}}
+ .como{{color:CanvasText}}
+ code{{font-family:ui-monospace,monospace;font-size:.86em;background:#6d80861f;
+   padding:.1em .35em;border-radius:4px}}
+ .url{{display:flex;gap:8px;align-items:center;flex-wrap:wrap;border:1px solid var(--l);
+   border-radius:6px;padding:11px 14px;margin-bottom:8px}}
+ .url code{{flex:1;min-width:220px;word-break:break-all;background:none;padding:0}}
+ .ev{{color:var(--m);font-size:.9rem;margin:0 0 24px}}
+ button{{font:600 15px system-ui;padding:11px 17px;border-radius:6px;border:1px solid var(--l);
+   background:Canvas;color:CanvasText;cursor:pointer}}
+ button.p{{background:var(--a);color:#fff;border-color:var(--a)}}
+ button:disabled{{opacity:.45;cursor:not-allowed}}
+ .acc{{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px}}
+ pre{{background:#6d80861a;padding:13px;border-radius:6px;overflow-x:auto;font-size:13px;
+   white-space:pre-wrap;margin:0}}
+ h2{{font-size:1rem;margin:22px 0 8px}}
+</style>
+<h1>Disputas · puesta en marcha</h1>
+<p class=sub>{'Todo listo. Ya podés traer el histórico.' if listo
+  else 'Faltan una o dos cosas. Están marcadas abajo.'}</p>
+<ol>{filas}</ol>
+
+<h2>URL para pegar en Stripe</h2>
+<div class=url><code id=u>{url_webhook}</code>
+  <button onclick="navigator.clipboard.writeText(document.getElementById('u').textContent)">Copiar</button></div>
+<p class=ev>Eventos a marcar: <code>charge.dispute.created</code> ·
+<code>charge.dispute.updated</code> · <code>charge.dispute.closed</code> ·
+<code>radar.early_fraud_warning.created</code></p>
+
+<h2>Y ahora</h2>
+<div class=acc>
+  <button class=p id=b1 onclick="sinc()" {'' if stripe_ok else 'disabled'}>
+    Traer las disputas de los últimos 6 meses</button>
+  <button onclick="kpis()">Ver la tasa de éxito</button>
+</div>
+<pre id=out>Cuando toques un botón, el resultado aparece acá.</pre>
+<script>
+const CLAVE={json.dumps(clave)};
+const out=document.getElementById('out');
+async function llamar(url,metodo){{
+  out.textContent='Trabajando…';
+  try{{
+    const r=await fetch(url,{{method:metodo,headers:{{'X-API-Key':CLAVE}}}});
+    const j=await r.json();
+    out.textContent=JSON.stringify(j,null,2);
+    return j;
+  }}catch(e){{out.textContent='Error: '+e;}}
+}}
+async function sinc(){{
+  const b=document.getElementById('b1'); b.disabled=true;
+  await llamar('/disputas/sincronizar?dias=180','POST');
+  b.disabled=false;
+  setTimeout(kpis,700);
+}}
+function kpis(){{return llamar('/disputas/kpis','GET');}}
+</script></html>"""
+
+@app.get("/disputas/{disputa_id}")
+def disputa_detalle(disputa_id: str, x_api_key: str | None = Header(default=None)):
+    _chequear_clave(x_api_key)
+    fila = _disputa_leer(disputa_id)
+    if not fila:
+        raise HTTPException(404, "No hay ninguna disputa con ese id.")
+    exp = json.loads(fila["expediente"]) if fila.get("expediente") else {}
+    accion, motivo = _disputa_recomendacion(exp)
+    return {
+        "disputa": {k: v for k, v in fila.items() if k not in ("expediente", "borrador")},
+        "dias_restantes": _disputa_dias_restantes(fila.get("vence_en")),
+        "recomendacion": {"accion": accion, "motivo": motivo},
+        "expediente": exp,
+        "borrador": json.loads(fila["borrador"]) if fila.get("borrador") else {},
+    }
+
+
+@app.post("/disputas/{disputa_id}/rearmar")
+def disputa_rearmar(disputa_id: str, x_api_key: str | None = Header(default=None)):
+    """Vuelve a juntar la evidencia. Sirve cuando se corrigió algo en el CRM."""
+    _chequear_clave(x_api_key)
+    d = _stripe_api("GET", f"/v1/disputes/{disputa_id}")
+    exp = _disputa_procesar(d, avisar=False)
+    return {"ok": True, "expediente": exp, "borrador": _disputa_borrador(exp)}
+
+
+@app.post("/disputas/sincronizar")
+def disputas_sincronizar(dias: int = 180, tope: int = 500,
+                         x_api_key: str | None = Header(default=None)):
+    """
+    Trae el histórico de Stripe con categoría y resultado.
+    Esto es lo primero que hay que correr: sin la tasa de éxito por
+    categoría no se puede decidir qué vale la pena pelear.
+    """
+    _chequear_clave(x_api_key)
+    desde = int(time.time()) - dias * 86400
+    traidas, cursor = 0, None
+    while traidas < tope:
+        params = {"limit": 100, "created[gte]": desde}
+        if cursor:
+            params["starting_after"] = cursor
+        r = _stripe_api("GET", "/v1/disputes", params=params)
+        datos = r.get("data") or []
+        if not datos:
+            break
+        for d in datos:
+            # sin expediente: el histórico se guarda para medir, no para responder
+            _disputa_guardar(d)
+            if d.get("status") in ("won", "lost"):
+                with _db_lock, sqlite3.connect(DB_PATH) as con:
+                    con.execute("UPDATE disputas SET resultado=? WHERE id=?",
+                                (d["status"], d["id"]))
+                    con.commit()
+            traidas += 1
+        cursor = datos[-1]["id"]
+        if not r.get("has_more"):
+            break
+    return {"sincronizadas": traidas, "dias": dias,
+            "siguiente": "GET /disputas/kpis para ver la tasa de éxito por categoría"}
+
+
+# ── Envío. Lo dispara una persona, nunca el sistema ───────────────
+
+@app.post("/disputas/{disputa_id}/evidencia")
+def disputa_enviar_evidencia(disputa_id: str, body: dict,
+                             x_api_key: str | None = Header(default=None)):
+    """
+    body: {"campos": {...}, "enviar": true, "por": "roberto"}
+    Con `enviar` en false se guarda el borrador en Stripe sin
+    presentarlo: se puede seguir editando hasta la fecha límite.
+    """
+    _chequear_clave(x_api_key)
+    fila = _disputa_leer(disputa_id)
+    if not fila:
+        raise HTTPException(404, "No hay ninguna disputa con ese id.")
+    if fila.get("resultado"):
+        raise HTTPException(409, f"La disputa ya está cerrada como '{fila['resultado']}'.")
+
+    campos = body.get("campos") or {}
+    if not campos:
+        raise HTTPException(400, "No hay ningún campo de evidencia para enviar.")
+
+    pendientes = [k for k, v in campos.items() if isinstance(v, str) and re.search(r"\{[a-z_]+\}", v)]
+    if pendientes and body.get("enviar"):
+        raise HTTPException(400,
+            "Estos campos todavía tienen huecos sin completar: " + ", ".join(pendientes) +
+            ". Un descargo que afirma algo que la evidencia no respalda debilita todo el "
+            "expediente. Completalos o sacá esos campos.")
+
+    form = {f"evidence[{k}]": v for k, v in campos.items() if v}
+    if body.get("enviar"):
+        form["submit"] = "true"
+    r = _stripe_api("POST", f"/v1/disputes/{disputa_id}", form=form)
+
+    if body.get("enviar"):
+        with _db_lock, sqlite3.connect(DB_PATH) as con:
+            con.execute("UPDATE disputas SET enviada_en=?, enviada_por=?, estado=?, borrador=? "
+                        "WHERE id=?",
+                        (datetime.now(timezone.utc).isoformat(), str(body.get("por") or "sin firma"),
+                         r.get("status"), json.dumps(campos, ensure_ascii=False), disputa_id))
+            con.commit()
+        if DISPUTAS_SLACK_WEBHOOK_URL:
+            _slack_enviar(DISPUTAS_SLACK_WEBHOOK_URL,
+                          f":outbox_tray: Evidencia presentada en la disputa `{disputa_id}` "
+                          f"por *{body.get('por') or 'sin firma'}* · "
+                          f"{fila['monto']:.2f} {fila['moneda']}. "
+                          f"El banco emisor tarda entre 60 y 75 días en decidir.",
+                          nombre="disputas")
+    else:
+        with _db_lock, sqlite3.connect(DB_PATH) as con:
+            con.execute("UPDATE disputas SET borrador=? WHERE id=?",
+                        (json.dumps(campos, ensure_ascii=False), disputa_id))
+            con.commit()
+    return {"ok": True, "enviada": bool(body.get("enviar")), "estado": r.get("status")}
+
+
+@app.post("/disputas/{disputa_id}/aceptar")
+def disputa_aceptar(disputa_id: str, body: dict,
+                    x_api_key: str | None = Header(default=None)):
+    """
+    Aceptar es renunciar al dinero: cierra la disputa como perdida y
+    no tiene vuelta atrás. Por eso exige `confirmar` explícito y firma.
+    """
+    _chequear_clave(x_api_key)
+    if not body.get("confirmar"):
+        raise HTTPException(400,
+            "Aceptar la disputa cierra el caso como perdido y no se puede deshacer. "
+            "Mandá {\"confirmar\": true, \"por\": \"<nombre>\"} si es lo que querés.")
+    r = _stripe_api("POST", f"/v1/disputes/{disputa_id}/close")
+    with _db_lock, sqlite3.connect(DB_PATH) as con:
+        con.execute("UPDATE disputas SET estado=?, resultado='lost', cerrada_en=?, enviada_por=? "
+                    "WHERE id=?",
+                    (r.get("status"), datetime.now(timezone.utc).isoformat(),
+                     str(body.get("por") or "sin firma"), disputa_id))
+        con.commit()
+    return {"ok": True, "estado": r.get("status")}
+
+
+# ── El panel de revisión ──────────────────────────────────────────
+
+@app.get("/disputas/{disputa_id}/panel", response_class=HTMLResponse)
+def disputa_panel(disputa_id: str, clave: str = ""):
+    """
+    La pantalla donde una persona revisa y envía. La clave va por query
+    porque el enlace se abre desde Slack, donde no se pueden mandar
+    cabeceras.
+    """
+    _chequear_clave(clave)
+    fila = _disputa_leer(disputa_id)
+    if not fila:
+        raise HTTPException(404, "No hay ninguna disputa con ese id.")
+    exp = json.loads(fila["expediente"]) if fila.get("expediente") else {}
+    borrador = json.loads(fila["borrador"]) if fila.get("borrador") else {}
+    accion, motivo = _disputa_recomendacion(exp)
+    dias = _disputa_dias_restantes(fila.get("vence_en"))
+    c = exp.get("cliente") or {}
+
+    def esc(x):
+        return (str(x if x is not None else "")
+                .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+    campos_html = "".join(
+        f"<label><span class=k>{esc(k)}</span>"
+        f"<textarea name='{esc(k)}' rows='{min(14, 2 + str(v).count(chr(10)) + len(str(v)) // 90)}'>"
+        f"{esc(v)}</textarea></label>"
+        for k, v in borrador.items())
+
+    faltan = exp.get("faltantes") or []
+    faltan_html = ("<div class='warn'><b>Falta completar:</b> " +
+                   " · ".join(esc(f) for f in faltan) + "</div>") if faltan else ""
+
+    ficha = "".join(
+        f"<div><span>{esc(kk)}</span><b>{esc(vv)}</b></div>"
+        for kk, vv in [("Cliente", c.get("nombre")), ("ID Yopsi", c.get("yopsi_id")),
+                       ("Plan", c.get("plan")), ("Sesiones asistidas", c.get("sesiones_asistidas")),
+                       ("Especialista", c.get("especialista")),
+                       ("Último pago", c.get("fecha_ultimo_pago")),
+                       ("Motivo", fila.get("categoria")), ("Código de red", fila.get("codigo_red"))]
+        if vv)
+
+    enviada = (f"<div class='ok'>Evidencia presentada el {esc(fila['enviada_en'][:16])} "
+               f"por {esc(fila.get('enviada_por'))}. El emisor tarda 60 a 75 días.</div>"
+               if fila.get("enviada_en") else "")
+
+    return f"""<!doctype html><html lang=es><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Disputa {esc(disputa_id)}</title>
+<style>
+ :root{{color-scheme:light dark;--l:#d8dfe0;--m:#6d8086;--a:#0f6b62;--r:#9c2338;--w:#9a5b12}}
+ body{{font:15px/1.55 system-ui,sans-serif;max-width:860px;margin:0 auto;padding:24px 18px 80px}}
+ h1{{font-size:1.3rem;margin:0 0 4px}} .sub{{color:var(--m);margin:0 0 18px}}
+ .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1px;
+        background:var(--l);border:1px solid var(--l);margin-bottom:16px}}
+ .grid>div{{background:Canvas;padding:10px 12px;display:flex;flex-direction:column;gap:2px}}
+ .grid span{{font-size:.72rem;letter-spacing:.08em;text-transform:uppercase;color:var(--m)}}
+ .rec{{border-left:3px solid var(--a);padding:10px 14px;margin-bottom:14px;background:#0f6b6212}}
+ .warn{{border-left:3px solid var(--w);padding:10px 14px;margin-bottom:14px;background:#9a5b1212}}
+ .ok{{border-left:3px solid var(--a);padding:10px 14px;margin-bottom:14px;background:#0f6b6212}}
+ .urg{{color:var(--r);font-weight:700}}
+ label{{display:block;margin-bottom:14px}}
+ .k{{display:block;font:600 .74rem/1.6 ui-monospace,monospace;letter-spacing:.04em;color:var(--a)}}
+ textarea{{width:100%;box-sizing:border-box;font:13px/1.5 ui-monospace,monospace;padding:9px;
+   border:1px solid var(--l);border-radius:5px;background:Canvas;color:CanvasText}}
+ .bar{{position:sticky;bottom:0;background:Canvas;border-top:1px solid var(--l);
+   padding:12px 0 calc(12px + env(safe-area-inset-bottom,0px));display:flex;gap:10px;flex-wrap:wrap}}
+ button{{font:600 15px system-ui;padding:11px 18px;border-radius:6px;border:1px solid var(--l);
+   cursor:pointer;background:Canvas;color:CanvasText}}
+ button.p{{background:var(--a);color:#fff;border-color:var(--a)}}
+ button.d{{color:var(--r);border-color:var(--r)}}
+ #msg{{padding:10px 0;font-weight:600}}
+ a{{color:var(--a)}}
+</style>
+<h1>Disputa · {esc(fila['monto'])} {esc(fila['moneda'])}</h1>
+<p class=sub><code>{esc(disputa_id)}</code> ·
+{'<span class=urg>quedan ' + esc(dias) + ' días</span>' if dias is not None and dias < 3
+ else 'quedan ' + esc(dias) + ' días' if dias is not None else 'sin fecha límite informada'}
+{' · <a href="' + esc(c.get('ficha')) + '">HubSpot</a>' if c.get('ficha') else ''}
+{' · <a href="' + esc(c.get('admin')) + '">Admin</a>' if c.get('admin') else ''}</p>
+{enviada}
+<div class=grid>{ficha}</div>
+<div class=rec><b>Sugerencia: {esc(accion.upper())}</b> — {esc(motivo)}</div>
+{faltan_html}
+<form id=f>{campos_html}</form>
+<div id=msg></div>
+<div class=bar>
+  <button class=p onclick="mandar(true)">Presentar a Stripe</button>
+  <button onclick="mandar(false)">Guardar borrador</button>
+  <button class=d onclick="aceptar()">Aceptar la disputa</button>
+</div>
+<script>
+const ID={json.dumps(disputa_id)}, CLAVE={json.dumps(clave)};
+function campos(){{const o={{}};for(const t of document.querySelectorAll('textarea'))
+  if(t.value.trim())o[t.name]=t.value;return o;}}
+async function pedir(url,body){{
+  const r=await fetch(url,{{method:'POST',headers:{{'Content-Type':'application/json','X-API-Key':CLAVE}},
+    body:JSON.stringify(body)}});
+  const j=await r.json().catch(()=>({{}}));
+  const m=document.getElementById('msg');
+  if(r.ok){{m.style.color='#0f6b62';m.textContent='Listo.';}}
+  else{{m.style.color='#9c2338';m.textContent=j.detail||('Error '+r.status);}}
+  return r.ok;}}
+async function mandar(enviar){{
+  if(enviar&&!confirm('Se presenta la evidencia al banco emisor. No se puede deshacer.'))return;
+  await pedir('/disputas/'+ID+'/evidencia',{{campos:campos(),enviar:enviar,por:'panel'}});
+  if(enviar)setTimeout(()=>location.reload(),900);}}
+async function aceptar(){{
+  if(!confirm('Aceptar cierra la disputa como perdida y renuncia al dinero. ¿Seguro?'))return;
+  if(await pedir('/disputas/'+ID+'/aceptar',{{confirmar:true,por:'panel'}}))
+    setTimeout(()=>location.reload(),900);}}
+</script></html>"""
+
+
+# ── Vigilante de plazos ───────────────────────────────────────────
+
+def _disputas_loop():
+    while True:
+        try:
+            with _db_lock, sqlite3.connect(DB_PATH) as con:
+                con.row_factory = sqlite3.Row
+                filas = [dict(r) for r in con.execute(
+                    "SELECT * FROM disputas WHERE resultado IS NULL AND enviada_en IS NULL "
+                    "AND vence_en IS NOT NULL").fetchall()]
+            for f in filas:
+                dias = _disputa_dias_restantes(f.get("vence_en"))
+                if dias is None or dias < 0:
+                    continue
+                exp = json.loads(f["expediente"]) if f.get("expediente") else {}
+                if dias <= 2 and _disputa_marcar_aviso(f["id"], "urgente"):
+                    _disputa_avisar(f, exp, urgencia="urgente")
+                elif dias <= 5 and _disputa_marcar_aviso(f["id"], "mitad"):
+                    _disputa_avisar(f, exp, urgencia="mitad")
+        except Exception as e:
+            log.error(f"[disputas] el vigilante de plazos falló: {e}")
+        time.sleep(3600)
+
+
+def arrancar_disputas():
+    if not STRIPE_API_KEY:
+        log.warning("[startup] disputas NO arranca — falta STRIPE_API_KEY.")
+        return
+    if not _a_bool(DISPUTAS_ACTIVO, por_defecto=True):
+        log.warning("[startup] disputas desactivado por DISPUTAS_ACTIVO.")
+        return
+    if not STRIPE_WEBHOOK_SECRET:
+        log.warning("[startup] disputas: falta STRIPE_WEBHOOK_SECRET. El webhook va a "
+                    "rechazar todo hasta que se configure.")
+    threading.Thread(target=_disputas_loop, daemon=True).start()
+    log.warning("[startup] disputas activo · vigilante de plazos cada hora · "
+                "el envío a Stripe lo dispara siempre una persona")
+
+
+arrancar_disputas()
