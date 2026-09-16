@@ -2022,7 +2022,7 @@ def version_bloques(x_api_key: str | None = Header(default=None)):
     _chequear_clave(x_api_key)
     return {
         "base": "1.3.3",
-        "bloques": ["workflows_push (1.3.4)", "cohorte_renovaciones (1.3.5)", "reintento_pushes (1.3.5)", "contador_sesiones (1.3.6)", "workflows_crudo (1.3.7)", "riesgo_cancelacion (1.3.8)", "salud_mensajeria (1.3.9)", "correccion_veteranos (1.4.0)", "salud_detalle (1.4.1)", "arreglos_cruce_y_auditoria (1.4.2)", "reintento_automatico (1.4.2)", "cobertura_bifurcacion (1.4.2)", "sesiones_agendadas (1.4.3)", "monitor_riesgo (1.4.4)", "riesgo_lista_v2 (1.4.4)", "segmento_dormant (1.4.5)", "parte_operativo (1.4.6)", "reintento_por_nombre (1.4.7)", "caducidad_reintento (1.4.8)", "pedidos_v2 (1.4.9)", "webhook_propio_pedidos (1.5.0)", "sla_v2 (1.5.1)", "partes_sin_repetir (1.5.2)", "alcance_cola_reintento (1.5.3)", "cliente_esperando (1.5.4)", "disputas_stripe (1.5.5)", "adopcion_campanas (1.5.6)"],
+        "bloques": ["workflows_push (1.3.4)", "cohorte_renovaciones (1.3.5)", "reintento_pushes (1.3.5)", "contador_sesiones (1.3.6)", "workflows_crudo (1.3.7)", "riesgo_cancelacion (1.3.8)", "salud_mensajeria (1.3.9)", "correccion_veteranos (1.4.0)", "salud_detalle (1.4.1)", "arreglos_cruce_y_auditoria (1.4.2)", "reintento_automatico (1.4.2)", "cobertura_bifurcacion (1.4.2)", "sesiones_agendadas (1.4.3)", "monitor_riesgo (1.4.4)", "riesgo_lista_v2 (1.4.4)", "segmento_dormant (1.4.5)", "parte_operativo (1.4.6)", "reintento_por_nombre (1.4.7)", "caducidad_reintento (1.4.8)", "pedidos_v2 (1.4.9)", "webhook_propio_pedidos (1.5.0)", "sla_v2 (1.5.1)", "partes_sin_repetir (1.5.2)", "alcance_cola_reintento (1.5.3)", "cliente_esperando (1.5.4)", "disputas_stripe (1.5.5)", "adopcion_campanas (1.5.6)", "enriquecer_stripe (1.5.7)"],
         "endpoints_nuevos": [
             "POST /cohorte/setup", "POST /cohorte/procesar",
             "GET /cohorte/renovaciones", "GET /cohorte/kpis",
@@ -8153,4 +8153,298 @@ def pushes_adoptar(body: dict | None = None,
                  "se pueden crear después con POST /workflows/push sin volver a tocar la "
                  "propiedad. Si los workflows nacieron apagados, el reintento todavía no "
                  "los usa: hay que activarlos."),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════
+#  ENRIQUECIMIENTO DE COBROS EN STRIPE  ·  v1.5.7
+#  Agregado 16/09/2026. BLOQUE PURAMENTE ADITIVO: no toca ni una
+#  línea de lo anterior. Todo lo nuevo vive acá abajo.
+#
+#  ── Por qué existe ────────────────────────────────────────────────
+#  El 16/09 revisamos un cobro real en el dashboard (pi_3UGEYs…,
+#  USD 160, Plan Premium) y el PaymentIntent, la suscripción y el
+#  Customer estaban los tres vacíos:
+#
+#      PaymentIntent.metadata ... vacío
+#      PaymentIntent.description "Subscription creation"
+#      Subscription.metadata .... vacío
+#      Customer.name ............ vacío
+#      Customer.phone ........... vacío
+#      Customer.address ......... vacío
+#
+#  Eso importa porque cuando se responde una disputa, Stripe arma la
+#  evidencia con campos propios — customer_name, billing_address,
+#  customer_email_address, product_description — que salen del
+#  Customer y del PaymentIntent. Con esos objetos vacíos la evidencia
+#  sale en blanco haga uno lo que haga, y Smart Disputes no tiene
+#  nada que completar. Sobre 262 disputas medidas, 96 son
+#  'fraudulent' (37%) y se ganan el 26%: es justo la categoría que
+#  este agujero castiga, porque el banco emisor ve un cargo sin
+#  nombre, sin dirección y sin descripción del servicio.
+#
+#  La metadata en Stripe es MUTABLE: se puede escribir en un cobro
+#  que ya existe, incluso con la disputa abierta. Por eso esto sirve
+#  hacia atrás, no solo para los cobros nuevos.
+#
+#  ── Qué escribe ───────────────────────────────────────────────────
+#  Customer      : name, phone, address[country]
+#  PaymentIntent : description  ("Plan X · N sesiones · Opción YO")
+#                  metadata     yopsi_id, plan, sesiones_asistidas,
+#                               especialista, hubspot_id
+#
+#  ── Salvaguardas ──────────────────────────────────────────────────
+#  · DRY-RUN por defecto. Sin ?aplicar=true simula y devuelve qué
+#    haría, sin escribir nada en Stripe.
+#  · NUNCA pisa un valor que ya tenga contenido. Si alguien cargó el
+#    nombre a mano, queda como está. Con ?sobrescribir=true se puede
+#    forzar, pero no es el camino normal.
+#  · Solo escribe lo que encontró en HubSpot. Sin ficha, no toca nada
+#    (no inventa datos que después habría que defender ante un banco).
+#  · Tope por corrida.
+#  · Por defecto arranca por los cobros CON DISPUTA ABIERTA, que son
+#    los que se van a responder esta semana.
+# ══════════════════════════════════════════════════════════════════
+
+ENRIQUECER_MAX_POR_CORRIDA = int(os.environ.get("ENRIQUECER_MAX_POR_CORRIDA", "50"))
+
+METRICAS.setdefault("cobros_enriquecidos", 0)
+
+
+def _enr_vacio(v):
+    """Un valor de Stripe cuenta como vacío si es None o string en blanco."""
+    return v is None or (isinstance(v, str) and not v.strip())
+
+
+def _enr_desde_hubspot(email):
+    """
+    Datos del cliente listos para escribir en Stripe, o None si no hay ficha.
+    Devuelve solo las claves que de verdad tienen valor.
+    """
+    p = _disputa_contacto_hubspot(email)
+    if not p:
+        return None
+
+    nombre = " ".join(x for x in [(p.get("firstname") or "").strip(),
+                                  (p.get("lastname") or "").strip()] if x).strip()
+    telefono = (p.get("hs_whatsapp_phone_number") or p.get("phone") or "").strip()
+    plan = (p.get("plan") or p.get("tipo_de_plan") or "").strip()
+    sesiones = p.get("sesiones_asistidas")
+
+    meta = {}
+    for clave, valor in (("yopsi_id", p.get("yopsi_id")),
+                         ("plan", plan),
+                         ("sesiones_asistidas", sesiones),
+                         ("especialista", p.get("especialista_label")),
+                         ("hubspot_id", p.get("_hs_id"))):
+        if valor not in (None, "", "null"):
+            meta[clave] = str(valor)[:480]
+
+    # La descripción es lo que lee el banco emisor. Que diga qué se
+    # compró, no "Subscription creation".
+    partes = [plan or "Suscripción"]
+    if sesiones not in (None, "", "0"):
+        partes.append(f"{sesiones} sesiones realizadas")
+    partes.append("Opción YO")
+    descripcion = " · ".join(partes)[:350]
+
+    return {"nombre": nombre, "telefono": telefono,
+            "metadata": meta, "descripcion": descripcion,
+            "hubspot_id": p.get("_hs_id")}
+
+
+def _enr_plan_cambios(pi, datos, sobrescribir=False):
+    """
+    Qué habría que escribir en este PaymentIntent y en su Customer.
+    Devuelve (cambios_pi, cambios_cliente). Función pura: no escribe.
+    """
+    cambios_pi, cambios_cli = {}, {}
+
+    if datos["metadata"] and (sobrescribir or not (pi.get("metadata") or {})):
+        cambios_pi["metadata"] = dict(datos["metadata"])
+
+    desc = pi.get("description") or ""
+    # "Subscription creation" es el texto que pone Stripe solo: cuenta
+    # como vacío aunque técnicamente haya algo escrito.
+    generica = _enr_vacio(desc) or desc.strip().lower() in (
+        "subscription creation", "subscription update", "invoice")
+    if datos["descripcion"] and (sobrescribir or generica):
+        cambios_pi["description"] = datos["descripcion"]
+
+    cli = pi.get("customer")
+    cli = cli if isinstance(cli, dict) else None
+    if cli:
+        if datos["nombre"] and (sobrescribir or _enr_vacio(cli.get("name"))):
+            cambios_cli["name"] = datos["nombre"]
+        if datos["telefono"] and (sobrescribir or _enr_vacio(cli.get("phone"))):
+            cambios_cli["phone"] = datos["telefono"]
+
+    return cambios_pi, cambios_cli
+
+
+def _enr_form(d, prefijo=None):
+    """Aplana un dict al formato form-encoded que espera Stripe."""
+    salida = {}
+    for k, v in d.items():
+        clave = f"{prefijo}[{k}]" if prefijo else k
+        if isinstance(v, dict):
+            salida.update(_enr_form(v, clave))
+        else:
+            salida[clave] = v
+    return salida
+
+
+def _enr_cobros_con_disputa(tope):
+    """PaymentIntents de las disputas que todavía se pueden responder."""
+    r = _stripe_api("GET", "/v1/disputes",
+                    params={"limit": min(int(tope), 100),
+                            "expand[]": "data.payment_intent"})
+    salida = []
+    for d in r.get("data") or []:
+        if d.get("status") not in ("warning_needs_response", "needs_response"):
+            continue
+        pi = d.get("payment_intent")
+        pi_id = pi.get("id") if isinstance(pi, dict) else pi
+        if pi_id:
+            salida.append(pi_id)
+    return salida
+
+
+def _enr_cobros_recientes(tope):
+    r = _stripe_api("GET", "/v1/payment_intents",
+                    params={"limit": min(int(tope), 100)})
+    return [p["id"] for p in (r.get("data") or []) if p.get("id")]
+
+
+def _enr_traer_pi(pi_id):
+    return _stripe_api("GET", f"/v1/payment_intents/{pi_id}",
+                       params={"expand[]": "customer"})
+
+
+@app.get("/stripe/enriquecimiento/estado")
+def enriquecimiento_estado(x_api_key: str | None = Header(default=None),
+                           muestra: int = 25):
+    """
+    Diagnóstico: de los últimos cobros, cuántos están vacíos.
+    Solo lectura, no escribe nada en Stripe ni en HubSpot.
+    """
+    _chequear_clave(x_api_key)
+    ids = _enr_cobros_recientes(min(int(muestra), 100))
+    total = sin_meta = sin_desc = sin_nombre = sin_telefono = 0
+    for pi_id in ids:
+        try:
+            pi = _enr_traer_pi(pi_id)
+        except HTTPException:
+            continue
+        total += 1
+        if not (pi.get("metadata") or {}):
+            sin_meta += 1
+        desc = (pi.get("description") or "").strip().lower()
+        if not desc or desc in ("subscription creation", "subscription update", "invoice"):
+            sin_desc += 1
+        cli = pi.get("customer")
+        cli = cli if isinstance(cli, dict) else {}
+        if _enr_vacio(cli.get("name")):
+            sin_nombre += 1
+        if _enr_vacio(cli.get("phone")):
+            sin_telefono += 1
+
+    def pct(n):
+        return round(100 * n / total, 1) if total else 0.0
+
+    return {
+        "cobros_revisados": total,
+        "sin_metadata": {"casos": sin_meta, "pct": pct(sin_meta)},
+        "descripcion_generica": {"casos": sin_desc, "pct": pct(sin_desc)},
+        "cliente_sin_nombre": {"casos": sin_nombre, "pct": pct(sin_nombre)},
+        "cliente_sin_telefono": {"casos": sin_telefono, "pct": pct(sin_telefono)},
+        "por_que_importa": ("Stripe arma la evidencia de una disputa con customer_name, "
+                            "billing_address y product_description. Si el Customer y el "
+                            "PaymentIntent están vacíos, esos campos salen en blanco y "
+                            "Smart Disputes no tiene con qué trabajar."),
+    }
+
+
+@app.post("/stripe/enriquecer")
+def stripe_enriquecer(x_api_key: str | None = Header(default=None),
+                      aplicar: bool = False,
+                      solo_disputas: bool = True,
+                      sobrescribir: bool = False,
+                      tope: int | None = None):
+    """
+    Rellena en Stripe los datos que hacen falta para defender una disputa,
+    tomándolos de la ficha de HubSpot.
+
+    ?aplicar=true        escribe de verdad (por defecto simula)
+    ?solo_disputas=false además de las disputas abiertas, cobros recientes
+    ?sobrescribir=true   pisa valores que ya tengan contenido (no recomendado)
+    ?tope=N              cuántos cobros como máximo
+    """
+    _chequear_clave(x_api_key)
+    limite = min(int(tope), ENRIQUECER_MAX_POR_CORRIDA) if tope else ENRIQUECER_MAX_POR_CORRIDA
+
+    ids = _enr_cobros_con_disputa(limite)
+    origen = "disputas_abiertas"
+    if not solo_disputas:
+        vistos = set(ids)
+        for pi_id in _enr_cobros_recientes(limite):
+            if pi_id not in vistos and len(ids) < limite:
+                ids.append(pi_id)
+                vistos.add(pi_id)
+        origen = "disputas_abiertas + cobros_recientes"
+    ids = ids[:limite]
+
+    plan, omitidos = [], {"sin_ficha_en_hubspot": 0, "ya_estaba_completo": 0, "error": 0}
+    for pi_id in ids:
+        try:
+            pi = _enr_traer_pi(pi_id)
+        except HTTPException:
+            omitidos["error"] += 1
+            continue
+        cli = pi.get("customer")
+        cli = cli if isinstance(cli, dict) else {}
+        email = (cli.get("email") or pi.get("receipt_email") or "").strip()
+        datos = _enr_desde_hubspot(email) if email else None
+        if not datos:
+            omitidos["sin_ficha_en_hubspot"] += 1
+            continue
+        cam_pi, cam_cli = _enr_plan_cambios(pi, datos, sobrescribir)
+        if not cam_pi and not cam_cli:
+            omitidos["ya_estaba_completo"] += 1
+            continue
+        plan.append({"payment_intent": pi_id, "customer": cli.get("id"),
+                     "email": email, "hubspot_id": datos["hubspot_id"],
+                     "cambios_cobro": cam_pi, "cambios_cliente": cam_cli})
+
+    if not aplicar:
+        return {
+            "modo": "simulacion", "origen": origen, "tope": limite,
+            "cobros_mirados": len(ids), "a_enriquecer": len(plan),
+            "omitidos": omitidos, "plan": plan[:20],
+            "aviso": "Simulación. Para escribir de verdad: POST /stripe/enriquecer?aplicar=true",
+        }
+
+    hechos, errores = [], []
+    for item in plan:
+        try:
+            if item["cambios_cobro"]:
+                _stripe_api("POST", f"/v1/payment_intents/{item['payment_intent']}",
+                            form=_enr_form(item["cambios_cobro"]))
+            if item["cambios_cliente"] and item["customer"]:
+                _stripe_api("POST", f"/v1/customers/{item['customer']}",
+                            form=_enr_form(item["cambios_cliente"]))
+            hechos.append(item["payment_intent"])
+        except HTTPException as e:
+            errores.append({"payment_intent": item["payment_intent"], "error": e.detail})
+        except Exception as e:
+            errores.append({"payment_intent": item["payment_intent"], "error": str(e)})
+
+    METRICAS["cobros_enriquecidos"] += len(hechos)
+    return {
+        "modo": "aplicado", "origen": origen,
+        "enriquecidos": len(hechos), "errores": errores, "omitidos": omitidos,
+        "nota": ("Esto arregla los cobros que ya existen. Para que los nuevos nazcan "
+                 "completos hay que mandar la metadata en payment_intent_data.metadata "
+                 "al crear el Checkout, y cargar name/phone en el Customer: poner "
+                 "metadata a nivel de la Session no baja al cobro."),
     }
