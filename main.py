@@ -2022,7 +2022,7 @@ def version_bloques(x_api_key: str | None = Header(default=None)):
     _chequear_clave(x_api_key)
     return {
         "base": "1.3.3",
-        "bloques": ["workflows_push (1.3.4)", "cohorte_renovaciones (1.3.5)", "reintento_pushes (1.3.5)", "contador_sesiones (1.3.6)", "workflows_crudo (1.3.7)", "riesgo_cancelacion (1.3.8)", "salud_mensajeria (1.3.9)", "correccion_veteranos (1.4.0)", "salud_detalle (1.4.1)", "arreglos_cruce_y_auditoria (1.4.2)", "reintento_automatico (1.4.2)", "cobertura_bifurcacion (1.4.2)", "sesiones_agendadas (1.4.3)", "monitor_riesgo (1.4.4)", "riesgo_lista_v2 (1.4.4)", "segmento_dormant (1.4.5)", "parte_operativo (1.4.6)", "reintento_por_nombre (1.4.7)", "caducidad_reintento (1.4.8)", "pedidos_v2 (1.4.9)", "webhook_propio_pedidos (1.5.0)", "sla_v2 (1.5.1)", "partes_sin_repetir (1.5.2)", "alcance_cola_reintento (1.5.3)", "cliente_esperando (1.5.4)", "disputas_stripe (1.5.5)", "adopcion_campanas (1.5.6)", "enriquecer_stripe (1.5.7)", "panel_consultoria (1.5.9)"],
+        "bloques": ["workflows_push (1.3.4)", "cohorte_renovaciones (1.3.5)", "reintento_pushes (1.3.5)", "contador_sesiones (1.3.6)", "workflows_crudo (1.3.7)", "riesgo_cancelacion (1.3.8)", "salud_mensajeria (1.3.9)", "correccion_veteranos (1.4.0)", "salud_detalle (1.4.1)", "arreglos_cruce_y_auditoria (1.4.2)", "reintento_automatico (1.4.2)", "cobertura_bifurcacion (1.4.2)", "sesiones_agendadas (1.4.3)", "monitor_riesgo (1.4.4)", "riesgo_lista_v2 (1.4.4)", "segmento_dormant (1.4.5)", "parte_operativo (1.4.6)", "reintento_por_nombre (1.4.7)", "caducidad_reintento (1.4.8)", "pedidos_v2 (1.4.9)", "webhook_propio_pedidos (1.5.0)", "sla_v2 (1.5.1)", "partes_sin_repetir (1.5.2)", "alcance_cola_reintento (1.5.3)", "cliente_esperando (1.5.4)", "disputas_stripe (1.5.5)", "adopcion_campanas (1.5.6)", "enriquecer_stripe (1.5.7)", "panel_consultoria (1.6.0)"],
         "endpoints_nuevos": [
             "POST /cohorte/setup", "POST /cohorte/procesar",
             "GET /cohorte/renovaciones", "GET /cohorte/kpis",
@@ -8451,7 +8451,7 @@ def stripe_enriquecer(x_api_key: str | None = Header(default=None),
 
 
 # ══════════════════════════════════════════════════════════════════
-#  PANEL DE CONSULTORÍA  ·  v1.5.9   (reemplaza a 1.5.8)
+#  PANEL DE CONSULTORÍA  ·  v1.6.0   (reemplaza a 1.5.8 y 1.5.9)
 #  Auditado contra el dato real del portal el 17/09/2026.
 #  BLOQUE PURAMENTE ADITIVO.
 #
@@ -8788,6 +8788,13 @@ def _consul_calcular(periodo):
     equipo = _consul_equipo()
     tickets = _consul_tickets(desde, hasta)
     llamadas = _consul_llamadas(desde, hasta, equipo)
+    try:
+        pr_map, pr_info = _consul_primera_respuesta(tickets, llamadas, desde)
+    except Exception as e:
+        log.error(f"[consultoria] primera respuesta no disponible: {e}")
+        pr_map, pr_info = {}, {"dwh_ok": False, "error": str(e),
+                               "por_canal": {"whatsapp": 0, "llamada": 0}}
+    pr_valores = []
 
     por_consultor, por_tipo, por_etapa, por_resolucion = {}, {}, {}, {}
     cierres, gestiones = [], []
@@ -8815,7 +8822,7 @@ def _consul_calcular(periodo):
         c = por_consultor.setdefault(nombre, {
             "consultor": nombre, "owner_id": oid, "tickets": 0, "cerrados": 0,
             "abiertos": 0, "cierres_ms": [], "gestiones_ms": [],
-            "exito": 0, "no_exito": 0, "sin_resolucion": 0,
+            "exito": 0, "no_exito": 0, "sin_resolucion": 0, "pr_ms": [],
             "seg_total": 0, "regla_ok": 0, "regla_mal": 0,
             "llamadas": 0, "contestadas": 0, "minutos": 0.0,
         })
@@ -8831,6 +8838,10 @@ def _consul_calcular(periodo):
         pg = _consul_primera_gestion(p)
         if pg:
             c["gestiones_ms"].append(pg); gestiones.append(pg)
+
+        pr = pr_map.get(str(p.get("hs_object_id") or ""))
+        if pr:
+            c["pr_ms"].append(pr[0]); pr_valores.append(pr[0])
 
         seg = _consul_seguimientos(p)
         c["seg_total"] += seg
@@ -8895,12 +8906,14 @@ def _consul_calcular(periodo):
     for c in por_consultor.values():
         med = _consul_mediana(c["cierres_ms"])
         medg = _consul_mediana(c["gestiones_ms"])
+        medpr = _consul_mediana(c["pr_ms"])
         juzgados = c["exito"] + c["no_exito"]
         filas.append({
             "consultor": c["consultor"], "owner_id": c["owner_id"],
             "tickets": c["tickets"], "cerrados": c["cerrados"], "abiertos": c["abiertos"],
             "cierre_mediana_h": _consul_horas(med),
             "gestion_mediana_h": _consul_horas(medg),
+            "pr_mediana_h": _consul_horas(medpr), "pr_casos": len(c["pr_ms"]),
             "exito": c["exito"], "no_exito": c["no_exito"],
             "sin_resolucion": c["sin_resolucion"],
             "tasa_exito_pct": _consul_pct(c["exito"], juzgados),
@@ -8928,6 +8941,9 @@ def _consul_calcular(periodo):
             "cierre_casos": len(cierres),
             "gestion_mediana_h": _consul_horas(_consul_mediana(gestiones)),
             "gestion_casos": len(gestiones),
+            "pr_mediana_h": _consul_horas(_consul_mediana(pr_valores)),
+            "pr_casos": len(pr_valores),
+            "pr_cobertura_pct": _consul_pct(len(pr_valores), n),
             "llamadas": llamadas_equipo["total"],
             "contestadas": llamadas_equipo["contestadas"],
             "minutos": round(llamadas_equipo["ms"] / 60000.0, 1),
@@ -8954,6 +8970,21 @@ def _consul_calcular(periodo):
                                 "Si no contestó, hacen falta 3 como mínimo.",
                       como_se_sabe="El «contestó / no contestó» sale de hs_resolution: "
                                    "«Sin éxito · sin respuesta» = no contestó."),
+        "primera_respuesta": {
+            "casos": len(pr_valores), "de": n,
+            "cobertura_pct": _consul_pct(len(pr_valores), n),
+            "mediana_h": _consul_horas(_consul_mediana(pr_valores)),
+            "p90_h": _consul_horas(sorted(pr_valores)[int(len(pr_valores) * 0.9)]
+                                   if pr_valores else None),
+            "dentro_de_1h": sum(1 for v in pr_valores if v <= 3600000),
+            "mas_de_24h": sum(1 for v in pr_valores if v > 86400000),
+            "por_canal": pr_info.get("por_canal") or {},
+            "dwh_ok": bool(pr_info.get("dwh_ok")),
+            "diagnostico": pr_info,
+            "fuente": ("DWH · fact_agent_messages (mensajes salientes de Treble) + "
+                       "llamadas salientes del CRM. Es el primer contacto del equipo "
+                       "hacia el cliente después de creado el ticket."),
+        },
         "consultores": filas,
         "por_tipo": sorted([{"tipo": k, "tickets": v} for k, v in por_tipo.items()],
                            key=lambda x: -x["tickets"]),
@@ -8970,12 +9001,14 @@ def _consul_calcular(periodo):
                                          "pct": _consul_pct(n - tipo_de_categoria, n),
                                          "que_hacer": "Cargar hs_ticket_category en la plantilla "
                                                       "del ticket deja de depender del asunto."},
-            "primera_respuesta": {"casos": 0, "de": n, "pct": 0.0,
-                                  "que_hacer": "HubSpot sólo la calcula sobre su bandeja. "
-                                               "En Consultoría se atiende por teléfono y "
-                                               "WhatsApp/Treble, así que el ticket nunca la "
-                                               "registra. El panel muestra «primera gestión» "
-                                               "(primer cambio de etapa) como proxy."},
+            "primera_respuesta": {
+                "casos": n - len(pr_valores), "de": n,
+                "pct": _consul_pct(n - len(pr_valores), n),
+                "que_hacer": ("Los que faltan son tickets sin contacto asociado o sin ningún "
+                              "contacto saliente registrado. HubSpot no tiene esta métrica: "
+                              "sale del DWH (Treble) más las llamadas del CRM."
+                              + ("" if pr_info.get("dwh_ok")
+                                 else " ATENCIÓN: el DWH no respondió en esta corrida."))},
         },
     }
 
@@ -8999,6 +9032,277 @@ def consultoria_panel(x_api_key: str | None = Header(default=None),
     _CONSUL_CACHE[periodo] = (ahora, datos)
     METRICAS["consultoria_consultas"] += 1
     return dict(datos, desde_cache=False)
+
+
+# ══════════════════════════════════════════════════════════════════
+#  PRIMERA RESPUESTA REAL  ·  v1.6.0  (desde el Data Warehouse)
+#
+#  HubSpot no la tiene: sólo la calcula sobre conversaciones de su
+#  bandeja, y Consultoría atiende por WhatsApp (Treble) y por teléfono.
+#  Verificado sobre los 308 tickets del mes: el campo nativo devuelve 0
+#  casos y las propiedades internas 3.
+#
+#  El DWH sí lo tiene. `fact_agent_messages` guarda cada mensaje con su
+#  `sender` y su `created_at`, y `fact_conversations` lo ata al cliente
+#  por `helpdesk_contact_id` (el id de HubSpot) y por `contact_wa_id`
+#  (el número). Con eso la primera respuesta es medible de verdad:
+#
+#      primera respuesta = primer contacto SALIENTE del equipo hacia el
+#      cliente después de creado el ticket
+#          · mensaje de agente en Treble   (DWH)
+#          · llamada saliente del equipo   (CRM)
+#      lo que ocurra primero.
+#
+#  El ticket se ata al cliente por su asociación en HubSpot: 296 de los
+#  308 tickets del mes la tienen (96,1%). Cuando el cruce por id falla
+#  se reintenta por teléfono, igual que hace el contador de sesiones.
+#
+#  Si el DWH no responde, la métrica se marca como no disponible y el
+#  resto del panel sigue funcionando. Nunca se rellena con ceros.
+# ══════════════════════════════════════════════════════════════════
+
+import bisect
+
+CONSUL_PR_MARGEN_DIAS = int(os.environ.get("CONSUL_PR_MARGEN_DIAS", "1"))
+CONSUL_PR_TOPE_MENSAJES = int(os.environ.get("CONSUL_PR_TOPE_MENSAJES", "200000"))
+CONSUL_PR_LLAMADAS = _a_bool(os.environ.get("CONSUL_PR_LLAMADAS"), True)
+CONSUL_PR_LOTE = 100
+
+
+def _consul_asociaciones(objeto, ids):
+    """{id_del_objeto: [contact_id, ...]} leído por lotes de 100."""
+    salida, ids = {}, [str(i) for i in ids if i]
+    for i in range(0, len(ids), CONSUL_PR_LOTE):
+        lote = ids[i:i + CONSUL_PR_LOTE]
+        try:
+            r = _hubspot_request("POST", f"/crm/v4/associations/{objeto}/contacts/batch/read",
+                                 {"inputs": [{"id": x} for x in lote]})
+        except Exception as e:
+            log.warning(f"[consultoria] asociaciones {objeto} lote {i}: {e}")
+            continue
+        for fila in r.get("results") or []:
+            origen = str((fila.get("from") or {}).get("id") or "")
+            destinos = [str((t or {}).get("toObjectId") or "") for t in (fila.get("to") or [])]
+            destinos = [d for d in destinos if d]
+            if origen and destinos:
+                salida[origen] = destinos
+    return salida
+
+
+def _consul_telefonos(contact_ids):
+    """{contact_id: solo_digitos_del_telefono} por lotes de 100."""
+    salida, ids = {}, sorted({str(c) for c in contact_ids if c})
+    for i in range(0, len(ids), CONSUL_PR_LOTE):
+        try:
+            r = _hubspot_request("POST", "/crm/v3/objects/contacts/batch/read", {
+                "properties": ["hs_whatsapp_phone_number", "mobilephone", "phone"],
+                "inputs": [{"id": x} for x in ids[i:i + CONSUL_PR_LOTE]]})
+        except Exception as e:
+            log.warning(f"[consultoria] teléfonos lote {i}: {e}")
+            continue
+        for c in r.get("results") or []:
+            p = c.get("properties") or {}
+            for campo in ("hs_whatsapp_phone_number", "mobilephone", "phone"):
+                d = _solo_digitos(p.get(campo))
+                if len(d) >= 8:
+                    salida[str(c.get("id"))] = d
+                    break
+    return salida
+
+
+def _consul_ts_ms(texto):
+    """'2026-09-16 15:34:13.000000' (UTC, como lo devuelve el DWH) -> epoch ms."""
+    t = str(texto or "").strip()
+    if not t:
+        return None
+    t = t.split(".")[0].replace("T", " ")
+    try:
+        return int(datetime.strptime(t, "%Y-%m-%d %H:%M:%S")
+                   .replace(tzinfo=timezone.utc).timestamp() * 1000)
+    except ValueError:
+        return None
+
+
+def _consul_mensajes_dwh(hs_ids, tels, desde_ms):
+    """
+    Mensajes salientes del equipo en Treble para esos clientes.
+    Devuelve ({hubspot_id: [ms...]}, {tel10: [ms...]}, ok).
+    Misma forma de consulta que /espera/lista, que ya corre en producción.
+    """
+    por_hs, por_tel = {}, {}
+    hs_ids = sorted({re.sub(r"\D", "", str(x)) for x in hs_ids if str(x or "").strip()})
+    tels = sorted({t[-10:] for t in tels if t and len(t) >= 10})
+    if not (hs_ids or tels):
+        return por_hs, por_tel, True
+
+    desde = datetime.fromtimestamp(desde_ms / 1000, timezone.utc) - timedelta(days=CONSUL_PR_MARGEN_DIAS)
+    cond = []
+    if hs_ids:
+        cond.append("c.helpdesk_contact_id IN (" + ",".join(f"'{x}'" for x in hs_ids if x) + ")")
+    if tels:
+        cond.append("substring(c.contact_wa_id, length(c.contact_wa_id) - 9, 10) IN ("
+                    + ",".join(f"'{t}'" for t in tels) + ")")
+    sql = f"""
+        SELECT c.helpdesk_contact_id hs,
+               c.contact_wa_id wa,
+               toString(m.created_at) ts
+        FROM fact_agent_messages m
+        INNER JOIN fact_conversations c ON m.conversation_id = c.conversation_id
+        WHERE m.company_id = {int(SALUD_COMPANY_ID)}
+          AND c.company_id = {int(SALUD_COMPANY_ID)}
+          AND m.sender != 'USER'
+          AND m.created_at >= toDateTime('{desde.strftime("%Y-%m-%d %H:%M:%S")}')
+          AND ({" OR ".join(cond)})
+        ORDER BY ts
+        LIMIT {CONSUL_PR_TOPE_MENSAJES}
+    """
+    try:
+        filas = _query_interna(sql) or []
+    except Exception as e:
+        log.error(f"[consultoria] el DWH no respondió la primera respuesta: {e}")
+        return por_hs, por_tel, False
+
+    for f in filas:
+        ms = _consul_ts_ms(f.get("ts"))
+        if ms is None:
+            continue
+        hs = str(f.get("hs") or "").strip()
+        if hs:
+            por_hs.setdefault(hs, []).append(ms)
+        wa = _solo_digitos(f.get("wa"))
+        if len(wa) >= 10:
+            por_tel.setdefault(wa[-10:], []).append(ms)
+    for d in (por_hs, por_tel):
+        for k in d:
+            d[k].sort()
+    return por_hs, por_tel, True
+
+
+def _consul_llamadas_por_contacto(llamadas):
+    """{contact_id: [ms...]} de las llamadas salientes del equipo."""
+    if not (CONSUL_PR_LLAMADAS and llamadas):
+        return {}
+    ids = [str(l.get("id") or "") for l in llamadas]
+    asoc = _consul_asociaciones("calls", ids)
+    if not asoc:
+        return {}
+    salida = {}
+    for l in llamadas:
+        ms = _consul_num((l.get("properties") or {}).get("hs_timestamp")) or \
+             _consul_ts_ms((l.get("properties") or {}).get("hs_timestamp"))
+        if ms is None:
+            continue
+        for cid in asoc.get(str(l.get("id") or ""), []):
+            salida.setdefault(cid, []).append(int(ms))
+    for k in salida:
+        salida[k].sort()
+    return salida
+
+
+def _consul_primero_despues(lista, desde_ms):
+    """El primer elemento >= desde_ms, o None. La lista viene ordenada."""
+    if not lista:
+        return None
+    i = bisect.bisect_left(lista, desde_ms)
+    return lista[i] if i < len(lista) else None
+
+
+def _consul_primera_respuesta(tickets, llamadas, desde_ms):
+    """
+    {ticket_id: (ms_hasta_la_primera_respuesta, canal)} más un informe de
+    cobertura. canal = 'whatsapp' | 'llamada'.
+    """
+    ids = [str((t.get("properties") or {}).get("hs_object_id") or "") for t in tickets]
+    asoc = _consul_asociaciones("tickets", ids)
+    contactos = sorted({c for v in asoc.values() for c in v})
+    tels = _consul_telefonos(contactos)
+    por_hs, por_tel, dwh_ok = _consul_mensajes_dwh(contactos, tels.values(), desde_ms)
+    por_llamada = _consul_llamadas_por_contacto(llamadas)
+
+    salida = {}
+    sin_contacto = 0
+    canales = {"whatsapp": 0, "llamada": 0}
+    for t in tickets:
+        p = t.get("properties") or {}
+        tid = str(p.get("hs_object_id") or "")
+        creado = _consul_num(p.get("createdate"))
+        cids = asoc.get(tid) or []
+        if not cids:
+            sin_contacto += 1
+            continue
+        if not creado:
+            continue
+        mejor, canal = None, None
+        for cid in cids:
+            wa = _consul_primero_despues(por_hs.get(cid) or [], creado)
+            tel = tels.get(cid)
+            if tel:
+                otro = _consul_primero_despues(por_tel.get(tel[-10:]) or [], creado)
+                wa = otro if (wa is None or (otro is not None and otro < wa)) else wa
+            ll = _consul_primero_despues(por_llamada.get(cid) or [], creado)
+            for cand, nombre in ((wa, "whatsapp"), (ll, "llamada")):
+                if cand is not None and (mejor is None or cand < mejor):
+                    mejor, canal = cand, nombre
+        if mejor is not None:
+            salida[tid] = (mejor - creado, canal)
+            canales[canal] += 1
+
+    return salida, {
+        "tickets_con_contacto": len(tickets) - sin_contacto,
+        "tickets_sin_contacto": sin_contacto,
+        "contactos": len(contactos),
+        "por_canal": canales,
+        "dwh_ok": dwh_ok,
+        "llamadas_cruzadas": len(por_llamada),
+    }
+
+
+@app.get("/consultoria/primera-respuesta")
+def consultoria_primera_respuesta(x_api_key: str | None = Header(default=None),
+                                  periodo: str = "semana", tope: int = 25):
+    """
+    Diagnóstico de la primera respuesta: de dónde sale cada caso y cuántos
+    quedan sin cruzar. Solo lectura.
+    """
+    _chequear_clave(x_api_key)
+    periodo = periodo if periodo in ("ayer", "semana", "mes") else "semana"
+    desde, hasta, etiqueta = _consul_ventana(periodo)
+    try:
+        tickets = _consul_tickets(desde, hasta)
+        llamadas = _consul_llamadas(desde, hasta, _consul_equipo())
+        pr, info = _consul_primera_respuesta(tickets, llamadas, desde)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"No se pudo calcular la primera respuesta: {e}")
+
+    duenos = _consul_duenos()
+    detalle = []
+    for t in tickets:
+        p = t.get("properties") or {}
+        tid = str(p.get("hs_object_id") or "")
+        if tid not in pr:
+            continue
+        ms, canal = pr[tid]
+        detalle.append({
+            "ticket": tid, "asunto": (p.get("subject") or "")[:90],
+            "consultor": duenos.get(str(p.get("hubspot_owner_id") or ""), "Sin asignar"),
+            "horas": _consul_horas(ms), "canal": canal,
+            "link": f"https://app.hubspot.com/contacts/{ACCOUNT_ID}/ticket/{tid}",
+        })
+    detalle.sort(key=lambda x: -(x["horas"] or 0))
+    valores = [v[0] for v in pr.values()]
+    return {
+        "periodo": periodo, "etiqueta": etiqueta, "tickets": len(tickets),
+        "con_primera_respuesta": len(pr),
+        "cobertura_pct": _consul_pct(len(pr), len(tickets)),
+        "mediana_h": _consul_horas(_consul_mediana(valores)),
+        "diagnostico": info,
+        "peores": detalle[:max(1, int(tope))],
+        "fuente": ("DWH: fact_agent_messages (mensajes salientes de Treble) + "
+                   "llamadas salientes del CRM. Se toma el primer contacto del equipo "
+                   "posterior a la creación del ticket."),
+    }
 
 
 CONSUL_HTML = """<!doctype html><html lang=es><head><meta charset=utf-8>
@@ -9121,10 +9425,31 @@ function pinta(d){
  let h='<div class=tiles>'+
   tile(t.tickets,'Tickets creados', t.sin_asignar?(t.sin_asignar+' sin dueño'):'todos con dueño')+
   tile(pct(r.tasa_exito_pct),'Tasa de éxito','sobre '+r.juzgados+' con resultado')+
+  tile(horas(t.pr_mediana_h),'Primera respuesta','DWH · '+t.pr_casos+' de '+t.tickets+' tickets')+
   tile(horas(t.cierre_mediana_h),'Mediana a cierre','SLA total · '+t.cierre_casos+' casos')+
   tile(t.contestadas,'Llamadas +1 min','de '+t.llamadas+' · '+pct(t.tasa_contacto_pct)+' contacto')+
   tile(g.incumple,'Incumplen la regla','de '+(g.cumple+g.incumple)+' auditables',g.incumple>0)+
  '</div>';
+
+ // ── Primera respuesta ──────────────────────────────────────────
+ const pr=d.primera_respuesta||{};
+ h+='<section><h2>Primera respuesta</h2>'+
+  '<p class=cap>Primer contacto del equipo hacia el cliente después de creado el ticket: '+
+  'mensaje saliente en Treble (Data Warehouse) o llamada saliente del CRM, lo que ocurra primero. '+
+  'HubSpot no tiene este dato porque sólo lo calcula sobre su propia bandeja.</p>'+
+  (pr.dwh_ok===false?'<div class=nota style="border:1px solid var(--critical)"><b>El Data Warehouse '+
+    'no respondió en esta corrida.</b> Lo que se ve abajo sale sólo de las llamadas del CRM.</div>':'')+
+  '<div class=tiles>'+
+   tile(horas(pr.mediana_h),'Mediana','sobre '+(pr.casos||0)+' tickets')+
+   tile(horas(pr.p90_h),'Percentil 90','9 de cada 10 responden antes')+
+   tile(num(pr.dentro_de_1h),'Dentro de 1 hora','')+
+   tile(num(pr.mas_de_24h),'Más de 24 horas','',pr.mas_de_24h>0)+
+   tile(pct(pr.cobertura_pct),'Cobertura','tickets con un contacto saliente')+
+  '</div>'+
+  '<p class=cap>Por canal: <b>'+((pr.por_canal||{}).whatsapp||0)+'</b> por WhatsApp · <b>'+
+  ((pr.por_canal||{}).llamada||0)+'</b> por llamada. '+
+  'Los que no aparecen son tickets sin contacto asociado o sin ningún contacto saliente registrado.</p>'+
+ '</section>';
 
  // ── Regla de seguimientos ──────────────────────────────────────
  const audit=g.cumple+g.incumple;
@@ -9185,7 +9510,7 @@ function pinta(d){
   'equipo en el período, no sólo las ligadas a un ticket.</p>'+
   '<div class=tw><table><thead><tr><th>Consultor</th><th>Tickets</th><th class=n>Cerrados</th>'+
   '<th class=n>Éxito</th><th class=n>Sin éxito</th><th class=n>% éxito</th>'+
-  '<th class=n>Mediana cierre</th><th class=n>Seguim.</th><th class=n>Incumple</th>'+
+  '<th class=n>1ª respuesta</th><th class=n>Mediana cierre</th><th class=n>Seguim.</th><th class=n>Incumple</th>'+
   '<th class=n>Llamadas</th><th class=n>+1 min</th><th class=n>Min.</th></tr></thead><tbody>'+
   d.consultores.map(f=>'<tr'+(f.owner_id?'':' class=nodueno')+'><td>'+esc(f.consultor)+'</td>'+
    '<td style="width:15%"><div class=barwrap><span class=bar style="width:'+
@@ -9193,6 +9518,7 @@ function pinta(d){
      '<span class=lbl>'+f.tickets+'</span></div></td>'+
    '<td class=n>'+f.cerrados+'</td><td class="n ok">'+f.exito+'</td>'+
    '<td class=n>'+f.no_exito+'</td><td class=n>'+pct(f.tasa_exito_pct)+'</td>'+
+   '<td class=n>'+horas(f.pr_mediana_h)+'</td>'+
    '<td class=n>'+horas(f.cierre_mediana_h)+'</td><td class=n>'+f.seguimientos+'</td>'+
    '<td class="n'+(f.regla_mal?' bad':'')+'">'+f.regla_mal+'</td>'+
    '<td class=n>'+f.llamadas+'</td><td class=n>'+f.contestadas+'</td>'+
@@ -9212,13 +9538,15 @@ function pinta(d){
   '<div class=tw><table><thead><tr><th>Qué falta</th><th class=n>Casos</th><th>Qué destraba</th></tr></thead><tbody>'+
   [['Tickets sin dueño',c.sin_asignar],['Tickets sin resolución',c.sin_resolucion],
    ['Tipo derivado del asunto',c.tipo_derivado_del_asunto],
-   ['Tiempo de primera respuesta',c.primera_respuesta]]
+   ['Tickets sin primera respuesta cruzada',c.primera_respuesta]]
   .map(([k,v])=>'<tr><td>'+k+'</td><td class=n>'+v.casos+' <span class=dash>/ '+v.de+'</span>'+
    (v.pct?' <span class=pill>'+v.pct+'%</span>':'')+'</td><td>'+esc(v.que_hacer)+'</td></tr>').join('')+
   '</tbody></table></div>'+
-  '<div class=nota><b>Primera gestión (proxy):</b> '+horas(d.totales.gestion_mediana_h)+
-  ' de mediana sobre '+d.totales.gestion_casos+' tickets. Es el primer cambio de etapa, '+
-  'no la primera respuesta al cliente. Se publica con ese nombre a propósito.</div></section>';
+  '<div class=nota><b>Primera respuesta:</b> sale del Data Warehouse (mensajes salientes de '+
+  'Treble) más las llamadas salientes del CRM, cruzado con el ticket por el contacto asociado. '+
+  'Aparte, <b>primera gestión</b> —el primer cambio de etapa— da '+horas(d.totales.gestion_mediana_h)+
+  ' sobre '+d.totales.gestion_casos+' tickets: sirve para ver cuánto tarda el ticket en moverse, '+
+  'que no es lo mismo que atender al cliente.</div></section>';
 
  $('#app').innerHTML=h;
  $('#foot').textContent='Pipeline '+ (d.pipeline||'Consultores') +
