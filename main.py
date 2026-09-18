@@ -2022,7 +2022,7 @@ def version_bloques(x_api_key: str | None = Header(default=None)):
     _chequear_clave(x_api_key)
     return {
         "base": "1.3.3",
-        "bloques": ["workflows_push (1.3.4)", "cohorte_renovaciones (1.3.5)", "reintento_pushes (1.3.5)", "contador_sesiones (1.3.6)", "workflows_crudo (1.3.7)", "riesgo_cancelacion (1.3.8)", "salud_mensajeria (1.3.9)", "correccion_veteranos (1.4.0)", "salud_detalle (1.4.1)", "arreglos_cruce_y_auditoria (1.4.2)", "reintento_automatico (1.4.2)", "cobertura_bifurcacion (1.4.2)", "sesiones_agendadas (1.4.3)", "monitor_riesgo (1.4.4)", "riesgo_lista_v2 (1.4.4)", "segmento_dormant (1.4.5)", "parte_operativo (1.4.6)", "reintento_por_nombre (1.4.7)", "caducidad_reintento (1.4.8)", "pedidos_v2 (1.4.9)", "webhook_propio_pedidos (1.5.0)", "sla_v2 (1.5.1)", "partes_sin_repetir (1.5.2)", "alcance_cola_reintento (1.5.3)", "cliente_esperando (1.5.4)", "disputas_stripe (1.5.5)", "adopcion_campanas (1.5.6)", "enriquecer_stripe (1.5.7)", "panel_consultoria (1.6.0)"],
+        "bloques": ["workflows_push (1.3.4)", "cohorte_renovaciones (1.3.5)", "reintento_pushes (1.3.5)", "contador_sesiones (1.3.6)", "workflows_crudo (1.3.7)", "riesgo_cancelacion (1.3.8)", "salud_mensajeria (1.3.9)", "correccion_veteranos (1.4.0)", "salud_detalle (1.4.1)", "arreglos_cruce_y_auditoria (1.4.2)", "reintento_automatico (1.4.2)", "cobertura_bifurcacion (1.4.2)", "sesiones_agendadas (1.4.3)", "monitor_riesgo (1.4.4)", "riesgo_lista_v2 (1.4.4)", "segmento_dormant (1.4.5)", "parte_operativo (1.4.6)", "reintento_por_nombre (1.4.7)", "caducidad_reintento (1.4.8)", "pedidos_v2 (1.4.9)", "webhook_propio_pedidos (1.5.0)", "sla_v2 (1.5.1)", "partes_sin_repetir (1.5.2)", "alcance_cola_reintento (1.5.3)", "cliente_esperando (1.5.4)", "disputas_stripe (1.5.5)", "adopcion_campanas (1.5.6)", "enriquecer_stripe (1.5.7)", "panel_consultoria (1.6.1)"],
         "endpoints_nuevos": [
             "POST /cohorte/setup", "POST /cohorte/procesar",
             "GET /cohorte/renovaciones", "GET /cohorte/kpis",
@@ -8603,6 +8603,32 @@ def _consul_mediana(xs):
     return xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2
 
 
+def _consul_fecha_ms(v):
+    """
+    Epoch ms de una fecha de HubSpot o del DWH.
+
+    Hace falta porque las propiedades de fecha NO vuelven todas igual: las
+    calculadas (`time_to_close`) vienen en milisegundos, pero `createdate`,
+    `hs_timestamp` y `hs_v2_date_entered_*` vuelven en ISO-8601
+    ("2026-09-18T02:05:09.087Z"). Leerlas con float() devolvía None y el
+    ticket quedaba afuera del cálculo sin avisar.
+    """
+    if v in (None, ""):
+        return None
+    t = str(v).strip()
+    if t.isdigit():
+        n = int(t)
+        return n if n > 10_000_000_000 else n * 1000
+    t = t.replace("Z", "").replace("T", " ").split("+")[0].strip()
+    t = t.split(".")[0]
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return int(datetime.strptime(t, fmt).replace(tzinfo=timezone.utc).timestamp() * 1000)
+        except ValueError:
+            continue
+    return None
+
+
 def _consul_horas(ms):
     return round(ms / 3600000, 1) if ms else None
 
@@ -8748,12 +8774,12 @@ def _consul_primera_gestion(props):
     Proxy de primera atención: primer cambio de etapa menos la creación.
     NO es el tiempo de primera respuesta y el panel no lo llama así.
     """
-    creado = _consul_num(props.get("createdate"))
+    creado = _consul_fecha_ms(props.get("createdate"))
     if not creado:
         return None
     marcas = []
     for e in CONSUL_ETAPAS_MOVIMIENTO:
-        v = _consul_num(props.get(f"hs_v2_date_entered_{e}"))
+        v = _consul_fecha_ms(props.get(f"hs_v2_date_entered_{e}"))
         if v and v > creado:
             marcas.append(v)
     return min(marcas) - creado if marcas else None
@@ -9069,16 +9095,16 @@ CONSUL_PR_LLAMADAS = _a_bool(os.environ.get("CONSUL_PR_LLAMADAS"), True)
 CONSUL_PR_LOTE = 100
 
 
-def _consul_asociaciones(objeto, ids):
-    """{id_del_objeto: [contact_id, ...]} leído por lotes de 100."""
+def _consul_asociaciones(objeto, ids, destino="contacts"):
+    """{id_del_objeto: [id_destino, ...]} leído por lotes de 100."""
     salida, ids = {}, [str(i) for i in ids if i]
     for i in range(0, len(ids), CONSUL_PR_LOTE):
         lote = ids[i:i + CONSUL_PR_LOTE]
         try:
-            r = _hubspot_request("POST", f"/crm/v4/associations/{objeto}/contacts/batch/read",
+            r = _hubspot_request("POST", f"/crm/v4/associations/{objeto}/{destino}/batch/read",
                                  {"inputs": [{"id": x} for x in lote]})
         except Exception as e:
-            log.warning(f"[consultoria] asociaciones {objeto} lote {i}: {e}")
+            log.warning(f"[consultoria] asociaciones {objeto}->{destino} lote {i}: {e}")
             continue
         for fila in r.get("results") or []:
             origen = str((fila.get("from") or {}).get("id") or "")
@@ -9112,15 +9138,7 @@ def _consul_telefonos(contact_ids):
 
 def _consul_ts_ms(texto):
     """'2026-09-16 15:34:13.000000' (UTC, como lo devuelve el DWH) -> epoch ms."""
-    t = str(texto or "").strip()
-    if not t:
-        return None
-    t = t.split(".")[0].replace("T", " ")
-    try:
-        return int(datetime.strptime(t, "%Y-%m-%d %H:%M:%S")
-                   .replace(tzinfo=timezone.utc).timestamp() * 1000)
-    except ValueError:
-        return None
+    return _consul_fecha_ms(texto)
 
 
 def _consul_mensajes_dwh(hs_ids, tels, desde_ms):
@@ -9178,24 +9196,28 @@ def _consul_mensajes_dwh(hs_ids, tels, desde_ms):
     return por_hs, por_tel, True
 
 
-def _consul_llamadas_por_contacto(llamadas):
-    """{contact_id: [ms...]} de las llamadas salientes del equipo."""
-    if not (CONSUL_PR_LLAMADAS and llamadas):
+def _consul_llamadas_por_contacto(llamadas, contactos):
+    """
+    {contact_id: [ms...]} de las llamadas salientes del equipo.
+
+    Se pregunta al revés de lo que parece natural: de los ~300 contactos del
+    período hacia sus llamadas, no de las ~3.000 llamadas hacia su contacto.
+    Son 3 pedidos a HubSpot en vez de 30, y así el período "mes" no se cae
+    por tiempo.
+    """
+    if not (CONSUL_PR_LLAMADAS and llamadas and contactos):
         return {}
-    ids = [str(l.get("id") or "") for l in llamadas]
-    asoc = _consul_asociaciones("calls", ids)
-    if not asoc:
-        return {}
-    salida = {}
+    cuando = {}
     for l in llamadas:
-        ms = _consul_num((l.get("properties") or {}).get("hs_timestamp")) or \
-             _consul_ts_ms((l.get("properties") or {}).get("hs_timestamp"))
-        if ms is None:
-            continue
-        for cid in asoc.get(str(l.get("id") or ""), []):
-            salida.setdefault(cid, []).append(int(ms))
-    for k in salida:
-        salida[k].sort()
+        ms = _consul_fecha_ms((l.get("properties") or {}).get("hs_timestamp"))
+        if ms is not None:
+            cuando[str(l.get("id") or "")] = ms
+    asoc = _consul_asociaciones("contacts", contactos, destino="calls")
+    salida = {}
+    for cid, calls in asoc.items():
+        marcas = sorted(cuando[c] for c in calls if c in cuando)
+        if marcas:
+            salida[cid] = marcas
     return salida
 
 
@@ -9217,7 +9239,7 @@ def _consul_primera_respuesta(tickets, llamadas, desde_ms):
     contactos = sorted({c for v in asoc.values() for c in v})
     tels = _consul_telefonos(contactos)
     por_hs, por_tel, dwh_ok = _consul_mensajes_dwh(contactos, tels.values(), desde_ms)
-    por_llamada = _consul_llamadas_por_contacto(llamadas)
+    por_llamada = _consul_llamadas_por_contacto(llamadas, contactos)
 
     salida = {}
     sin_contacto = 0
@@ -9225,7 +9247,7 @@ def _consul_primera_respuesta(tickets, llamadas, desde_ms):
     for t in tickets:
         p = t.get("properties") or {}
         tid = str(p.get("hs_object_id") or "")
-        creado = _consul_num(p.get("createdate"))
+        creado = _consul_fecha_ms(p.get("createdate"))
         cids = asoc.get(tid) or []
         if not cids:
             sin_contacto += 1
