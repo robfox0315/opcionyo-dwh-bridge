@@ -2022,7 +2022,7 @@ def version_bloques(x_api_key: str | None = Header(default=None)):
     _chequear_clave(x_api_key)
     return {
         "base": "1.3.3",
-        "bloques": ["workflows_push (1.3.4)", "cohorte_renovaciones (1.3.5)", "reintento_pushes (1.3.5)", "contador_sesiones (1.3.6)", "workflows_crudo (1.3.7)", "riesgo_cancelacion (1.3.8)", "salud_mensajeria (1.3.9)", "correccion_veteranos (1.4.0)", "salud_detalle (1.4.1)", "arreglos_cruce_y_auditoria (1.4.2)", "reintento_automatico (1.4.2)", "cobertura_bifurcacion (1.4.2)", "sesiones_agendadas (1.4.3)", "monitor_riesgo (1.4.4)", "riesgo_lista_v2 (1.4.4)", "segmento_dormant (1.4.5)", "parte_operativo (1.4.6)", "reintento_por_nombre (1.4.7)", "caducidad_reintento (1.4.8)", "pedidos_v2 (1.4.9)", "webhook_propio_pedidos (1.5.0)", "sla_v2 (1.5.1)", "partes_sin_repetir (1.5.2)", "alcance_cola_reintento (1.5.3)", "cliente_esperando (1.5.4)", "disputas_stripe (1.5.5)", "adopcion_campanas (1.5.6)", "enriquecer_stripe (1.5.7)"],
+        "bloques": ["workflows_push (1.3.4)", "cohorte_renovaciones (1.3.5)", "reintento_pushes (1.3.5)", "contador_sesiones (1.3.6)", "workflows_crudo (1.3.7)", "riesgo_cancelacion (1.3.8)", "salud_mensajeria (1.3.9)", "correccion_veteranos (1.4.0)", "salud_detalle (1.4.1)", "arreglos_cruce_y_auditoria (1.4.2)", "reintento_automatico (1.4.2)", "cobertura_bifurcacion (1.4.2)", "sesiones_agendadas (1.4.3)", "monitor_riesgo (1.4.4)", "riesgo_lista_v2 (1.4.4)", "segmento_dormant (1.4.5)", "parte_operativo (1.4.6)", "reintento_por_nombre (1.4.7)", "caducidad_reintento (1.4.8)", "pedidos_v2 (1.4.9)", "webhook_propio_pedidos (1.5.0)", "sla_v2 (1.5.1)", "partes_sin_repetir (1.5.2)", "alcance_cola_reintento (1.5.3)", "cliente_esperando (1.5.4)", "disputas_stripe (1.5.5)", "adopcion_campanas (1.5.6)", "enriquecer_stripe (1.5.7)", "panel_consultoria (1.5.9)"],
         "endpoints_nuevos": [
             "POST /cohorte/setup", "POST /cohorte/procesar",
             "GET /cohorte/renovaciones", "GET /cohorte/kpis",
@@ -8448,3 +8448,804 @@ def stripe_enriquecer(x_api_key: str | None = Header(default=None),
                  "al crear el Checkout, y cargar name/phone en el Customer: poner "
                  "metadata a nivel de la Session no baja al cobro."),
     }
+
+
+# ══════════════════════════════════════════════════════════════════
+#  PANEL DE CONSULTORÍA  ·  v1.5.9   (reemplaza a 1.5.8)
+#  Auditado contra el dato real del portal el 17/09/2026.
+#  BLOQUE PURAMENTE ADITIVO.
+#
+#  ── Qué cambió respecto de 1.5.8 y por qué ────────────────────────
+#  1.5.8 se construyó sobre una lectura del histórico completo (3.531
+#  tickets) que daba tres métricas por "sin dato". Al auditar sólo la
+#  ventana viva (308 tickets de los últimos 30 días) resultó falso:
+#
+#  · ÉXITO / NO ÉXITO  →  1.5.8 decía "hace falta que Consultoría lo
+#    defina". Es falso: la propiedad `hs_resolution` ya existe, está
+#    cargada en el 88 % de los tickets y su taxonomía es exactamente
+#    la que pidió Consultoría:
+#        Resuelto exitoso ................. 153
+#        Sin éxito · respondió ............  42
+#        Sin éxito · sin respuesta ........  26
+#        No se realizará / Duplicado ......  46
+#        sin cargar .......................  37
+#    No hay que crear ninguna etapa ni ninguna propiedad.
+#
+#  · SEGUIMIENTOS  →  1.5.8 los leía de la ETAPA ACTUAL. Como el 91 %
+#    de los tickets termina en "Cerrado", la etapa actual borra el
+#    recorrido: habría informado 5 tickets en Seguimiento 1 cuando en
+#    realidad 146 pasaron por ahí. Se leen ahora de
+#    `hs_v2_date_entered_<etapa>`, que es histórico y sobrevive al
+#    cierre:  Seg 1 = 146 · Seg 2 = 62 · Seg 3 = 38.
+#
+#  · TIPO DE TICKET  →  1.5.8 decía "hs_ticket_category está vacío".
+#    Está cargada en el 42 % con una taxonomía real (CDE_1…CDE_4,
+#    Seguimiento_CDE_n, ATC-…). Se usa la categoría cuando existe y
+#    sólo se deriva del asunto cuando no.
+#
+#  · LLAMADAS  →  1.5.8 pedía a HubSpot TODAS las llamadas de la
+#    ventana (28.918 en 30 días) y recortaba a 5.000 en el cliente:
+#    el número salía truncado en silencio. Ahora la búsqueda filtra
+#    por los dueños del equipo del lado del servidor (2.998 llamadas)
+#    y exige además estado COMPLETED, no sólo duración.
+#
+#  ── Lo único que sigue sin dato ───────────────────────────────────
+#  TIEMPO DE PRIMERA RESPUESTA. Verificado sobre los 308 tickets:
+#      hs_time_to_first_response_in_operating_hours .... 0
+#      horas_entre_creacion_y_primera_modificacion .....  3
+#      rangos_de_tiempo_para_primera_respuesta .........  3
+#      last_reply_date .................................  0
+#  HubSpot sólo lo calcula sobre conversaciones de su bandeja. En
+#  Consultoría se atiende por teléfono y por WhatsApp/Treble, así que
+#  el ticket nunca lo registra. En su lugar el panel publica
+#  "tiempo hasta la primera gestión" = primer cambio de etapa menos
+#  la creación, y lo rotula como proxy. No se lo llama primera
+#  respuesta porque no lo es.
+#
+#  ── Salvaguardas ──────────────────────────────────────────────────
+#  · Todo el bloque es de SOLO LECTURA. No escribe en HubSpot.
+#  · Cachea 5 minutos por período.
+#  · Si HubSpot falla devuelve el error, nunca un cero silencioso.
+#  · Cada número del panel trae de dónde sale y sobre cuántos casos.
+# ══════════════════════════════════════════════════════════════════
+
+CONSUL_PIPELINE = os.environ.get("CONSUL_PIPELINE", "705217631")
+
+CONSUL_ETAPAS = {
+    "1030429990": "Nuevo",
+    "1030429991": "Abierto",
+    "1030429992": "Esperando resolución",
+    "1030429993": "Cerrado",
+    "1031535977": "Seguimiento 1",
+    "1031535978": "Seguimiento 2",
+    "1031535979": "Seguimiento 3",
+    "1437104655": "On hold",
+}
+CONSUL_ETAPAS_CERRADAS = {"1030429993"}
+# etapa -> número de seguimiento. Se leen del histórico, no de la etapa actual.
+CONSUL_SEGUIMIENTOS = [("1031535977", 1), ("1031535978", 2), ("1031535979", 3)]
+# etapas cuyo date_entered marca que el ticket ya se movió de su estado inicial
+CONSUL_ETAPAS_MOVIMIENTO = ["1030429992", "1031535977", "1031535978",
+                            "1031535979", "1437104655", "1030429993"]
+
+# hs_resolution → (etiqueta, resultado, ¿contestó el cliente?)
+#   resultado: exito | no_exito | descartado | neutro
+#   contesto:  True | False | None (no se sabe)
+CONSUL_RESOLUCION = {
+    "ISSUE_FIXED":         ("Resuelto exitoso",              "exito",      True),
+    "Sin rescate":         ("Sin éxito · respondió",         "no_exito",   True),
+    "Sin respuesta":       ("Sin éxito · sin respuesta",     "no_exito",   False),
+    "Reembolso aprobado":  ("Reembolso aprobado",            "exito",      True),
+    "Reembolso rechazado": ("Reembolso rechazado",           "no_exito",   True),
+    "Asistió":             ("Asistió",                       "exito",      True),
+    "No asistió":          ("No asistió",                    "no_exito",   None),
+    "Disputa ganada":      ("Disputa ganada",                "exito",      None),
+    "Disputa perdida":     ("Disputa perdida",               "no_exito",   None),
+    "Disputa en revisión": ("Disputa en revisión",           "neutro",     None),
+    "Solo información":    ("Solo información",              "neutro",     True),
+    "Duplicado":           ("Duplicado",                     "descartado", None),
+    "Wont do":             ("No se realizará",               "descartado", None),
+}
+
+# Categoría nativa → nombre legible. Es la fuente preferida.
+CONSUL_CATEGORIAS = {
+    "CDE_1": "Cambio de especialista · pedido por el cliente",
+    "CDE_2": "Cambio de especialista · pedido por Cancelaciones",
+    "CDE_3": "Cambio de especialista · pedido por el especialista",
+    "CDE_4": "Cambio de especialista · pedido por el consultor",
+    "Seguimiento_CDE_1": "Seguimiento de cambio · cliente",
+    "Seguimiento_CDE_2": "Seguimiento de cambio · Cancelaciones",
+    "Seguimiento_CDE_3": "Seguimiento de cambio · especialista",
+    "Seguimiento_CDE_4": "Seguimiento de cambio · consultor",
+    "IA": "IA",
+}
+
+# Sólo para los tickets sin categoría cargada. El orden importa:
+# "Rescate con cambio" tiene que evaluarse antes que "Cambio de especialista".
+CONSUL_TIPOS = [
+    ("Alerta de retención en sesión", ("alerta de retenc",)),
+    ("Rescate con cambio de especialista", ("rescate con cambio",)),
+    ("Cambio de especialista", ("cambio de especialista", "cambio de Especialista",
+                                "coordinar cambio", "necesita cambio")),
+    ("Seguimiento de match", ("seguimiento de match",)),
+    ("Dificultades con un cliente nuevo", ("dificultades con un cliente",)),
+    ("Interconsulta / agregar especialista", ("interconsulta", "agregar especialista")),
+    ("Coordinar una nueva llamada", ("coordinemos una nueva llamada", "nueva llamada")),
+    ("Problema técnico", ("problema tecn", "problema técn", "no puedo ingresar")),
+    ("Compra SDD", ("compra sdd",)),
+    ("Solicitud de cancelación", ("cancelac", "dar de baja")),
+    ("Reembolso", ("reembolso",)),
+    ("Reagendamiento", ("reagend", "cambio de hora", "cambio de horario")),
+]
+
+CONSUL_LLAMADA_MIN_MS = int(os.environ.get("CONSUL_LLAMADA_MIN_MS", "60000"))
+CONSUL_CACHE_SEG = int(os.environ.get("CONSUL_CACHE_SEG", "300"))
+CONSUL_EQUIPO_DIAS = int(os.environ.get("CONSUL_EQUIPO_DIAS", "30"))
+_CONSUL_CACHE = {}
+_CONSUL_EQUIPO = {"ts": 0, "ids": None}
+
+METRICAS.setdefault("consultoria_consultas", 0)
+
+
+# ── utilidades ────────────────────────────────────────────────────
+def _consul_num(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _consul_mediana(xs):
+    xs = sorted(x for x in xs if x is not None)
+    if not xs:
+        return None
+    n = len(xs)
+    return xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2
+
+
+def _consul_horas(ms):
+    return round(ms / 3600000, 1) if ms else None
+
+
+def _consul_pct(parte, total):
+    return round(100.0 * parte / total, 1) if total else None
+
+
+def _consul_tipo(props):
+    """Categoría nativa si existe; si no, se deriva del asunto."""
+    cat = str(props.get("hs_ticket_category") or "").strip()
+    if cat:
+        return CONSUL_CATEGORIAS.get(cat, cat), "categoría"
+    a = str(props.get("subject") or "").lower()
+    for nombre, claves in CONSUL_TIPOS:
+        if any(k.lower() in a for k in claves):
+            return nombre, "asunto"
+    return "Otro / sin clasificar", "asunto"
+
+
+def _consul_ventana(periodo):
+    """(desde, hasta, etiqueta) en epoch ms. 'ayer' = día calendario anterior."""
+    hoy = datetime.now(timezone.utc).date()
+    if periodo == "ayer":
+        d = hoy - timedelta(days=1)
+        return _dia_ms(d), _dia_ms(hoy), f"Ayer · {d.isoformat()}"
+    if periodo == "mes":
+        d = hoy - timedelta(days=30)
+        return _dia_ms(d), _dia_ms(hoy + timedelta(days=1)), "Últimos 30 días"
+    d = hoy - timedelta(days=7)
+    return _dia_ms(d), _dia_ms(hoy + timedelta(days=1)), "Últimos 7 días"
+
+
+def _consul_duenos():
+    """owner_id -> nombre. Si falla, quedan los ids crudos."""
+    try:
+        r = _hubspot_request("GET", "/crm/v3/owners?limit=500")
+        salida = {}
+        for o in r.get("results") or []:
+            nom = " ".join(x for x in [o.get("firstName") or "", o.get("lastName") or ""] if x).strip()
+            salida[str(o.get("id"))] = nom or o.get("email") or str(o.get("id"))
+        return salida
+    except Exception as e:
+        log.warning(f"[consultoria] no se pudieron leer los owners: {e}")
+        return {}
+
+
+def _consul_props_ticket():
+    props = ["hs_object_id", "subject", "hubspot_owner_id", "hs_pipeline_stage",
+             "createdate", "closed_date", "time_to_close", "hs_resolution",
+             "hs_ticket_category"]
+    props += [f"hs_v2_date_entered_{e}" for e in CONSUL_ETAPAS_MOVIMIENTO]
+    return props
+
+
+def _consul_buscar(objeto, cuerpo, tope):
+    """Paginado genérico sobre /crm/v3/objects/<objeto>/search."""
+    salida, after = [], None
+    while len(salida) < tope:
+        c = dict(cuerpo)
+        if after:
+            c["after"] = after
+        r = _hubspot_request("POST", f"/crm/v3/objects/{objeto}/search", c)
+        salida.extend(r.get("results") or [])
+        after = ((r.get("paging") or {}).get("next") or {}).get("after")
+        if not after:
+            break
+    return salida[:tope]
+
+
+def _consul_tickets(desde_ms, hasta_ms, tope=3000):
+    filtros = [
+        {"propertyName": "hs_pipeline", "operator": "EQ", "value": CONSUL_PIPELINE},
+        {"propertyName": "createdate", "operator": "BETWEEN",
+         "value": str(desde_ms), "highValue": str(hasta_ms)},
+    ]
+    return _consul_buscar("tickets", {
+        "filterGroups": [{"filters": filtros}],
+        "properties": _consul_props_ticket(), "limit": 100}, tope)
+
+
+def _consul_equipo():
+    """
+    Los dueños del equipo, deducidos de quién tuvo tickets en los últimos 30
+    días. Se calcula sobre 30 días aunque se mire 'ayer', para que un consultor
+    sin tickets ayer no desaparezca del panel de llamadas.
+    """
+    ahora = time.time()
+    if _CONSUL_EQUIPO["ids"] is not None and ahora - _CONSUL_EQUIPO["ts"] < 3600:
+        return _CONSUL_EQUIPO["ids"]
+    hoy = datetime.now(timezone.utc).date()
+    desde = _dia_ms(hoy - timedelta(days=CONSUL_EQUIPO_DIAS))
+    hasta = _dia_ms(hoy + timedelta(days=1))
+    filtros = [
+        {"propertyName": "hs_pipeline", "operator": "EQ", "value": CONSUL_PIPELINE},
+        {"propertyName": "createdate", "operator": "BETWEEN",
+         "value": str(desde), "highValue": str(hasta)},
+    ]
+    filas = _consul_buscar("tickets", {
+        "filterGroups": [{"filters": filtros}],
+        "properties": ["hubspot_owner_id"], "limit": 100}, 3000)
+    ids = sorted({str((f.get("properties") or {}).get("hubspot_owner_id") or "")
+                  for f in filas} - {""})
+    _CONSUL_EQUIPO["ids"] = ids
+    _CONSUL_EQUIPO["ts"] = ahora
+    return ids
+
+
+def _consul_llamadas(desde_ms, hasta_ms, duenos_ids, tope=20000):
+    """
+    Llamadas salientes del equipo en la ventana. El filtro por dueño va del
+    lado del servidor: sin él HubSpot devuelve las ~29.000 llamadas de todo
+    el portal y el recorte del cliente trunca el número en silencio.
+    """
+    if not duenos_ids:
+        return []
+    filtros = [
+        {"propertyName": "hs_timestamp", "operator": "BETWEEN",
+         "value": str(desde_ms), "highValue": str(hasta_ms)},
+        {"propertyName": "hs_call_direction", "operator": "EQ", "value": "OUTBOUND"},
+        {"propertyName": "hubspot_owner_id", "operator": "IN", "values": list(duenos_ids)},
+    ]
+    return _consul_buscar("calls", {
+        "filterGroups": [{"filters": filtros}],
+        "properties": ["hs_call_duration", "hs_call_status", "hs_call_direction",
+                       "hubspot_owner_id", "hs_timestamp"], "limit": 100}, tope)
+
+
+def _consul_seguimientos(props):
+    """
+    Cuántos seguimientos hizo el ticket, leído del histórico de etapas.
+    Devuelve el número más alto por el que pasó (0 si nunca pasó por ninguno).
+    """
+    alcanzado = 0
+    for etapa, n in CONSUL_SEGUIMIENTOS:
+        if props.get(f"hs_v2_date_entered_{etapa}"):
+            alcanzado = max(alcanzado, n)
+    return alcanzado
+
+
+def _consul_primera_gestion(props):
+    """
+    Proxy de primera atención: primer cambio de etapa menos la creación.
+    NO es el tiempo de primera respuesta y el panel no lo llama así.
+    """
+    creado = _consul_num(props.get("createdate"))
+    if not creado:
+        return None
+    marcas = []
+    for e in CONSUL_ETAPAS_MOVIMIENTO:
+        v = _consul_num(props.get(f"hs_v2_date_entered_{e}"))
+        if v and v > creado:
+            marcas.append(v)
+    return min(marcas) - creado if marcas else None
+
+
+def _consul_regla(resolucion, seg):
+    """
+    La regla que pidió Consultoría:
+      · si el cliente contestó, alcanza con 1 seguimiento
+      · si el cliente no contestó, hacen falta 3 como mínimo
+    Devuelve (cumple|incumple|no_aplica|sin_dato, motivo).
+    """
+    info = CONSUL_RESOLUCION.get(resolucion or "")
+    if info is None:
+        return "sin_dato", "El ticket no tiene resolución cargada."
+    _, resultado, contesto = info
+    if resultado == "descartado":
+        return "no_aplica", "Duplicado o no se realizará."
+    if contesto is True:
+        return ("cumple" if seg >= 1 else "incumple",
+                "El cliente contestó: con 1 seguimiento alcanza.")
+    if contesto is False:
+        return ("cumple" if seg >= 3 else "incumple",
+                "El cliente no contestó: hacen falta 3 seguimientos.")
+    return "sin_dato", "La resolución no dice si el cliente contestó."
+
+
+# ── el cálculo ────────────────────────────────────────────────────
+def _consul_calcular(periodo):
+    desde, hasta, etiqueta = _consul_ventana(periodo)
+    duenos = _consul_duenos()
+    equipo = _consul_equipo()
+    tickets = _consul_tickets(desde, hasta)
+    llamadas = _consul_llamadas(desde, hasta, equipo)
+
+    por_consultor, por_tipo, por_etapa, por_resolucion = {}, {}, {}, {}
+    cierres, gestiones = [], []
+    seg_cerrados = {0: 0, 1: 0, 2: 0, 3: 0}
+    seg_alcanzo = {1: 0, 2: 0, 3: 0}
+    regla = {"cumple": 0, "incumple": 0, "no_aplica": 0, "sin_dato": 0}
+    resultados = {"exito": 0, "no_exito": 0, "descartado": 0, "neutro": 0, "sin_dato": 0}
+    incumplen, sin_asignar, tipo_de_categoria = [], 0, 0
+
+    for t in tickets:
+        p = t.get("properties") or {}
+        oid = str(p.get("hubspot_owner_id") or "")
+        if not oid:
+            sin_asignar += 1
+        nombre = duenos.get(oid, oid) if oid else "Sin asignar"
+        etapa_id = str(p.get("hs_pipeline_stage") or "")
+        etapa = CONSUL_ETAPAS.get(etapa_id, etapa_id or "—")
+        tipo, origen_tipo = _consul_tipo(p)
+        if origen_tipo == "categoría":
+            tipo_de_categoria += 1
+
+        por_etapa[etapa] = por_etapa.get(etapa, 0) + 1
+        por_tipo[tipo] = por_tipo.get(tipo, 0) + 1
+
+        c = por_consultor.setdefault(nombre, {
+            "consultor": nombre, "owner_id": oid, "tickets": 0, "cerrados": 0,
+            "abiertos": 0, "cierres_ms": [], "gestiones_ms": [],
+            "exito": 0, "no_exito": 0, "sin_resolucion": 0,
+            "seg_total": 0, "regla_ok": 0, "regla_mal": 0,
+            "llamadas": 0, "contestadas": 0, "minutos": 0.0,
+        })
+        c["tickets"] += 1
+
+        cerrado = etapa_id in CONSUL_ETAPAS_CERRADAS
+        c["cerrados" if cerrado else "abiertos"] += 1
+
+        tc = _consul_num(p.get("time_to_close"))
+        if cerrado and tc:
+            c["cierres_ms"].append(tc); cierres.append(tc)
+
+        pg = _consul_primera_gestion(p)
+        if pg:
+            c["gestiones_ms"].append(pg); gestiones.append(pg)
+
+        seg = _consul_seguimientos(p)
+        c["seg_total"] += seg
+        for n in (1, 2, 3):
+            if seg >= n:
+                seg_alcanzo[n] += 1
+        if cerrado:
+            seg_cerrados[min(seg, 3)] += 1
+
+        res = str(p.get("hs_resolution") or "").strip()
+        info = CONSUL_RESOLUCION.get(res)
+        if info:
+            label, resultado, _ = info
+            por_resolucion[label] = por_resolucion.get(label, 0) + 1
+            resultados[resultado] += 1
+            if resultado == "exito":
+                c["exito"] += 1
+            elif resultado == "no_exito":
+                c["no_exito"] += 1
+        else:
+            resultados["sin_dato"] += 1
+            c["sin_resolucion"] += 1
+            por_resolucion["Sin resolución cargada"] = por_resolucion.get("Sin resolución cargada", 0) + 1
+
+        veredicto, motivo = _consul_regla(res, seg)
+        regla[veredicto] += 1
+        if veredicto == "cumple":
+            c["regla_ok"] += 1
+        elif veredicto == "incumple":
+            c["regla_mal"] += 1
+            incumplen.append({
+                "ticket": p.get("hs_object_id"),
+                "asunto": (p.get("subject") or "")[:90],
+                "consultor": nombre,
+                "resolucion": (info[0] if info else "—"),
+                "seguimientos": seg,
+                "faltan": (3 - seg) if (info and info[2] is False) else max(0, 1 - seg),
+                "motivo": motivo,
+                "link": f"https://app.hubspot.com/contacts/{ACCOUNT_ID}/ticket/{p.get('hs_object_id')}",
+            })
+
+    llamadas_equipo = {"total": 0, "contestadas": 0, "ms": 0.0}
+    for l in llamadas:
+        p = l.get("properties") or {}
+        if str(p.get("hs_call_status") or "").upper() != "COMPLETED":
+            continue
+        nombre = duenos.get(str(p.get("hubspot_owner_id") or ""), "Sin asignar")
+        llamadas_equipo["total"] += 1
+        dur = _consul_num(p.get("hs_call_duration")) or 0
+        contestada = dur >= CONSUL_LLAMADA_MIN_MS
+        if contestada:
+            llamadas_equipo["contestadas"] += 1
+            llamadas_equipo["ms"] += dur
+        c = por_consultor.get(nombre)
+        if c:
+            c["llamadas"] += 1
+            if contestada:
+                c["contestadas"] += 1
+                c["minutos"] += dur / 60000.0
+
+    filas = []
+    for c in por_consultor.values():
+        med = _consul_mediana(c["cierres_ms"])
+        medg = _consul_mediana(c["gestiones_ms"])
+        juzgados = c["exito"] + c["no_exito"]
+        filas.append({
+            "consultor": c["consultor"], "owner_id": c["owner_id"],
+            "tickets": c["tickets"], "cerrados": c["cerrados"], "abiertos": c["abiertos"],
+            "cierre_mediana_h": _consul_horas(med),
+            "gestion_mediana_h": _consul_horas(medg),
+            "exito": c["exito"], "no_exito": c["no_exito"],
+            "sin_resolucion": c["sin_resolucion"],
+            "tasa_exito_pct": _consul_pct(c["exito"], juzgados),
+            "seguimientos": c["seg_total"],
+            "regla_ok": c["regla_ok"], "regla_mal": c["regla_mal"],
+            "llamadas": c["llamadas"], "contestadas": c["contestadas"],
+            "minutos": round(c["minutos"], 1),
+        })
+    filas.sort(key=lambda x: -x["tickets"])
+    incumplen.sort(key=lambda x: (-x["faltan"], x["consultor"]))
+
+    juzgados = resultados["exito"] + resultados["no_exito"]
+    n = len(tickets)
+    return {
+        "periodo": periodo, "etiqueta": etiqueta, "pipeline": CONSUL_PIPELINE,
+        "desde": datetime.fromtimestamp(desde / 1000, timezone.utc).isoformat(),
+        "hasta": datetime.fromtimestamp(hasta / 1000, timezone.utc).isoformat(),
+        "generado": datetime.now(timezone.utc).isoformat(),
+        "totales": {
+            "tickets": n,
+            "cerrados": sum(f["cerrados"] for f in filas),
+            "abiertos": sum(f["abiertos"] for f in filas),
+            "sin_asignar": sin_asignar,
+            "cierre_mediana_h": _consul_horas(_consul_mediana(cierres)),
+            "cierre_casos": len(cierres),
+            "gestion_mediana_h": _consul_horas(_consul_mediana(gestiones)),
+            "gestion_casos": len(gestiones),
+            "llamadas": llamadas_equipo["total"],
+            "contestadas": llamadas_equipo["contestadas"],
+            "minutos": round(llamadas_equipo["ms"] / 60000.0, 1),
+            "tasa_contacto_pct": _consul_pct(llamadas_equipo["contestadas"],
+                                             llamadas_equipo["total"]),
+        },
+        "resultado": {
+            "exito": resultados["exito"], "no_exito": resultados["no_exito"],
+            "descartado": resultados["descartado"], "neutro": resultados["neutro"],
+            "sin_dato": resultados["sin_dato"],
+            "juzgados": juzgados,
+            "tasa_exito_pct": _consul_pct(resultados["exito"], juzgados),
+            "detalle": sorted([{"resolucion": k, "tickets": v} for k, v in por_resolucion.items()],
+                              key=lambda x: -x["tickets"]),
+            "fuente": "hs_resolution",
+        },
+        "seguimientos": {
+            "llego_a_1": seg_alcanzo[1], "llego_a_2": seg_alcanzo[2], "llego_a_3": seg_alcanzo[3],
+            "cerrados_con": seg_cerrados,
+            "fuente": "hs_v2_date_entered_<etapa> · histórico, sobrevive al cierre",
+        },
+        "regla": dict(regla, detalle=incumplen[:100],
+                      enunciado="Si el cliente contestó alcanza 1 seguimiento. "
+                                "Si no contestó, hacen falta 3 como mínimo.",
+                      como_se_sabe="El «contestó / no contestó» sale de hs_resolution: "
+                                   "«Sin éxito · sin respuesta» = no contestó."),
+        "consultores": filas,
+        "por_tipo": sorted([{"tipo": k, "tickets": v} for k, v in por_tipo.items()],
+                           key=lambda x: -x["tickets"]),
+        "por_etapa": sorted([{"etapa": k, "tickets": v} for k, v in por_etapa.items()],
+                            key=lambda x: -x["tickets"]),
+        "calidad_del_dato": {
+            "sin_asignar": {"casos": sin_asignar, "de": n, "pct": _consul_pct(sin_asignar, n),
+                            "que_hacer": "Tickets sin dueño: no entran en el ranking de nadie."},
+            "sin_resolucion": {"casos": resultados["sin_dato"], "de": n,
+                               "pct": _consul_pct(resultados["sin_dato"], n),
+                               "que_hacer": "Sin resolución no hay éxito/no éxito ni se puede "
+                                            "auditar la regla de seguimientos."},
+            "tipo_derivado_del_asunto": {"casos": n - tipo_de_categoria, "de": n,
+                                         "pct": _consul_pct(n - tipo_de_categoria, n),
+                                         "que_hacer": "Cargar hs_ticket_category en la plantilla "
+                                                      "del ticket deja de depender del asunto."},
+            "primera_respuesta": {"casos": 0, "de": n, "pct": 0.0,
+                                  "que_hacer": "HubSpot sólo la calcula sobre su bandeja. "
+                                               "En Consultoría se atiende por teléfono y "
+                                               "WhatsApp/Treble, así que el ticket nunca la "
+                                               "registra. El panel muestra «primera gestión» "
+                                               "(primer cambio de etapa) como proxy."},
+        },
+    }
+
+
+@app.get("/consultoria/panel")
+def consultoria_panel(x_api_key: str | None = Header(default=None),
+                      periodo: str = "semana", refrescar: bool = False):
+    """Métricas del pipeline de Consultoría. Solo lectura."""
+    _chequear_clave(x_api_key)
+    periodo = periodo if periodo in ("ayer", "semana", "mes") else "semana"
+    ahora = time.time()
+    hit = _CONSUL_CACHE.get(periodo)
+    if hit and not refrescar and ahora - hit[0] < CONSUL_CACHE_SEG:
+        return dict(hit[1], desde_cache=True)
+    try:
+        datos = _consul_calcular(periodo)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"No se pudo armar el panel: {e}")
+    _CONSUL_CACHE[periodo] = (ahora, datos)
+    METRICAS["consultoria_consultas"] += 1
+    return dict(datos, desde_cache=False)
+
+
+CONSUL_HTML = """<!doctype html><html lang=es><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Panel de Consultoría · Opción YO</title>
+<style>
+:root{
+ --plane:#f9f9f7; --surface:#fcfcfb; --ink:#0b0b0b; --ink2:#52514e; --muted:#898781;
+ --grid:#e1e0d9; --line:#c3c2b7; --border:rgba(11,11,11,.10);
+ --good:#0ca30c; --warn:#fab219; --serious:#ec835a; --critical:#d03b3b;
+ --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a; --s4:#eda100; --s5:#e87ba4; --s6:#008300;
+ --o1:#86b6ef; --o2:#5598e7; --o3:#2a78d6; --o4:#1c5cab;
+ --chip:#f0efec; --n1:#c3c2b7; --n2:#e1e0d9;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){
+ --plane:#0d0d0d; --surface:#1a1a19; --ink:#fff; --ink2:#c3c2b7; --muted:#898781;
+ --grid:#2c2c2a; --line:#383835; --border:rgba(255,255,255,.10);
+ --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s4:#c98500; --s5:#d55181; --s6:#008300;
+ --o1:#184f95; --o2:#256abf; --o3:#3987e5; --o4:#86b6ef;
+ --chip:#383835; --n1:#6f6e69; --n2:#45443f;
+}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--plane);color:var(--ink);
+ font:15px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+ -webkit-font-smoothing:antialiased}
+.w{max-width:1140px;margin:0 auto;padding:22px 16px 72px}
+header h1{font-size:23px;margin:0;letter-spacing:-.3px}
+.sub{color:var(--ink2);font-size:13px;margin-top:3px}
+.tabs{display:flex;gap:6px;margin:18px 0;flex-wrap:wrap}
+.tab{padding:7px 15px;border:1px solid var(--border);background:var(--surface);
+ border-radius:999px;cursor:pointer;font:inherit;font-size:13.5px;color:var(--ink2)}
+.tab[aria-selected=true]{background:var(--ink);color:var(--plane);border-color:var(--ink)}
+.tab:focus-visible{outline:2px solid var(--s1);outline-offset:2px}
+section{background:var(--surface);border:1px solid var(--border);border-radius:12px;
+ padding:18px;margin-bottom:14px}
+h2{font-size:15px;margin:0 0 3px;letter-spacing:-.1px}
+h2 + .cap{margin-bottom:14px}
+.cap{color:var(--ink2);font-size:12.5px;margin:0 0 10px}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(158px,1fr));gap:12px;margin-bottom:14px}
+.tile{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:15px 16px}
+.tile .v{font-size:29px;font-weight:600;letter-spacing:-1px;line-height:1.1}
+.tile .k{font-size:12px;color:var(--ink2);margin-top:4px}
+.tile .n{font-size:11.5px;color:var(--muted);margin-top:2px}
+.tile.alerta{border-color:var(--critical)}
+.tile.alerta .v{color:var(--critical)}
+table{width:100%;border-collapse:collapse;font-size:13.5px}
+th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--grid);vertical-align:middle}
+th{font-size:11px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.5px}
+td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
+tbody tr:last-child td{border-bottom:0}
+tbody tr:hover{background:var(--chip)}
+.bar{height:9px;border-radius:0 4px 4px 0;display:block;min-width:2px}
+.barwrap{display:flex;align-items:center;gap:8px}
+.barwrap .lbl{font-variant-numeric:tabular-nums;font-size:12.5px;color:var(--ink2);min-width:2.6em;text-align:right}
+.stack{display:flex;width:100%;height:30px;border-radius:6px;overflow:hidden;gap:2px;background:var(--grid)}
+.stack > div{position:relative;cursor:default}
+.legend{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:10px;font-size:12.5px;color:var(--ink2)}
+.legend span{display:flex;align-items:center;gap:6px}
+.sw{width:11px;height:11px;border-radius:3px;flex:none}
+.ok{color:var(--good);font-weight:600}
+.nodueno td{color:var(--muted);font-style:italic}
+.nodueno .bar{background:var(--n1)!important}
+.bad{color:var(--critical);font-weight:600}
+.pill{display:inline-block;padding:1px 8px;border-radius:999px;font-size:11.5px;
+ background:var(--chip);color:var(--ink2)}
+.nota{background:var(--chip);border-radius:10px;padding:13px 15px;font-size:13px;color:var(--ink2);margin-top:12px}
+.nota b{color:var(--ink)}
+.err{background:var(--surface);border:1px solid var(--critical);color:var(--ink);
+ padding:16px;border-radius:12px}
+a{color:var(--s1)}
+.dash{color:var(--muted)}
+.foot{color:var(--muted);font-size:12px;margin-top:22px;text-align:center}
+.tw{overflow-x:auto;-webkit-overflow-scrolling:touch}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@media(max-width:760px){.grid2{grid-template-columns:1fr}.w{padding:14px 12px 60px}
+ table{font-size:12.5px}th,td{padding:6px}}
+[data-tip]{position:relative}
+[data-tip]:hover::after{content:attr(data-tip);position:absolute;left:50%;bottom:calc(100% + 7px);
+ transform:translateX(-50%);background:var(--ink);color:var(--plane);padding:5px 9px;border-radius:6px;
+ font-size:11.5px;white-space:nowrap;z-index:9;pointer-events:none}
+</style></head><body><div class=w>
+<header><h1>Panel de Consultoría</h1><div class=sub id=sub>Cargando…</div></header>
+<div class=tabs role=tablist>
+<button class=tab data-p=ayer role=tab>Ayer</button>
+<button class=tab data-p=semana role=tab aria-selected=true>Últimos 7 días</button>
+<button class=tab data-p=mes role=tab>Últimos 30 días</button>
+</div>
+<div id=app></div>
+<div class=foot id=foot></div>
+</div>
+<script>
+const $=s=>document.querySelector(s);
+const q=new URLSearchParams(location.search);
+const CLAVE=q.get('clave')||'';
+let periodo=q.get('periodo')||'semana';
+const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const num=v=>v==null?'<span class=dash>—</span>':v;
+const pct=v=>v==null?'<span class=dash>—</span>':v+'%';
+const horas=v=>v==null?'<span class=dash>—</span>':(v>=48?(v/24).toFixed(1)+' d':v+' h');
+
+function tile(v,k,n,alerta){
+ return '<div class="tile'+(alerta?' alerta':'')+'"><div class=v>'+v+'</div>'+
+  '<div class=k>'+k+'</div>'+(n?'<div class=n>'+n+'</div>':'')+'</div>';
+}
+function barras(filas,color){
+ const max=Math.max(1,...filas.map(f=>f.v));
+ return '<div class=tw><table><tbody>'+filas.map(f=>
+  '<tr><td>'+esc(f.k)+'</td><td style="width:58%"><div class=barwrap>'+
+  '<span class=bar style="width:'+(100*f.v/max)+'%;background:'+(f.c||color)+'" '+
+  'data-tip="'+esc(f.k)+': '+f.v+'"></span>'+
+  '<span class=lbl>'+f.v+'</span></div></td></tr>').join('')+'</tbody></table></div>';
+}
+
+function pinta(d){
+ const t=d.totales, r=d.resultado, g=d.regla, s=d.seguimientos;
+ document.querySelectorAll('.tab').forEach(b=>b.setAttribute('aria-selected',b.dataset.p===d.periodo));
+ $('#sub').textContent=d.etiqueta+' · '+t.tickets+' tickets · generado '+
+   new Date(d.generado).toLocaleString('es')+(d.desde_cache?' (caché)':'');
+
+ let h='<div class=tiles>'+
+  tile(t.tickets,'Tickets creados', t.sin_asignar?(t.sin_asignar+' sin dueño'):'todos con dueño')+
+  tile(pct(r.tasa_exito_pct),'Tasa de éxito','sobre '+r.juzgados+' con resultado')+
+  tile(horas(t.cierre_mediana_h),'Mediana a cierre','SLA total · '+t.cierre_casos+' casos')+
+  tile(t.contestadas,'Llamadas +1 min','de '+t.llamadas+' · '+pct(t.tasa_contacto_pct)+' contacto')+
+  tile(g.incumple,'Incumplen la regla','de '+(g.cumple+g.incumple)+' auditables',g.incumple>0)+
+ '</div>';
+
+ // ── Regla de seguimientos ──────────────────────────────────────
+ const audit=g.cumple+g.incumple;
+ h+='<section><h2>Regla de seguimientos</h2>'+
+  '<p class=cap>'+esc(g.enunciado)+' · '+esc(g.como_se_sabe)+'</p>'+
+  '<div class=stack>'+
+   seg(g.cumple,'var(--good)','Cumple')+
+   seg(g.incumple,'var(--critical)','Incumple')+
+   seg(g.no_aplica,'var(--n1)','No aplica (duplicado / no se realizará)')+
+   seg(g.sin_dato,'var(--n2)','Sin resolución cargada')+
+  '</div>'+
+  '<div class=legend>'+
+   lg('var(--good)','Cumple '+g.cumple)+lg('var(--critical)','Incumple '+g.incumple)+
+   lg('var(--n1)','No aplica '+g.no_aplica)+lg('var(--n2)','Sin dato '+g.sin_dato)+
+  '</div>';
+ if(g.detalle.length){
+  h+='<p class=cap style="margin-top:16px">Los '+g.detalle.length+' tickets que se cerraron '+
+     'con menos seguimientos de los que pide la regla:</p>'+
+   '<div class=tw><table><thead><tr><th>Ticket</th><th>Consultor</th><th>Resolución</th>'+
+   '<th class=n>Seguim.</th><th class=n>Faltaron</th></tr></thead><tbody>'+
+   g.detalle.map(x=>'<tr><td><a href="'+x.link+'" target=_blank rel=noopener>'+
+    esc(x.asunto||x.ticket)+'</a></td><td>'+esc(x.consultor)+'</td>'+
+    '<td><span class=pill>'+esc(x.resolucion)+'</span></td>'+
+    '<td class=n>'+x.seguimientos+'</td><td class="n bad">'+x.faltan+'</td></tr>').join('')+
+   '</tbody></table></div>';
+ } else if(audit){
+  h+='<p class=cap style="margin-top:14px" class=ok>Ningún ticket auditable incumplió la regla.</p>';
+ }
+ if(g.sin_dato) h+='<div class=nota><b>'+g.sin_dato+' tickets no se pueden auditar</b> porque '+
+  'no tienen resolución cargada. Sin ese campo no hay forma de saber si el cliente contestó, '+
+  'y la regla depende de eso.</div>';
+ h+='</section>';
+
+ // ── Resultado y embudo ─────────────────────────────────────────
+ h+='<div class=grid2>'+
+  '<section><h2>Resultado</h2><p class=cap>Propiedad «Resolución» del ticket · '+
+   r.sin_dato+' de '+d.totales.tickets+' sin cargar</p>'+
+   barras(r.detalle.map(x=>({k:x.resolucion,v:x.tickets,
+     c:/exitoso|aprobado|ganada|Asistió/i.test(x.resolucion)?'var(--good)':
+       (/Sin éxito|rechazado|perdida|No asistió/i.test(x.resolucion)?'var(--critical)':'var(--n1)')})))+
+  '</section>'+
+  '<section><h2>Embudo de seguimientos</h2>'+
+   '<p class=cap>Cuántos tickets pasaron por cada seguimiento. Se lee del histórico de '+
+   'etapas, no de la etapa actual: por eso incluye los que ya están cerrados.</p>'+
+   barras([{k:'Creados',v:d.totales.tickets,c:'var(--o1)'},
+           {k:'Llegaron a Seguimiento 1',v:s.llego_a_1,c:'var(--o2)'},
+           {k:'Llegaron a Seguimiento 2',v:s.llego_a_2,c:'var(--o3)'},
+           {k:'Llegaron a Seguimiento 3',v:s.llego_a_3,c:'var(--o4)'}])+
+   '<p class=cap style="margin-top:12px">Cerrados según cuántos seguimientos tuvieron: '+
+   '<b>'+s.cerrados_con['0']+'</b> con ninguno · <b>'+s.cerrados_con['1']+'</b> con 1 · '+
+   '<b>'+s.cerrados_con['2']+'</b> con 2 · <b>'+s.cerrados_con['3']+'</b> con 3.</p>'+
+  '</section></div>';
+
+ // ── Por consultor ──────────────────────────────────────────────
+ const maxT=Math.max(1,...d.consultores.map(f=>f.tickets));
+ h+='<section><h2>Por consultor</h2>'+
+  '<p class=cap>Ordenado por volumen. Las llamadas son las salientes completadas del '+
+  'equipo en el período, no sólo las ligadas a un ticket.</p>'+
+  '<div class=tw><table><thead><tr><th>Consultor</th><th>Tickets</th><th class=n>Cerrados</th>'+
+  '<th class=n>Éxito</th><th class=n>Sin éxito</th><th class=n>% éxito</th>'+
+  '<th class=n>Mediana cierre</th><th class=n>Seguim.</th><th class=n>Incumple</th>'+
+  '<th class=n>Llamadas</th><th class=n>+1 min</th><th class=n>Min.</th></tr></thead><tbody>'+
+  d.consultores.map(f=>'<tr'+(f.owner_id?'':' class=nodueno')+'><td>'+esc(f.consultor)+'</td>'+
+   '<td style="width:15%"><div class=barwrap><span class=bar style="width:'+
+     (100*f.tickets/maxT)+'%;background:var(--s1)" data-tip="'+esc(f.consultor)+': '+f.tickets+' tickets"></span>'+
+     '<span class=lbl>'+f.tickets+'</span></div></td>'+
+   '<td class=n>'+f.cerrados+'</td><td class="n ok">'+f.exito+'</td>'+
+   '<td class=n>'+f.no_exito+'</td><td class=n>'+pct(f.tasa_exito_pct)+'</td>'+
+   '<td class=n>'+horas(f.cierre_mediana_h)+'</td><td class=n>'+f.seguimientos+'</td>'+
+   '<td class="n'+(f.regla_mal?' bad':'')+'">'+f.regla_mal+'</td>'+
+   '<td class=n>'+f.llamadas+'</td><td class=n>'+f.contestadas+'</td>'+
+   '<td class=n>'+f.minutos+'</td></tr>').join('')+'</tbody></table></div></section>';
+
+ // ── Tipo y etapa ───────────────────────────────────────────────
+ h+='<div class=grid2><section><h2>Tipo de ticket</h2>'+
+  '<p class=cap>Categoría del ticket cuando está cargada; si no, se deriva del asunto.</p>'+
+  barras(d.por_tipo.map(x=>({k:x.tipo,v:x.tickets})),'var(--s1)')+'</section>'+
+  '<section><h2>Etapa actual</h2><p class=cap>Dónde está parado cada ticket hoy.</p>'+
+  barras(d.por_etapa.map(x=>({k:x.etapa,v:x.tickets})),'var(--s3)')+'</section></div>';
+
+ // ── Calidad del dato ───────────────────────────────────────────
+ const c=d.calidad_del_dato;
+ h+='<section><h2>Calidad del dato</h2>'+
+  '<p class=cap>Lo que hoy limita al panel. Ninguno de estos números se rellena con ceros.</p>'+
+  '<div class=tw><table><thead><tr><th>Qué falta</th><th class=n>Casos</th><th>Qué destraba</th></tr></thead><tbody>'+
+  [['Tickets sin dueño',c.sin_asignar],['Tickets sin resolución',c.sin_resolucion],
+   ['Tipo derivado del asunto',c.tipo_derivado_del_asunto],
+   ['Tiempo de primera respuesta',c.primera_respuesta]]
+  .map(([k,v])=>'<tr><td>'+k+'</td><td class=n>'+v.casos+' <span class=dash>/ '+v.de+'</span>'+
+   (v.pct?' <span class=pill>'+v.pct+'%</span>':'')+'</td><td>'+esc(v.que_hacer)+'</td></tr>').join('')+
+  '</tbody></table></div>'+
+  '<div class=nota><b>Primera gestión (proxy):</b> '+horas(d.totales.gestion_mediana_h)+
+  ' de mediana sobre '+d.totales.gestion_casos+' tickets. Es el primer cambio de etapa, '+
+  'no la primera respuesta al cliente. Se publica con ese nombre a propósito.</div></section>';
+
+ $('#app').innerHTML=h;
+ $('#foot').textContent='Pipeline '+ (d.pipeline||'Consultores') +
+   ' · ventana '+new Date(d.desde).toLocaleDateString('es')+' → '+
+   new Date(d.hasta).toLocaleDateString('es')+' · solo lectura';
+}
+function seg(v,c,tip){
+ return v?'<div style="flex:'+v+';background:'+c+'" data-tip="'+esc(tip)+': '+v+'"></div>':'';
+}
+function lg(c,txt){return '<span><i class=sw style="background:'+c+'"></i>'+esc(txt)+'</span>';}
+
+async function cargar(){
+ $('#app').innerHTML='<section><p class=cap>Cargando…</p></section>';
+ document.querySelectorAll('.tab').forEach(b=>b.setAttribute('aria-selected',b.dataset.p===periodo));
+ try{
+  const r=await fetch('/consultoria/panel?periodo='+periodo,{headers:{'X-API-Key':CLAVE}});
+  if(!r.ok) throw new Error('HTTP '+r.status+' — '+(await r.text()).slice(0,200));
+  pinta(await r.json());
+ }catch(e){ $('#app').innerHTML='<div class=err><b>No se pudo cargar.</b><br>'+esc(e.message)+
+  '<br><br>Si dice 401, falta la clave: agregá <code>?clave=TU_CLAVE</code> al final de la URL.</div>'; }
+}
+document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{periodo=b.dataset.p;cargar();});
+cargar();
+</script></body></html>"""
+
+
+@app.get("/consultoria/tablero", response_class=HTMLResponse)
+def consultoria_tablero():
+    """La página del panel. No pide clave: los datos sí (van por ?clave=)."""
+    return HTMLResponse(CONSUL_HTML)
