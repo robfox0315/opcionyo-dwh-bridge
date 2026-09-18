@@ -2022,7 +2022,7 @@ def version_bloques(x_api_key: str | None = Header(default=None)):
     _chequear_clave(x_api_key)
     return {
         "base": "1.3.3",
-        "bloques": ["workflows_push (1.3.4)", "cohorte_renovaciones (1.3.5)", "reintento_pushes (1.3.5)", "contador_sesiones (1.3.6)", "workflows_crudo (1.3.7)", "riesgo_cancelacion (1.3.8)", "salud_mensajeria (1.3.9)", "correccion_veteranos (1.4.0)", "salud_detalle (1.4.1)", "arreglos_cruce_y_auditoria (1.4.2)", "reintento_automatico (1.4.2)", "cobertura_bifurcacion (1.4.2)", "sesiones_agendadas (1.4.3)", "monitor_riesgo (1.4.4)", "riesgo_lista_v2 (1.4.4)", "segmento_dormant (1.4.5)", "parte_operativo (1.4.6)", "reintento_por_nombre (1.4.7)", "caducidad_reintento (1.4.8)", "pedidos_v2 (1.4.9)", "webhook_propio_pedidos (1.5.0)", "sla_v2 (1.5.1)", "partes_sin_repetir (1.5.2)", "alcance_cola_reintento (1.5.3)", "cliente_esperando (1.5.4)", "disputas_stripe (1.5.5)", "adopcion_campanas (1.5.6)", "enriquecer_stripe (1.5.7)", "panel_consultoria (1.6.1)"],
+        "bloques": ["workflows_push (1.3.4)", "cohorte_renovaciones (1.3.5)", "reintento_pushes (1.3.5)", "contador_sesiones (1.3.6)", "workflows_crudo (1.3.7)", "riesgo_cancelacion (1.3.8)", "salud_mensajeria (1.3.9)", "correccion_veteranos (1.4.0)", "salud_detalle (1.4.1)", "arreglos_cruce_y_auditoria (1.4.2)", "reintento_automatico (1.4.2)", "cobertura_bifurcacion (1.4.2)", "sesiones_agendadas (1.4.3)", "monitor_riesgo (1.4.4)", "riesgo_lista_v2 (1.4.4)", "segmento_dormant (1.4.5)", "parte_operativo (1.4.6)", "reintento_por_nombre (1.4.7)", "caducidad_reintento (1.4.8)", "pedidos_v2 (1.4.9)", "webhook_propio_pedidos (1.5.0)", "sla_v2 (1.5.1)", "partes_sin_repetir (1.5.2)", "alcance_cola_reintento (1.5.3)", "cliente_esperando (1.5.4)", "disputas_stripe (1.5.5)", "adopcion_campanas (1.5.6)", "enriquecer_stripe (1.5.7)", "panel_consultoria (1.6.2)"],
         "endpoints_nuevos": [
             "POST /cohorte/setup", "POST /cohorte/procesar",
             "GET /cohorte/renovaciones", "GET /cohorte/kpis",
@@ -9041,14 +9041,15 @@ def _consul_calcular(periodo):
 
 @app.get("/consultoria/panel")
 def consultoria_panel(x_api_key: str | None = Header(default=None),
+                      x_panel_token: str | None = Header(default=None),
                       periodo: str = "semana", refrescar: bool = False):
     """Métricas del pipeline de Consultoría. Solo lectura."""
-    _chequear_clave(x_api_key)
+    quien = _consul_quien(x_api_key, x_panel_token)
     periodo = periodo if periodo in ("ayer", "semana", "mes") else "semana"
     ahora = time.time()
     hit = _CONSUL_CACHE.get(periodo)
     if hit and not refrescar and ahora - hit[0] < CONSUL_CACHE_SEG:
-        return dict(hit[1], desde_cache=True)
+        return dict(hit[1], desde_cache=True, sesion=quien)
     try:
         datos = _consul_calcular(periodo)
     except HTTPException:
@@ -9057,7 +9058,7 @@ def consultoria_panel(x_api_key: str | None = Header(default=None),
         raise HTTPException(502, f"No se pudo armar el panel: {e}")
     _CONSUL_CACHE[periodo] = (ahora, datos)
     METRICAS["consultoria_consultas"] += 1
-    return dict(datos, desde_cache=False)
+    return dict(datos, desde_cache=False, sesion=quien)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -9281,12 +9282,13 @@ def _consul_primera_respuesta(tickets, llamadas, desde_ms):
 
 @app.get("/consultoria/primera-respuesta")
 def consultoria_primera_respuesta(x_api_key: str | None = Header(default=None),
+                                  x_panel_token: str | None = Header(default=None),
                                   periodo: str = "semana", tope: int = 25):
     """
     Diagnóstico de la primera respuesta: de dónde sale cada caso y cuántos
     quedan sin cruzar. Solo lectura.
     """
-    _chequear_clave(x_api_key)
+    _consul_quien(x_api_key, x_panel_token)
     periodo = periodo if periodo in ("ayer", "semana", "mes") else "semana"
     desde, hasta, etiqueta = _consul_ventana(periodo)
     try:
@@ -9325,6 +9327,116 @@ def consultoria_primera_respuesta(x_api_key: str | None = Header(default=None),
                    "llamadas salientes del CRM. Se toma el primer contacto del equipo "
                    "posterior a la creación del ticket."),
     }
+
+
+# ══════════════════════════════════════════════════════════════════
+#  ACCESO AL PANEL  ·  v1.6.2
+#
+#  Hasta acá el tablero se abría con ?clave=<BRIDGE_API_KEY> en la URL.
+#  Esa clave abre TODO el bridge, incluidos los endpoints que escriben.
+#  Mandarle ese link a gerencia es regalar la llave del portal.
+#
+#  Ahora el panel tiene su propia puerta: nombre + clave de lectura.
+#  · La clave de lectura (CONSUL_PANEL_CLAVE) NO sirve para ningún otro
+#    endpoint del bridge. Solo abre /consultoria/*, que son de lectura.
+#  · El nombre no valida a nadie: sirve para que quede registrado quién
+#    miró el panel y para que la sesión lo muestre arriba.
+#  · La sesión es un token firmado con HMAC que vive 12 horas y viaja
+#    en un header, nunca en la URL.
+#  · Los intentos fallidos se frenan: 10 por ventana de 5 minutos.
+# ══════════════════════════════════════════════════════════════════
+
+import base64
+
+CONSUL_PANEL_CLAVE = os.environ.get("CONSUL_PANEL_CLAVE", "consultoria2026")
+CONSUL_PANEL_HORAS = int(os.environ.get("CONSUL_PANEL_HORAS", "12"))
+CONSUL_PANEL_MAX_FALLOS = int(os.environ.get("CONSUL_PANEL_MAX_FALLOS", "10"))
+_CONSUL_ACCESOS = []
+_CONSUL_FALLOS = []
+
+METRICAS.setdefault("consultoria_accesos", 0)
+METRICAS.setdefault("consultoria_accesos_rechazados", 0)
+
+
+def _consul_firma(base):
+    return hmac.new(str(API_KEY).encode(), base.encode(), hashlib.sha256).hexdigest()[:32]
+
+
+def _consul_token(nombre, vence):
+    base = f"{nombre}|{int(vence)}"
+    cuerpo = base64.urlsafe_b64encode(base.encode()).decode().rstrip("=")
+    return cuerpo + "." + _consul_firma(base)
+
+
+def _consul_leer_token(token):
+    """Nombre de quien mira, o None si el token es falso o venció."""
+    try:
+        cuerpo, firma = str(token or "").split(".", 1)
+        base = base64.urlsafe_b64decode(cuerpo + "=" * (-len(cuerpo) % 4)).decode()
+        nombre, vence = base.rsplit("|", 1)
+    except Exception:
+        return None
+    if not hmac.compare_digest(firma, _consul_firma(base)):
+        return None
+    try:
+        if time.time() > float(vence):
+            return None
+    except ValueError:
+        return None
+    return nombre or None
+
+
+def _consul_quien(x_api_key, x_panel_token):
+    """
+    Quién está mirando. Acepta la sesión del panel (solo lectura) o la
+    clave de servicio del bridge. Sin ninguna de las dos, corta.
+    """
+    nombre = _consul_leer_token(x_panel_token)
+    if nombre:
+        return nombre
+    if x_api_key:
+        _chequear_clave(x_api_key)
+        return "clave de servicio"
+    raise HTTPException(401, "Hace falta iniciar sesión en el panel.")
+
+
+@app.post("/consultoria/acceso")
+def consultoria_acceso(body: dict | None = None):
+    """Entrega una sesión de solo lectura. No devuelve ningún dato del panel."""
+    body = body or {}
+    nombre = str(body.get("nombre") or "").strip()[:60]
+    clave = str(body.get("clave") or "")
+
+    ahora = time.time()
+    _CONSUL_FALLOS[:] = [t for t in _CONSUL_FALLOS if ahora - t < 300]
+    if len(_CONSUL_FALLOS) >= CONSUL_PANEL_MAX_FALLOS:
+        raise HTTPException(429, "Demasiados intentos fallidos. Probá de nuevo en unos minutos.")
+
+    if len(nombre) < 3:
+        raise HTTPException(400, "Poné tu nombre y apellido para entrar.")
+    if not hmac.compare_digest(clave, str(CONSUL_PANEL_CLAVE)):
+        _CONSUL_FALLOS.append(ahora)
+        METRICAS["consultoria_accesos_rechazados"] += 1
+        log.warning(f"[consultoria] acceso rechazado para '{nombre}'")
+        raise HTTPException(401, "Clave incorrecta.")
+
+    vence = ahora + CONSUL_PANEL_HORAS * 3600
+    _CONSUL_ACCESOS.append({"nombre": nombre,
+                            "cuando": datetime.now(timezone.utc).isoformat()})
+    del _CONSUL_ACCESOS[:-200]
+    METRICAS["consultoria_accesos"] += 1
+    log.warning(f"[consultoria] entró al panel: {nombre}")
+    return {"token": _consul_token(nombre, vence), "nombre": nombre,
+            "vence": datetime.fromtimestamp(vence, timezone.utc).isoformat(),
+            "horas": CONSUL_PANEL_HORAS}
+
+
+@app.get("/consultoria/accesos")
+def consultoria_accesos(x_api_key: str | None = Header(default=None)):
+    """Quién entró al panel. Pide la clave de servicio, no la del panel."""
+    _chequear_clave(x_api_key)
+    return {"accesos": list(reversed(_CONSUL_ACCESOS))[:100],
+            "rechazados": METRICAS.get("consultoria_accesos_rechazados", 0)}
 
 
 CONSUL_HTML = """<!doctype html><html lang=es><head><meta charset=utf-8>
@@ -9397,6 +9509,23 @@ tbody tr:hover{background:var(--chip)}
 a{color:var(--s1)}
 .dash{color:var(--muted)}
 .foot{color:var(--muted);font-size:12px;margin-top:22px;text-align:center}
+.entrar{max-width:380px;margin:9vh auto;background:var(--surface);border:1px solid var(--border);
+ border-radius:14px;padding:28px}
+.entrar h1{font-size:19px;margin:0 0 4px}
+.entrar p{color:var(--ink2);font-size:13px;margin:0 0 20px}
+.campo{margin-bottom:13px}
+.campo label{display:block;font-size:12px;color:var(--ink2);margin-bottom:5px}
+.campo input{width:100%;padding:10px 12px;font:inherit;font-size:14.5px;color:var(--ink);
+ background:var(--plane);border:1px solid var(--line);border-radius:8px}
+.campo input:focus{outline:2px solid var(--s1);outline-offset:1px;border-color:var(--s1)}
+.btn{width:100%;padding:11px;font:inherit;font-size:14.5px;font-weight:600;cursor:pointer;
+ background:var(--ink);color:var(--plane);border:0;border-radius:8px;margin-top:6px}
+.btn[disabled]{opacity:.55;cursor:default}
+.aviso{color:var(--critical);font-size:13px;margin-top:12px;min-height:1.2em}
+.sesion{display:flex;align-items:center;gap:10px;font-size:12.5px;color:var(--ink2)}
+.sesion b{color:var(--ink)}
+.salir{font:inherit;font-size:12.5px;background:none;border:0;color:var(--s1);cursor:pointer;padding:0;
+ text-decoration:underline}
 .tw{overflow-x:auto;-webkit-overflow-scrolling:touch}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
 @media(max-width:760px){.grid2{grid-template-columns:1fr}.w{padding:14px 12px 60px}
@@ -9406,7 +9535,19 @@ a{color:var(--s1)}
  transform:translateX(-50%);background:var(--ink);color:var(--plane);padding:5px 9px;border-radius:6px;
  font-size:11.5px;white-space:nowrap;z-index:9;pointer-events:none}
 </style></head><body><div class=w>
-<header><h1>Panel de Consultoría</h1><div class=sub id=sub>Cargando…</div></header>
+<div id=puerta style="display:none"><form class=entrar id=formEntrar>
+ <h1>Panel de Consultoría</h1>
+ <p>Opción YO · acceso de solo lectura</p>
+ <div class=campo><label for=nom>Tu nombre y apellido</label>
+  <input id=nom name=nombre autocomplete=name required minlength=3 placeholder="Nombre Apellido"></div>
+ <div class=campo><label for=cla>Clave del panel</label>
+  <input id=cla name=clave type=password autocomplete=current-password required placeholder="••••••••"></div>
+ <button class=btn type=submit id=btnEntrar>Entrar</button>
+ <div class=aviso id=avisoEntrar></div>
+</form></div>
+<div id=todo style="display:none">
+<header><h1>Panel de Consultoría</h1><div class=sub id=sub>Cargando…</div>
+ <div class=sesion id=sesion></div></header>
 <div class=tabs role=tablist>
 <button class=tab data-p=ayer role=tab>Ayer</button>
 <button class=tab data-p=semana role=tab aria-selected=true>Últimos 7 días</button>
@@ -9414,12 +9555,40 @@ a{color:var(--s1)}
 </div>
 <div id=app></div>
 <div class=foot id=foot></div>
-</div>
+</div></div>
 <script>
 const $=s=>document.querySelector(s);
 const q=new URLSearchParams(location.search);
-const CLAVE=q.get('clave')||'';
+const CLAVE=q.get('clave')||'';   // compatibilidad: clave de servicio por URL
 let periodo=q.get('periodo')||'semana';
+const LLAVE='oy_panel_consultoria';
+function sesion(){ try{ return JSON.parse(sessionStorage.getItem(LLAVE)||'null'); }catch(e){ return null; } }
+function guardar(s){ try{ sessionStorage.setItem(LLAVE, JSON.stringify(s)); }catch(e){} }
+function salir(){ try{ sessionStorage.removeItem(LLAVE); }catch(e){} location.reload(); }
+function cabeceras(){
+ const s=sesion();
+ if(s && s.token) return {'X-Panel-Token': s.token};
+ return CLAVE ? {'X-API-Key': CLAVE} : {};
+}
+function puerta(mostrar){
+ $('#puerta').style.display = mostrar?'block':'none';
+ $('#todo').style.display   = mostrar?'none':'block';
+ if(mostrar) setTimeout(()=>$('#nom').focus(),50);
+}
+$('#formEntrar').addEventListener('submit', async ev=>{
+ ev.preventDefault();
+ const b=$('#btnEntrar'), av=$('#avisoEntrar');
+ b.disabled=true; b.textContent='Entrando…'; av.textContent='';
+ try{
+  const r=await fetch('/consultoria/acceso',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({nombre:$('#nom').value.trim(), clave:$('#cla').value})});
+  const j=await r.json().catch(()=>({}));
+  if(!r.ok) throw new Error(j.detail||('No se pudo entrar (HTTP '+r.status+')'));
+  guardar(j); puerta(false); cargar();
+ }catch(e){ av.textContent=e.message; }
+ finally{ b.disabled=false; b.textContent='Entrar'; }
+});
 const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const num=v=>v==null?'<span class=dash>—</span>':v;
 const pct=v=>v==null?'<span class=dash>—</span>':v+'%';
@@ -9441,6 +9610,11 @@ function barras(filas,color){
 function pinta(d){
  const t=d.totales, r=d.resultado, g=d.regla, s=d.seguimientos;
  document.querySelectorAll('.tab').forEach(b=>b.setAttribute('aria-selected',b.dataset.p===d.periodo));
+ const ses=sesion();
+ $('#sesion').innerHTML = ses&&ses.nombre
+   ? 'Sesión de <b>'+esc(ses.nombre)+'</b> · <button class=salir id=btnSalir>Salir</button>'
+   : (d.sesion?'Sesión: <b>'+esc(d.sesion)+'</b>':'');
+ const bs=$('#btnSalir'); if(bs) bs.onclick=salir;
  $('#sub').textContent=d.etiqueta+' · '+t.tickets+' tickets · generado '+
    new Date(d.generado).toLocaleString('es')+(d.desde_cache?' (caché)':'');
 
@@ -9584,14 +9758,14 @@ async function cargar(){
  $('#app').innerHTML='<section><p class=cap>Cargando…</p></section>';
  document.querySelectorAll('.tab').forEach(b=>b.setAttribute('aria-selected',b.dataset.p===periodo));
  try{
-  const r=await fetch('/consultoria/panel?periodo='+periodo,{headers:{'X-API-Key':CLAVE}});
+  const r=await fetch('/consultoria/panel?periodo='+periodo,{headers:cabeceras()});
+  if(r.status===401){ salir(); return; }
   if(!r.ok) throw new Error('HTTP '+r.status+' — '+(await r.text()).slice(0,200));
   pinta(await r.json());
- }catch(e){ $('#app').innerHTML='<div class=err><b>No se pudo cargar.</b><br>'+esc(e.message)+
-  '<br><br>Si dice 401, falta la clave: agregá <code>?clave=TU_CLAVE</code> al final de la URL.</div>'; }
+ }catch(e){ $('#app').innerHTML='<div class=err><b>No se pudo cargar.</b><br>'+esc(e.message)+'</div>'; }
 }
 document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{periodo=b.dataset.p;cargar();});
-cargar();
+if(sesion()||CLAVE){ puerta(false); cargar(); } else { puerta(true); }
 </script></body></html>"""
 
 
